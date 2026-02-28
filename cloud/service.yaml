@@ -1,0 +1,55 @@
+# Cloud Run service configuration for Rio.
+# Deploy with:
+#   gcloud run services replace service.yaml --region us-central1
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rio-cloud
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Keep at least 1 instance warm to avoid cold-start on WS connect
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "5"
+        # Do not throttle CPU between requests (needed for WS keep-alive)
+        run.googleapis.com/cpu-throttling: "false"
+        # Session affinity: sticky sessions for WebSocket connections
+        run.googleapis.com/sessionAffinity: "true"
+    spec:
+      # Long timeout for persistent WebSocket sessions (1 hour)
+      timeoutSeconds: 3600
+      containerConcurrency: 80
+      containers:
+        - image: gcr.io/PROJECT_ID/rio-cloud:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: GEMINI_API_KEY
+                  key: latest
+            - name: PORT
+              value: "8080"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30

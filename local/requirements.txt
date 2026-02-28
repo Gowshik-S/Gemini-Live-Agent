@@ -1,0 +1,22 @@
+# Rio Local — Layer 2 (voice + vision client)
+# Audio capture (Day 3) + playback (Day 4), VAD + PTT (Day 5), Vision (Day 6).
+
+websockets>=14.0
+pyyaml>=6.0
+structlog>=24.0.0
+
+# Audio I/O (L1) — capture at 16kHz, playback at 24kHz
+sounddevice>=0.5.0
+numpy>=1.24.0
+
+# VAD — Silero (Day 5)
+# For CPU-only (lighter): pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+
+# Push-to-Talk hotkeys (Day 5) + Screenshot hotkey (Day 6)
+# Note: On Wayland Linux, pynput may require X11 compatibility layer
+pynput>=1.7.0
+
+# Screen capture (Day 6 / L2 — Vision)
+mss>=9.0.0
+Pillow>=10.0.0

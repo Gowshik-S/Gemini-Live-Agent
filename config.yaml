@@ -1,0 +1,54 @@
+# Rio — Proactive AI Pair Programmer
+# User configuration file
+# All values here can be overridden; sensible defaults exist in local/config.py
+
+rio:
+  # WebSocket URL for the Rio cloud backend
+  # Change to your Cloud Run URL after deployment
+  cloud_url: "ws://localhost:8080/ws/rio/live"
+
+  # Session mode: "live" for Live API bidirectional audio, "text" for text-only fallback
+  session_mode: "live"
+
+  # Audio capture / playback settings (Layer 1+)
+  audio:
+    sample_rate: 16000        # Hz — matches Gemini Live API expectation
+    block_size: 1600          # samples per chunk (~100ms at 16kHz)
+    input_device: null        # null = system default mic
+    output_device: null       # null = system default speaker
+
+  # Keyboard shortcuts (Layer 1+)
+  hotkeys:
+    push_to_talk: "f2"
+    screenshot: "f3"
+    toggle_proactive: "f4"
+
+  # Voice Activity Detection (Day 5)
+  vad:
+    enabled: true
+    threshold: 0.5              # Silero probability threshold (0.0-1.0)
+
+  # Screen/vision capture settings (Layer 2+)
+  vision:
+    fps: 0.33                 # ~1 frame every 3 seconds
+    quality: 60               # JPEG quality (0-100)
+    resize_factor: 0.5        # downscale factor before sending
+
+  # Struggle detection settings (Layer 3+)
+  struggle:
+    enabled: true
+    threshold: 0.85           # confidence threshold to trigger proactive help
+    cooldown_seconds: 300     # minimum seconds between proactive interventions
+    decline_cooldown: 600     # cooldown after user declines help
+    demo_mode: false          # if true, lower thresholds for demonstration
+
+  # Local memory / RAG settings (Layer 4+)
+  memory:
+    db_path: "./rio_memory"
+    max_recall: 5             # max memory entries to inject into context
+
+  # Model selection
+  models:
+    primary: "gemini-2.0-flash"
+    secondary: "gemini-2.5-pro-preview-03-25"
+    pro_rpm_budget: 5         # max requests-per-minute to the pro model
