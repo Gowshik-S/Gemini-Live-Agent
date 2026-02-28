@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rio — Dashboard</title>
+
+  <!-- IBM Plex Sans + Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- ================================================================== -->
+  <!-- TOP BAR                                                            -->
+  <!-- ================================================================== -->
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__logo" viewBox="0 0 32 32" width="28" height="28" fill="none">
+        <rect x="2" y="2" width="28" height="28" rx="6" stroke="currentColor" stroke-width="2"/>
+        <path d="M10 22V10h5a4 4 0 010 8h-5m5-8l5 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="topbar__title">Rio</span>
+      <span class="topbar__subtitle">Dashboard</span>
+    </div>
+
+    <div class="topbar__status">
+      <!-- Connection indicator -->
+      <div class="status-pill" id="connection-pill">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="5" fill="currentColor"/>
+        </svg>
+        <span id="connection-label">Connecting</span>
+      </div>
+
+      <!-- Latency -->
+      <div class="status-pill status-pill--muted" id="latency-pill">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M8 3v5l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        <span id="latency-label">-- ms</span>
+      </div>
+
+      <!-- Model badge -->
+      <div class="status-pill status-pill--info" id="model-pill">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M8 2l5 3v6l-5 3-5-3V5l5-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          <circle cx="8" cy="8" r="1.5" fill="currentColor"/>
+        </svg>
+        <span id="model-label">Flash</span>
+      </div>
+
+      <!-- Session mode -->
+      <div class="status-pill status-pill--muted" id="session-pill">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M6 3a5 5 0 015 5 5 5 0 01-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M3 6l-1 2 1 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M9 6l1 2-1 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span id="session-label">--</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================================================================== -->
+  <!-- MAIN GRID                                                          -->
+  <!-- ================================================================== -->
+  <main class="grid">
+
+    <!-- ---- LEFT COLUMN: Transcript ---- -->
+    <section class="panel panel--transcript" id="transcript-panel">
+      <div class="panel__header">
+        <svg class="icon" viewBox="0 0 20 20" fill="none">
+          <path d="M4 5h12M4 10h8M4 15h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <h2 class="panel__title">Live Transcript</h2>
+        <span class="panel__badge" id="transcript-count">0</span>
+      </div>
+      <div class="panel__body transcript-scroll" id="transcript-body">
+        <div class="transcript-empty" id="transcript-empty">
+          <svg class="icon icon--lg" viewBox="0 0 24 24" fill="none">
+            <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 12h.01M12 12h.01M16 12h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <p>Waiting for conversation...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---- RIGHT COLUMN: Metrics ---- -->
+    <div class="metrics-column">
+
+      <!-- STRUGGLE GAUGE -->
+      <section class="panel panel--gauge" id="struggle-panel">
+        <div class="panel__header">
+          <svg class="icon" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2 class="panel__title">Struggle Detection</h2>
+        </div>
+        <div class="panel__body gauge-container">
+          <div class="gauge" id="struggle-gauge">
+            <svg viewBox="0 0 200 120" class="gauge__svg">
+              <defs>
+                <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#34D399"/>
+                  <stop offset="50%" stop-color="#FBBF24"/>
+                  <stop offset="100%" stop-color="#F87171"/>
+                </linearGradient>
+              </defs>
+              <!-- Track -->
+              <path d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#2A2A3C" stroke-width="12" stroke-linecap="round"/>
+              <!-- Value arc -->
+              <path d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="url(#gaugeGrad)" stroke-width="12" stroke-linecap="round"
+                    stroke-dasharray="251.2" stroke-dashoffset="251.2" id="gauge-arc"/>
+              <!-- Needle -->
+              <line x1="100" y1="100" x2="100" y2="28" stroke="#EAEAF0" stroke-width="2" stroke-linecap="round" id="gauge-needle"
+                    transform="rotate(-90, 100, 100)"/>
+              <circle cx="100" cy="100" r="5" fill="#EAEAF0"/>
+            </svg>
+            <div class="gauge__value" id="gauge-value">0.00</div>
+            <div class="gauge__label" id="gauge-label">No signals</div>
+          </div>
+
+          <!-- Signal indicators -->
+          <div class="signals-grid" id="signals-grid">
+            <div class="signal-item" id="signal-repeated" data-signal="repeated_error">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <path d="M8 3v6M8 12h.01" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <span>Repeated Error</span>
+            </div>
+            <div class="signal-item" id="signal-pause" data-signal="long_pause_error">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <rect x="4" y="3" width="3" height="10" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="9" y="3" width="3" height="10" rx="1" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Long Pause</span>
+            </div>
+            <div class="signal-item" id="signal-rapid" data-signal="rapid_changes">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <polyline points="2,12 5,6 8,9 11,3 14,7" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Rapid Changes</span>
+            </div>
+            <div class="signal-item" id="signal-stale" data-signal="stale_active">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M8 5v3h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <span>Stale + Active</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TOOL EXECUTION LOG -->
+      <section class="panel panel--tools" id="tools-panel">
+        <div class="panel__header">
+          <svg class="icon" viewBox="0 0 20 20" fill="none">
+            <path d="M14.7 6.3a1 1 0 000-1.4l-1.6-1.6a1 1 0 00-1.4 0l-1 1 3 3 1-1z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M3 14l7.3-7.3 3 3L6 17H3v-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+          <h2 class="panel__title">Tool Execution</h2>
+          <span class="panel__badge" id="tools-count">0</span>
+        </div>
+        <div class="panel__body tool-scroll" id="tools-body">
+          <div class="tools-empty" id="tools-empty">
+            <svg class="icon icon--lg" viewBox="0 0 24 24" fill="none">
+              <path d="M12 6v6l4 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <p>No tool executions yet</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- HEALTH / RPM / STATS -->
+      <section class="panel panel--health" id="health-panel">
+        <div class="panel__header">
+          <svg class="icon" viewBox="0 0 20 20" fill="none">
+            <path d="M3 10h3l2-5 3 10 2-5h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2 class="panel__title">System Health</h2>
+        </div>
+        <div class="panel__body health-grid">
+
+          <!-- RPM Usage -->
+          <div class="health-card" id="rpm-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <path d="M2 13V5l3 3 3-5 3 4 3-2v8H2z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/>
+              </svg>
+              <span class="health-card__label">RPM Usage</span>
+            </div>
+            <div class="health-card__value">
+              <span id="rpm-current">0</span>
+              <span class="health-card__unit">/ 30</span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-bar__fill" id="rpm-bar" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <!-- Uptime -->
+          <div class="health-card" id="uptime-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M8 5v3l2 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <span class="health-card__label">Session Time</span>
+            </div>
+            <div class="health-card__value">
+              <span id="uptime-value">00:00</span>
+            </div>
+          </div>
+
+          <!-- Messages -->
+          <div class="health-card" id="messages-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <path d="M2 3h12v8H6l-4 3V3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              </svg>
+              <span class="health-card__label">Messages</span>
+            </div>
+            <div class="health-card__value">
+              <span id="messages-value">0</span>
+            </div>
+          </div>
+
+          <!-- Screenshots -->
+          <div class="health-card" id="screenshots-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <rect x="2" y="3" width="12" height="10" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                <circle cx="6" cy="7" r="1.5" stroke="currentColor" stroke-width="1"/>
+                <path d="M2 11l3-3 2 2 3-3 4 4" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+              </svg>
+              <span class="health-card__label">Screenshots</span>
+            </div>
+            <div class="health-card__value">
+              <span id="screenshots-value">0</span>
+            </div>
+          </div>
+
+          <!-- Struggle Triggers -->
+          <div class="health-card" id="struggles-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <path d="M8 2l1.5 4.5H14l-3.5 3 1.5 4.5L8 11l-4 3 1.5-4.5L2 6.5h4.5L8 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              </svg>
+              <span class="health-card__label">Triggers</span>
+            </div>
+            <div class="health-card__value">
+              <span id="struggles-value">0</span>
+            </div>
+          </div>
+
+          <!-- Rate Limiter Status -->
+          <div class="health-card" id="ratelimit-card">
+            <div class="health-card__header">
+              <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+                <rect x="3" y="7" width="10" height="7" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M5 7V5a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span class="health-card__label">Rate Status</span>
+            </div>
+            <div class="health-card__value">
+              <span id="ratelimit-value" class="text-success">Normal</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- SCRIPTS                                                            -->
+  <!-- ================================================================== -->
+  <script src="js/websocket.js"></script>
+  <script src="js/transcript.js"></script>
+  <script src="js/gauge.js"></script>
+  <script src="js/toollog.js"></script>
+  <script src="js/health.js"></script>
+
+</body>
+</html>

@@ -35,6 +35,7 @@ class HotkeyConfig:
     push_to_talk: str = "f2"
     screenshot: str = "f3"
     toggle_proactive: str = "f4"
+    screen_mode: str = "f5"
 
 
 @dataclass
@@ -48,6 +49,7 @@ class VisionConfig:
     fps: float = 0.33
     quality: int = 60
     resize_factor: float = 0.5
+    default_mode: str = "on_demand"  # on_demand | autonomous
 
 
 @dataclass

@@ -34,12 +34,23 @@ RIO_SYSTEM_INSTRUCTION = (
     "Keep responses concise and conversational. When the user asks about code, "
     "be specific and actionable. You have access to tools that can read files, "
     "write files, patch files, and run shell commands on the user's machine. "
-    "Use them when the user asks you to examine, edit, or run code."
+    "Use them when the user asks you to examine, edit, or run code.\n\n"
+    "SCREEN CAPTURE: You are NOT always seeing the user's screen. Screen "
+    "vision is on-demand by default to save API credits. When the user asks "
+    "you to look at their screen, check their code visually, or says anything "
+    "like 'capture my screen', 'look at my screen', 'what's on my screen', "
+    "'check my screen' — call the capture_screen tool to take a screenshot. "
+    "The screenshot will be sent to your vision context. If the user has "
+    "enabled autonomous mode, you will receive periodic screen frames "
+    "automatically and do NOT need to call capture_screen."
 )
 
 # Model identifiers
 TEXT_MODEL = "gemini-2.5-flash"  # Standard API for L0 text mode
 LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"  # Live API for L1+ audio
+
+# Maximum consecutive stream errors before giving up in receive_live()
+MAX_STREAM_RETRIES = 5
 
 # ---------------------------------------------------------------------------
 # Tool declarations — exposed to Gemini via function calling
@@ -130,6 +141,22 @@ RIO_TOOL_DECLARATIONS = [
                     "required": ["command"],
                 },
             ),
+            types.FunctionDeclaration(
+                name="capture_screen",
+                description=(
+                    "Capture a screenshot of the user's screen right now and "
+                    "send it to your vision context. Use this when the user "
+                    "asks you to look at their screen, check something visual, "
+                    "or when you need to see what they are currently working on. "
+                    "The screenshot will appear as an inline image in your next "
+                    "context window."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {},
+                    "required": [],
+                },
+            ),
         ]
     ),
 ]
@@ -166,6 +193,7 @@ class GeminiSession:
         self._mode = mode  # May change to "text" if Live API connect fails
         self._live_session = None  # Live API session object
         self._live_ctx = None      # Async context manager for Live session
+        self._live_connect_error: str | None = None  # Error detail when Live API fails
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -192,10 +220,12 @@ class GeminiSession:
                         "gemini.connect.ok", mode="live", model=LIVE_MODEL,
                     )
                     return
-                except Exception:
+                except Exception as exc:
+                    self._live_connect_error = str(exc)
                     self._log.exception(
                         "gemini.connect.live_failed",
                         note="Falling back to text mode",
+                        error=self._live_connect_error,
                     )
                     self._mode = "text"
                     self._live_session = None
@@ -288,6 +318,41 @@ class GeminiSession:
             self._log.debug("gemini.send_text.attached_image", mime=img_mime)
 
         parts.append(types.Part(text=text))
+        self._history.append(types.Content(role="user", parts=parts))
+
+    async def send_context(self, context_text: str) -> None:
+        """Inject proactive context into the Gemini session.
+
+        Used by the struggle detector (L4) to prompt Gemini to offer
+        help without the user explicitly asking.
+
+        Live mode:  Sends text into the Live session with end_of_turn=True
+                    so Gemini responds proactively with voice.
+        Text mode:  Appends to history as a user message.  The relay task
+                    will call receive() and get Gemini's proactive response.
+        """
+        if not self._connected or self._client is None:
+            self._log.warning("gemini.send_context.not_connected")
+            return
+
+        self._log.info(
+            "gemini.send_context",
+            text_length=len(context_text),
+            mode=self._mode,
+        )
+
+        # ---- Live mode: inject into the bidirectional stream ----
+        if self._mode == "live" and self._live_session is not None:
+            try:
+                await self._live_session.send(
+                    input=context_text, end_of_turn=True,
+                )
+            except Exception:
+                self._log.exception("gemini.send_context.live_error")
+            return
+
+        # ---- Text mode (L0): append to history ----
+        parts = [types.Part(text=context_text)]
         self._history.append(types.Content(role="user", parts=parts))
 
     async def receive(self) -> AsyncGenerator[ReceiveItem, None]:
@@ -409,6 +474,11 @@ class GeminiSession:
 
     async def _connect_live(self) -> None:
         """Open a persistent Live API session for bidirectional streaming."""
+        self._log.info(
+            "gemini.live.connecting",
+            model=LIVE_MODEL,
+            tools_enabled=self._tools_enabled,
+        )
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -418,7 +488,9 @@ class GeminiSession:
                     )
                 )
             ),
-            system_instruction=RIO_SYSTEM_INSTRUCTION,
+            system_instruction=types.Content(
+                parts=[types.Part(text=RIO_SYSTEM_INSTRUCTION)]
+            ),
             tools=RIO_TOOL_DECLARATIONS if self._tools_enabled else None,
         )
         self._live_ctx = self._client.aio.live.connect(
@@ -488,10 +560,15 @@ class GeminiSession:
 
         self._log.info("gemini.receive_live.start")
 
+        consecutive_errors = 0
+
         try:
             while self._connected and self._live_session is not None:
                 try:
                     async for response in self._live_session.receive():
+                        # Reset error counter on successful receive
+                        consecutive_errors = 0
+
                         # -- Server content (model turn / turn complete) --
                         server_content = getattr(response, "server_content", None)
                         if server_content is not None:
@@ -551,7 +628,18 @@ class GeminiSession:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    self._log.exception("gemini.receive_live.stream_error")
+                    consecutive_errors += 1
+                    self._log.exception(
+                        "gemini.receive_live.stream_error",
+                        consecutive_errors=consecutive_errors,
+                        max_retries=MAX_STREAM_RETRIES,
+                    )
+                    if consecutive_errors >= MAX_STREAM_RETRIES:
+                        self._log.error(
+                            "gemini.receive_live.max_retries_exceeded",
+                            consecutive_errors=consecutive_errors,
+                        )
+                        break
                     if self._connected:
                         await asyncio.sleep(1.0)
                         continue

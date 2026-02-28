@@ -147,7 +147,8 @@ class SessionManager:
 
     async def _check_timeouts(self) -> None:
         now = time.monotonic()
-        stale_ids: list[str] = []
+        expired_ids: list[str] = []
+        idle_ids: list[str] = []
 
         async with self._lock:
             for cid, last_hb in list(self._heartbeats.items()):
@@ -161,7 +162,7 @@ class SessionManager:
                         client_id=cid,
                         age_s=round(age),
                     )
-                    stale_ids.append(cid)
+                    expired_ids.append(cid)
                     continue
 
                 # Idle timeout -- attempt reconnect
@@ -171,10 +172,17 @@ class SessionManager:
                         client_id=cid,
                         idle_s=round(idle),
                     )
-                    stale_ids.append(cid)
+                    idle_ids.append(cid)
 
-        # Reconnect outside the lock to avoid holding it during I/O
-        for cid in stale_ids:
+        # Remove expired sessions (hard lifetime cap -- no reconnect)
+        for cid in expired_ids:
+            try:
+                await self.remove_session(cid)
+            except Exception:
+                self._log.exception("session.remove_failed", client_id=cid)
+
+        # Reconnect idle sessions outside the lock to avoid holding it during I/O
+        for cid in idle_ids:
             try:
                 await self.reconnect_session(cid)
             except Exception:

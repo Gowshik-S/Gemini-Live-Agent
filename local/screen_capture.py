@@ -125,7 +125,11 @@ class ScreenCapture:
 
         try:
             with _mss_mod.mss() as sct:
-                monitor = sct.monitors[1]  # Primary monitor
+                try:
+                    monitor = sct.monitors[1]  # Primary monitor
+                except IndexError:
+                    monitor = sct.monitors[0]  # Fallback to full virtual screen
+                    log.warning("screen_capture.no_primary_monitor, using monitors[0]")
                 raw = sct.grab(monitor)
 
             # Convert to PIL Image (mss provides .rgb for RGB bytes)

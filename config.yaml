@@ -22,6 +22,7 @@ rio:
     push_to_talk: "f2"
     screenshot: "f3"
     toggle_proactive: "f4"
+    screen_mode: "f5"
 
   # Voice Activity Detection (Day 5)
   vad:
@@ -33,6 +34,7 @@ rio:
     fps: 0.33                 # ~1 frame every 3 seconds
     quality: 60               # JPEG quality (0-100)
     resize_factor: 0.5        # downscale factor before sending
+    default_mode: "on_demand" # on_demand | autonomous (on_demand saves Gemini credits)
 
   # Struggle detection settings (Layer 3+)
   struggle:

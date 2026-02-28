@@ -69,6 +69,36 @@ dashboard_lock = asyncio.Lock()
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Background: periodic dashboard health broadcast
+# ---------------------------------------------------------------------------
+async def _dashboard_health_broadcast_loop() -> None:
+    """Push rate-limiter and health stats to dashboard clients every 3s."""
+    while True:
+        await asyncio.sleep(3)
+        if not dashboard_clients:
+            continue
+        try:
+            usage = rate_limiter.get_usage()
+            await _broadcast_dashboard({
+                "type": "dashboard",
+                "subtype": "health",
+                "rpm": usage["rpm"],
+                "budget": usage["budget"],
+                "utilization_pct": usage["utilization_pct"],
+                "model": "Flash",
+                "sessions_active": session_manager.active_count if session_manager else 0,
+            })
+            await _broadcast_dashboard({
+                "type": "dashboard",
+                "subtype": "rate_limit",
+                "current_rpm": usage["rpm"],
+                "status": usage["degradation_level"].lower(),
+            })
+        except Exception:
+            logger.debug("dashboard.health_broadcast.error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global session_manager
@@ -79,7 +109,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     session_manager = SessionManager(api_key=GEMINI_API_KEY, session_mode=SESSION_MODE)
     logger.info("rio.startup", gemini_key_set=bool(GEMINI_API_KEY), session_mode=SESSION_MODE)
 
+    # Start background health broadcaster
+    health_task = asyncio.create_task(
+        _dashboard_health_broadcast_loop(),
+        name="dashboard-health",
+    )
+
     yield  # --- application runs here ---
+
+    health_task.cancel()
+    try:
+        await health_task
+    except asyncio.CancelledError:
+        pass
 
     logger.info("rio.shutdown")
     await session_manager.shutdown()
@@ -90,14 +132,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Rio Cloud Service",
-    version="0.1.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
 # CORS -- allow dashboard & local client origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8080",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -123,7 +172,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "rio-cloud",
-        "version": "0.1.0",
+        "version": "0.5.0",
         "sessions_active": session_manager.active_count if session_manager else 0,
         "rate_limiter": rate_limiter.get_usage(),
         "routing": model_router.get_routing_stats(),
@@ -181,6 +230,14 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     log = logger.bind(client_id=client_id)
     log.info("client.connected")
 
+    # Broadcast client connection to dashboard
+    await _broadcast_dashboard({
+        "type": "dashboard",
+        "subtype": "client_event",
+        "event": "connected",
+        "client_id": client_id,
+    })
+
     assert session_manager is not None, "SessionManager not initialised"
 
     # ---- Create Gemini session ----
@@ -192,6 +249,31 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             "action": "connected",
             "detail": "Gemini Live session ready",
         }))
+
+        # Tell the client which session mode is actually active
+        await websocket.send_text(json.dumps({
+            "type": "control",
+            "action": "session_mode",
+            "actual_mode": gemini.mode,
+            "requested_mode": SESSION_MODE,
+        }))
+
+        # If the session silently fell back from live to text, warn the client
+        if SESSION_MODE == "live" and gemini.mode == "text":
+            log.warning(
+                "client.live_fallback",
+                requested=SESSION_MODE,
+                actual=gemini.mode,
+                error=gemini._live_connect_error,
+            )
+            await websocket.send_text(json.dumps({
+                "type": "control",
+                "action": "live_api_unavailable",
+                "detail": (
+                    f"Live API connection failed — running in text mode. "
+                    f"Error: {gemini._live_connect_error or 'unknown'}"
+                ),
+            }))
     except Exception:
         log.exception("client.session_create_failed")
         try:
@@ -549,8 +631,35 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 await tool_result_queue.put(frame)
 
             elif frame_type == "context":
-                # L4 stub: struggle detection / memory context injection
-                log.debug("client.context.stub", note="Context injection not handled in L0")
+                # L4: Struggle detection / memory context injection
+                subtype = frame.get("subtype", "unknown")
+                content = frame.get("content", "")
+                confidence = frame.get("confidence", 0.0)
+                signals = frame.get("signals", [])
+
+                log.info(
+                    "client.context",
+                    subtype=subtype,
+                    confidence=confidence,
+                    signals=signals,
+                )
+
+                if subtype == "struggle" and content:
+                    # Inject the struggle context into Gemini so it responds proactively
+                    try:
+                        await gemini.send_context(content)
+                    except Exception:
+                        log.exception("client.context.send_failed")
+
+                    # Broadcast to dashboard
+                    await _broadcast_dashboard({
+                        "type": "dashboard",
+                        "subtype": "struggle",
+                        "confidence": confidence,
+                        "signals": signals,
+                    })
+                else:
+                    log.debug("client.context.unhandled", subtype=subtype)
 
             elif frame_type == "control":
                 action = frame.get("action", "")
@@ -583,6 +692,14 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 pass
         await session_manager.remove_session(client_id)
         log.info("client.cleanup_done")
+
+        # Broadcast client disconnection to dashboard
+        await _broadcast_dashboard({
+            "type": "dashboard",
+            "subtype": "client_event",
+            "event": "disconnected",
+            "client_id": client_id,
+        })
 
 
 # ---------------------------------------------------------------------------

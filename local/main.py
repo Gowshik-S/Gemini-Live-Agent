@@ -103,12 +103,12 @@ BANNER = r"""
  |  _ \(_) ___
  | |_) | |/ _ \
  |  _ <| | (_) |
- |_| \_\_|\___/   v0.5.0 — Layer 4 (struggle detection)
+ |_| \_\_|\___/   v0.5.1 — Screen mode toggle
 
  Proactive AI Pair Programmer
  Voice + screen vision + tools + struggle detection with Gemini.
- F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  Text input via stdin.
- Ctrl-C to quit.
+ F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
+ Text input via stdin.  Ctrl-C to quit.
 """
 
 
@@ -135,7 +135,7 @@ def _audio_mode(ptt, vad) -> str:
 # ---------------------------------------------------------------------------
 
 async def receive_loop(client: WSClient, playback=None, tool_executor=None,
-                       struggle_detector=None) -> None:
+                       struggle_detector=None, screen=None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     async for msg in client.receive():
         if isinstance(msg, dict):
@@ -183,6 +183,16 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     print("  [reconnecting...]")
                 elif action == "turn_complete":
                     log.debug("cloud.turn_complete")
+                elif action == "session_mode":
+                    actual = msg.get("actual_mode", "???")
+                    requested = msg.get("requested_mode", "???")
+                    print(f"  [session mode: {actual} (requested: {requested})]")
+                elif action == "live_api_unavailable":
+                    detail = msg.get("detail", "")
+                    print(f"  [warning] {detail}")
+                    print("  [Rio is running in text-only mode — no voice]")
+                elif action == "live_ready":
+                    print("  [Live API session fully initialized — voice active]")
 
             elif msg_type == "dashboard":
                 # Dashboard-only messages — ignore in CLI
@@ -194,6 +204,40 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 tool_args = msg.get("args", {})
                 log.info("tool_call.received", name=tool_name, args=tool_args)
                 print(f"\n  [tool] {tool_name}({_format_tool_args(tool_args)})")
+
+                # Special handling: capture_screen tool
+                if tool_name == "capture_screen" and screen is not None:
+                    try:
+                        jpeg = await screen.capture_async(force=True)
+                        if jpeg is not None:
+                            await client.send_binary(IMAGE_PREFIX + jpeg)
+                            result = {
+                                "success": True,
+                                "message": "Screenshot captured and sent to your vision context.",
+                                "size_kb": round(len(jpeg) / 1024, 1),
+                            }
+                            log.info("capture_screen.sent", size_kb=result["size_kb"])
+                            print(f"  [screenshot captured and sent — {result['size_kb']} KB]")
+                        else:
+                            result = {
+                                "success": False,
+                                "error": "Screen capture returned empty frame.",
+                            }
+                            print("  [screenshot failed — empty frame]")
+                    except Exception as exc:
+                        log.exception("capture_screen.error")
+                        result = {"success": False, "error": str(exc)}
+                        print(f"  [screenshot error: {exc}]")
+                    try:
+                        await client.send_json({
+                            "type": "tool_result",
+                            "name": "capture_screen",
+                            "result": result,
+                        })
+                    except ConnectionError:
+                        log.warning("capture_screen.send_failed")
+                    print("  You: ", end="", flush=True)
+                    continue
 
                 if tool_executor is not None:
                     result = await tool_executor.execute(tool_name, tool_args)
@@ -411,8 +455,13 @@ async def audio_capture_loop(
 async def screen_capture_loop(
     client: WSClient,
     screen: "ScreenCapture",
+    autonomous_mode: asyncio.Event,
 ) -> None:
     """Periodically capture the screen and send as binary vision frames.
+
+    Only runs when autonomous_mode is set.  In on-demand mode, this loop
+    sleeps until the mode is toggled (via F5 or voice command), saving
+    Gemini API credits.
 
     Uses delta detection to skip unchanged frames. The interval is
     derived from ``vision.fps`` in config.yaml (default: 1 frame / 3s).
@@ -421,6 +470,8 @@ async def screen_capture_loop(
     frames_sent = 0
 
     while True:
+        # Block here until autonomous mode is activated
+        await autonomous_mode.wait()
         await asyncio.sleep(interval)
 
         if not client.is_connected:
@@ -487,6 +538,37 @@ async def screenshot_hotkey_loop(
             log.exception("screenshot.error")
             print("  [screenshot error]")
 
+        print("  You: ", end="", flush=True)
+        await trigger.wait_for_release()
+
+
+# ---------------------------------------------------------------------------
+# Screen mode toggle loop — F5 switches between on-demand and autonomous
+# ---------------------------------------------------------------------------
+
+async def screen_mode_toggle_loop(
+    trigger: "PushToTalk",
+    autonomous_mode: asyncio.Event,
+) -> None:
+    """Wait for the screen-mode hotkey (F5) and toggle autonomous mode.
+
+    - on_demand (default): Frames only sent via F3, voice, or capture_screen tool.
+      Saves Gemini API credits.
+    - autonomous: Periodic frames sent every ~3s (original behaviour).
+    """
+    while True:
+        await trigger.wait_for_press()
+
+        if autonomous_mode.is_set():
+            autonomous_mode.clear()
+            mode_label = "on-demand"
+            log.info("screen_mode.toggled", mode="on_demand")
+        else:
+            autonomous_mode.set()
+            mode_label = "autonomous"
+            log.info("screen_mode.toggled", mode="autonomous")
+
+        print(f"\n  [screen mode: {mode_label}]")
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
 
@@ -790,6 +872,29 @@ async def main() -> None:
     elif screen is not None:
         print("  Screenshot: periodic only (pynput not available)")
 
+    # -- Initialize screen mode (on-demand vs autonomous) ----------------------
+    autonomous_mode = asyncio.Event()
+    if config.vision.default_mode == "autonomous":
+        autonomous_mode.set()
+        screen_mode_label = "autonomous"
+    else:
+        # on_demand is the default — event stays cleared
+        screen_mode_label = "on-demand"
+    if screen is not None:
+        print(f"  Screen mode: {screen_mode_label} (F5 to toggle)")
+        log.info("screen_mode.init", mode=config.vision.default_mode)
+
+    # -- Initialize F5 screen mode toggle hotkey --------------------------------
+    screen_mode_trigger = None
+    if screen is not None and PushToTalk is not None:
+        screen_mode_trigger = PushToTalk.create(
+            key_name=config.hotkeys.screen_mode,
+        )
+        if screen_mode_trigger is not None:
+            log.info("screen_mode.hotkey_ready", key=config.hotkeys.screen_mode)
+        else:
+            log.warning("screen_mode.hotkey_unavailable")
+    
     # -- Initialize tool executor (L3) -----------------------------------------
     tool_executor = None
     if ToolExecutor is not None:
@@ -884,7 +989,7 @@ async def main() -> None:
     # -- Run all loops concurrently ----------------------------------------
     tasks: set[asyncio.Task] = set()
 
-    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector), name="recv"))
+    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen), name="recv"))
     tasks.add(asyncio.create_task(input_loop(client, struggle_detector), name="input"))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
 
@@ -895,7 +1000,7 @@ async def main() -> None:
 
     if screen is not None:
         tasks.add(asyncio.create_task(
-            screen_capture_loop(client, screen), name="screen"
+            screen_capture_loop(client, screen, autonomous_mode), name="screen"
         ))
 
     if screenshot_trigger is not None and screen is not None:
@@ -920,6 +1025,15 @@ async def main() -> None:
             name="proactive_trigger",
         ))
 
+    # Screen mode toggle loop (F5)
+    if screen_mode_trigger is not None and screen is not None:
+        screen_mode_trigger.start(asyncio.get_running_loop())
+        print(f"  [press {config.hotkeys.screen_mode.upper()} to toggle screen mode]")
+        tasks.add(asyncio.create_task(
+            screen_mode_toggle_loop(screen_mode_trigger, autonomous_mode),
+            name="screen_mode",
+        ))
+
     # Wait until any task exits (user typed /quit, Ctrl-C, or fatal error)
     done, pending = await asyncio.wait(
         tasks,
@@ -934,6 +1048,8 @@ async def main() -> None:
         ptt.stop()
     if screenshot_trigger is not None:
         screenshot_trigger.stop()
+    if screen_mode_trigger is not None:
+        screen_mode_trigger.stop()
     if proactive_trigger is not None:
         proactive_trigger.stop()
     if capture is not None:

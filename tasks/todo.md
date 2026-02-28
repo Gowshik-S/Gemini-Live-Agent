@@ -1,6 +1,6 @@
 # Rio Build Progress
 
-## Current Layer: L3 — Tools (Day 8) ✅ COMPLETE
+## Current Layer: L4 — Struggle Detection (Day 9-10) ✅ COMPLETE
 
 ### Day 1: Cloud Scaffold — COMPLETE (original agent)
 - [x] Cloud scaffold (FastAPI + WS + Gemini session + rate limiter + model router)
@@ -100,6 +100,70 @@
 - [x] Version bumped to v0.4.0 (Layer 3: voice + vision + tools)
 - [x] System instruction updated to mention tool capabilities
 
+### Day 9-10: Struggle Detection (L4) — COMPLETE
+- [x] Created `local/struggle_detector.py` — StruggleDetector class
+  - [x] 4 screen-based signals (no pynput keystroke monitoring):
+    1. Repeated error — same screen hash 3+ times in 2-min window (weight 0.35)
+    2. Long pause on error — screen unchanged >30s after error keywords (weight 0.25)
+    3. Rapid small screen changes — 5+ distinct hashes in 60s (weight 0.20)
+    4. Stale screen with activity — unchanged >45s but user recently active (weight 0.20)
+  - [x] StruggleResult dataclass: confidence, active_signals, should_trigger, reason
+  - [x] feed_frame(jpeg_bytes) — stores MD5 hash + timestamp in rolling deque
+  - [x] feed_gemini_response(text) — checks for error keywords, primes Signal 2
+  - [x] note_user_activity() — updates last activity time for Signal 4
+  - [x] evaluate() — computes weighted sum, checks threshold + signal count + cooldown
+  - [x] Cooldown: record_trigger() (standard), record_decline() (longer cooldown)
+  - [x] Demo mode: threshold=0.4, cooldown=30s, min_signals=1
+  - [x] force_trigger() — bypasses all signals for F4 demo key
+  - [x] No sklearn dependency — pure Python weighted sum
+  - [x] Follows graceful degradation pattern (try/except ImportError in main.py)
+  - [x] structlog logging throughout
+- [x] Modified `local/main.py`:
+  - [x] Added StruggleDetector import guard (try/except)
+  - [x] Added struggle detector initialization after tool executor
+  - [x] Added `struggle_detection_loop()` — runs every 2s, feeds frames, evaluates, sends context
+  - [x] Added `proactive_trigger_loop()` — F4 demo key, force trigger
+  - [x] receive_loop: feeds Gemini responses to detector (feed_gemini_response)
+  - [x] input_loop: notes user activity (note_user_activity)
+  - [x] F4 PushToTalk.create() for demo mode proactive trigger
+  - [x] Struggle + proactive trigger tasks added to asyncio task set
+  - [x] Shutdown: stops proactive trigger listener
+  - [x] Version bumped to v0.5.0 (Layer 4: struggle detection)
+- [x] Modified `cloud/main.py`:
+  - [x] Replaced context frame stub with full handler
+  - [x] Extracts subtype, content, confidence, signals from context frames
+  - [x] Calls gemini.send_context() for struggle subtype
+  - [x] Broadcasts to dashboard: {type: dashboard, subtype: struggle, confidence, signals}
+- [x] Modified `cloud/gemini_session.py`:
+  - [x] Added send_context() method — dual-mode (live + text)
+  - [x] Live mode: sends to Live session with end_of_turn=True
+  - [x] Text mode: appends to history as user message
+- [x] Config already wired (config.yaml struggle section + StruggleConfig dataclass)
+
+## Architecture Decisions (Day 9-10 / L4)
+- **4 signals (screen-based)**: Deferred pynput keystroke/window-switching signals to polish phase
+- **No sklearn**: Pure Python weighted sum, zero extra dependencies
+- **F4 manual trigger**: demo_mode repurposes toggle_proactive hotkey as force-trigger
+- **send_context() vs send_text()**: Dedicated method keeps struggle injection separate from user messages
+- **Evaluation interval**: 2 seconds — fast enough to detect, negligible CPU
+- **Frame capture**: force=True in struggle loop to bypass delta detection (needs fresh frames for hash comparison)
+- **Error keyword tracking**: Gemini response → feed_gemini_response() → primes Signal 2 (long pause on error)
+- **Keystroke signals deferred**: Signals 2/5 from plan (undo/redo, SO switching) moved to L7 polish phase
+
+### Screen Mode Toggle (v0.5.1) — COMPLETE
+- [x] Added `default_mode: "on_demand"` to VisionConfig (config.yaml + config.py)
+- [x] Added `screen_mode: "f5"` to HotkeyConfig (config.yaml + config.py)
+- [x] Added `capture_screen` Gemini tool declaration (gemini_session.py)
+- [x] Updated system instruction to explain on-demand screen capture + capture_screen tool
+- [x] Gated `screen_capture_loop` with `asyncio.Event(autonomous_mode)` — only sends periodic frames when autonomous
+- [x] Added `screen_mode_toggle_loop()` — F5 hotkey toggles on-demand ↔ autonomous
+- [x] Intercept `capture_screen` tool_call in `receive_loop` — takes screenshot + sends to cloud
+- [x] Initialize autonomous_mode event based on config.vision.default_mode in main()
+- [x] Initialize F5 PushToTalk + screen_mode_trigger in main()
+- [x] Added screen_mode task to asyncio task set + shutdown cleanup
+- [x] Updated receive_loop signature to accept `screen` param for capture_screen
+- [x] Version bumped to v0.5.1, banner updated with F5=Screen-mode
+
 ## Architecture Decisions
 - **L0 (text)**: Standard `generate_content` API (stateful via history) — fallback mode
 - **L1 (live)**: Live API (`bidiGenerateContent`) via `aio.live.connect()` — primary mode
@@ -117,13 +181,60 @@
 - **Safety**: 5-round max per request, 60s timeout per tool call, command blocklist
 - **generate_content vs stream**: Switched to non-streaming generate_content for L3 (function calls don't chunk well in streams)
 
+### Day 12: Dashboard UI Wiring (L6) — COMPLETE
+- [x] Created `ui/dashboard/index.html` — single-page layout, dense grid
+  - [x] Top bar: brand logo (SVG), connection status pill, latency, model badge, session mode
+  - [x] Left column: full-height live transcript panel
+  - [x] Right column: struggle gauge + tool execution log + system health grid
+  - [x] All icons are inline SVG (no emojis, no external icon libs)
+- [x] Created `ui/dashboard/css/style.css` — Obsidian Slate dark theme
+  - [x] CSS custom properties (design tokens) for all colors
+  - [x] IBM Plex Sans + IBM Plex Mono via Google Fonts
+  - [x] Panels, pills, cards, scrollbars, progress bars
+  - [x] Responsive: stacks to single column below 860px
+  - [x] Pulse animation for connecting state
+  - [x] Smooth transitions on all interactive elements
+- [x] Created `ui/dashboard/js/websocket.js` — WebSocket connection manager
+  - [x] Auto-connect to /ws/dashboard on page load
+  - [x] Exponential backoff reconnect (1s up to 15s)
+  - [x] Ping keepalive every 10s
+  - [x] Event dispatching: routes by type/subtype to other modules
+  - [x] Connection status UI updates (pill color changes)
+- [x] Created `ui/dashboard/js/transcript.js` — live conversation display
+  - [x] SVG avatars for user/rio/system messages
+  - [x] Auto-scroll with smart detection (pauses on manual scroll-up)
+  - [x] Timestamp per message
+  - [x] Prunes at 200 messages
+  - [x] Fade-in animation on new messages
+- [x] Created `ui/dashboard/js/gauge.js` — struggle confidence meter
+  - [x] SVG semicircular arc gauge with gradient (green-yellow-red)
+  - [x] Animated needle + arc fill with easing
+  - [x] Numeric value display with color coding by threshold
+  - [x] 4 signal indicator tiles with active/high states
+  - [x] Label updates: No signals / Low activity / Monitoring / Struggling detected
+- [x] Created `ui/dashboard/js/toollog.js` — tool execution log
+  - [x] Per-tool SVG icons (read_file, write_file, patch_file, run_command, capture_screen)
+  - [x] Pending/success/error status icon coloring
+  - [x] Argument display (path for file ops, command for shell)
+  - [x] Auto-prunes at 50 entries
+- [x] Created `ui/dashboard/js/health.js` — system health panel
+  - [x] RPM usage with progress bar (green/warning/error states)
+  - [x] Session uptime timer
+  - [x] Message counter, screenshot counter, struggle trigger counter
+  - [x] Rate limiter status (Normal/Caution/Emergency/Critical)
+  - [x] Latency polling with color coding
+  - [x] Session mode + model badge updates from control events
+- [x] Modified `cloud/main.py`:
+  - [x] Added `_dashboard_health_broadcast_loop()` — pushes RPM/health every 3s
+  - [x] Background task created in lifespan, cancelled on shutdown
+  - [x] Broadcasts rate_limit status + health stats
+  - [x] Added client connect/disconnect dashboard events
+- [x] Version remains v0.5.1 (L6 is UI-only, no local client changes needed)
+
 ## Upcoming
-- L1: Voice via Live API (Days 3-5 rework — parallel)
-- L4: Struggle Detection (Days 9-10)
 - L5: Memory (Day 11)
-- L6: Dashboard (Day 12)
-- L7: Polish (Days 13-14)
-- L8: Demo (Days 15-16)
+- L7: Polish — keystroke signals, Pro model routing, reconnect (Days 13-14)
+- L8: Demo + Docs (Days 15-16)
 
 ## Lessons
 - `gemini-2.0-flash-exp` does NOT exist for bidiGenerateContent (Live API)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -115,11 +116,21 @@ class ToolExecutor:
     # ------------------------------------------------------------------
 
     def _resolve(self, path: str) -> Path:
-        """Resolve a path relative to the working directory."""
+        """Resolve a path relative to the working directory.
+
+        Raises ValueError if the resolved path escapes the working directory
+        (path traversal protection).
+        """
         p = Path(path)
         if not p.is_absolute():
             p = Path(self._cwd) / p
-        return p.resolve()
+        resolved = p.resolve()
+        cwd_resolved = Path(self._cwd).resolve()
+        if not str(resolved).startswith(str(cwd_resolved) + os.sep) and resolved != cwd_resolved:
+            raise ValueError(
+                f"Path traversal blocked: {path!r} resolves outside working directory"
+            )
+        return resolved
 
     # ------------------------------------------------------------------
     # read_file
@@ -239,8 +250,8 @@ class ToolExecutor:
         """Blocking subprocess execution (runs in executor)."""
         try:
             proc = subprocess.run(
-                command,
-                shell=True,
+                shlex.split(command),
+                shell=False,
                 capture_output=True,
                 text=True,
                 cwd=self._cwd,
