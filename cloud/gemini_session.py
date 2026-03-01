@@ -45,9 +45,9 @@ RIO_SYSTEM_INSTRUCTION = (
     "automatically and do NOT need to call capture_screen."
 )
 
-# Model identifiers
-TEXT_MODEL = "gemini-2.5-flash"  # Standard API for L0 text mode
-LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"  # Live API for L1+ audio
+# Model identifiers — defaults; can be overridden via constructor args
+DEFAULT_TEXT_MODEL = "gemini-2.5-flash"  # Standard API for L0 text mode
+DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"  # Live API for L1+ audio
 
 # Maximum consecutive stream errors before giving up in receive_live()
 MAX_STREAM_RETRIES = 5
@@ -176,12 +176,16 @@ class GeminiSession:
     # str = text chunk, dict = tool_call descriptor
     ReceiveItem = Union[str, dict]
 
-    def __init__(self, api_key: str, client_id: str, mode: str = "live") -> None:
+    def __init__(self, api_key: str, client_id: str, mode: str = "live",
+                 text_model: str | None = None, live_model: str | None = None) -> None:
         self._api_key = api_key
         self._client_id = client_id
         self._client: genai.Client | None = None
         self._connected = False
         self._log = logger.bind(client_id=client_id)
+        # Model selection — use provided values or fall back to defaults
+        self._text_model = text_model or DEFAULT_TEXT_MODEL
+        self._live_model = live_model or DEFAULT_LIVE_MODEL
         # Conversation history for stateful text mode (L0)
         self._history: list[types.Content] = []
         # L2: pending screenshot for next interaction
@@ -217,7 +221,7 @@ class GeminiSession:
                     await self._connect_live()
                     self._connected = True
                     self._log.info(
-                        "gemini.connect.ok", mode="live", model=LIVE_MODEL,
+                        "gemini.connect.ok", mode="live", model=self._live_model,
                     )
                     return
                 except Exception as exc:
@@ -233,7 +237,7 @@ class GeminiSession:
 
             # Text mode (L0 fallback)
             self._connected = True
-            self._log.info("gemini.connect.ok", mode="text", model=TEXT_MODEL)
+            self._log.info("gemini.connect.ok", mode="text", model=self._text_model)
         except Exception:
             self._connected = False
             self._log.exception("gemini.connect.failed")
@@ -388,7 +392,7 @@ class GeminiSession:
         for attempt in range(max_retries):
             try:
                 response = await self._client.aio.models.generate_content(
-                    model=TEXT_MODEL,
+                    model=self._text_model,
                     contents=self._history,
                     config=types.GenerateContentConfig(
                         system_instruction=RIO_SYSTEM_INSTRUCTION,
@@ -442,9 +446,30 @@ class GeminiSession:
                         )
                         yield full_text
 
-                # Keep history bounded (last 20 turns = 40 messages)
+                # Keep history bounded -- but never trim in the middle of
+                # a tool-call chain (model function_call followed by user
+                # function_response).  Find a safe trim point.
                 if len(self._history) > 40:
-                    self._history = self._history[-20:]
+                    trim_to = 20
+                    # Walk backwards from trim_to to find a safe cut point
+                    # (not between a tool call and its result)
+                    while trim_to > 0:
+                        entry = self._history[-(trim_to)]
+                        # Check if this entry is a function_response (tool result)
+                        is_tool_result = False
+                        if entry.role == "user":
+                            for p in (entry.parts or []):
+                                if hasattr(p, "function_response") and p.function_response:
+                                    is_tool_result = True
+                                    break
+                        if is_tool_result:
+                            # Don't cut here -- the preceding model tool_call
+                            # would be orphaned.  Include one more entry.
+                            trim_to += 1
+                        else:
+                            break
+                    trim_to = min(trim_to, len(self._history))
+                    self._history = self._history[-trim_to:]
 
                 self._log.debug("gemini.receive.turn_complete")
                 return  # Success — exit retry loop
@@ -476,7 +501,7 @@ class GeminiSession:
         """Open a persistent Live API session for bidirectional streaming."""
         self._log.info(
             "gemini.live.connecting",
-            model=LIVE_MODEL,
+            model=self._live_model,
             tools_enabled=self._tools_enabled,
         )
         config = types.LiveConnectConfig(
@@ -494,12 +519,12 @@ class GeminiSession:
             tools=RIO_TOOL_DECLARATIONS if self._tools_enabled else None,
         )
         self._live_ctx = self._client.aio.live.connect(
-            model=LIVE_MODEL, config=config,
+            model=self._live_model, config=config,
         )
         self._live_session = await self._live_ctx.__aenter__()
         self._log.info(
             "gemini.live.session_opened",
-            model=LIVE_MODEL,
+            model=self._live_model,
             tools_enabled=self._tools_enabled,
         )
 

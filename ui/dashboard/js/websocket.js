@@ -14,6 +14,8 @@ const RioSocket = (() => {
   let _pingTimer = null;
   let _lastPong = 0;
   let _connectTime = 0;
+  let _pingSentAt = 0;
+  let _latencyMs = null;
 
   const MAX_RECONNECT_DELAY = 15000;
 
@@ -71,6 +73,13 @@ const RioSocket = (() => {
 
     _ws.onmessage = (event) => {
       _lastPong = Date.now();
+
+      // Track RTT for ping/pong latency measurement
+      if (event.data === 'pong' && _pingSentAt > 0) {
+        _latencyMs = Date.now() - _pingSentAt;
+        _pingSentAt = 0;
+        return; // Don't try to JSON-parse 'pong'
+      }
 
       // Try JSON parse
       let data;
@@ -140,8 +149,8 @@ const RioSocket = (() => {
   }
 
   function getLatency() {
-    if (!_connected || _lastPong === 0) return null;
-    return Date.now() - _lastPong;
+    if (!_connected) return null;
+    return _latencyMs;
   }
 
   function getConnectTime() {
@@ -164,6 +173,7 @@ const RioSocket = (() => {
   function _startPing() {
     _stopPing();
     _pingTimer = setInterval(() => {
+      _pingSentAt = Date.now();
       send('ping');
     }, 10000);
   }

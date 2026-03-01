@@ -16,8 +16,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY . .
 
+# Run as non-root user for security (Cloud Run best practice)
+RUN adduser --disabled-password --gecos "" riouser \
+    && chown -R riouser:riouser /app
+USER riouser
+
 # Cloud Run default port
 EXPOSE 8080
+
+# Health check so Cloud Run knows when the container is ready
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
 
 # Start the server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -37,8 +37,7 @@ log = structlog.get_logger(__name__)
 
 # Shell commands that are always blocked (case-insensitive regex patterns)
 COMMAND_BLOCKLIST = [
-    r"\brm\s+(-\w+\s+)*-r\w*\s+/\s*$",     # rm -rf /
-    r"\brm\s+(-\w+\s+)*-rf\s+/\s*$",        # rm -rf /
+    r"\brm\s+(-\w+\s+)*-r",                   # rm -r (any variant: -rf, -r /, -rf /*, etc.)
     r"\brm\s+(-\w+\s+)*--no-preserve-root",  # rm --no-preserve-root
     r"\bmkfs\b",                              # format filesystem
     r"\bformat\b",                            # format (Windows)
@@ -52,6 +51,13 @@ COMMAND_BLOCKLIST = [
     r"\bchmod\s+(-\w+\s+)*777\s+/",          # chmod 777 /
     r">\s*/dev/sd[a-z]",                      # write to disk device
     r">\s*/etc/passwd",                       # overwrite passwd
+    r"\bcurl\b.*\|\s*(ba)?sh",                # curl | bash / curl | sh
+    r"\bwget\b.*\|\s*(ba)?sh",                # wget | bash / wget | sh
+    r"\bsudo\s+rm\b",                         # sudo rm (any variant)
+    r"\bpython[23]?\s+-c\s+.*\bos\.system\b", # python -c inject via os.system
+    r"\bpython[23]?\s+-c\s+.*\bsubprocess\b", # python -c inject via subprocess
+    r"\b>\.\w+rc\b",                          # overwrite shell rc files
+    r">\s*/etc/",                             # overwrite any /etc/ file
 ]
 
 COMMAND_TIMEOUT = 30  # seconds
@@ -126,7 +132,12 @@ class ToolExecutor:
             p = Path(self._cwd) / p
         resolved = p.resolve()
         cwd_resolved = Path(self._cwd).resolve()
-        if not str(resolved).startswith(str(cwd_resolved) + os.sep) and resolved != cwd_resolved:
+        # Use is_relative_to (Python 3.9+) for correct path containment check.
+        # The old startswith approach had false positives:
+        # e.g. /home/user/project_evil passes startswith(/home/user/project)
+        try:
+            resolved.relative_to(cwd_resolved)
+        except ValueError:
             raise ValueError(
                 f"Path traversal blocked: {path!r} resolves outside working directory"
             )
@@ -249,9 +260,11 @@ class ToolExecutor:
     def _run_sync(self, command: str) -> dict[str, Any]:
         """Blocking subprocess execution (runs in executor)."""
         try:
+            # Use shell=True so pipes, redirects, &&, and env vars work.
+            # Dangerous commands are already blocked by the blocklist above.
             proc = subprocess.run(
-                shlex.split(command),
-                shell=False,
+                command,
+                shell=True,
                 capture_output=True,
                 text=True,
                 cwd=self._cwd,

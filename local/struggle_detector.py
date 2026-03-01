@@ -84,8 +84,9 @@ class StruggleResult:
 
 @dataclass
 class _FrameRecord:
-    hash: str
+    hash: str           # MD5 of raw JPEG bytes
     timestamp: float
+    text_hash: Optional[str] = None   # MD5 of OCR-extracted text (if available)
 
 
 # ---------------------------------------------------------------------------
@@ -213,16 +214,26 @@ class StruggleDetector:
     # Feed methods — called from main.py loops
     # ------------------------------------------------------------------
 
-    def feed_frame(self, jpeg_bytes: Optional[bytes]) -> None:
+    def feed_frame(
+        self,
+        jpeg_bytes: Optional[bytes],
+        ocr_text: Optional[str] = None,
+    ) -> None:
         """Process a screen capture frame.
 
         Called by the struggle detection loop with JPEG bytes from
         ScreenCapture.  Stores the MD5 hash + timestamp for signal
         analysis.
 
+        When ``ocr_text`` is provided (from the OCR engine), its hash
+        is stored alongside the JPEG hash.  Signal 1 prefers the text
+        hash because it is immune to pixel-level noise (cursor blink,
+        clock tick).
+
         Args:
             jpeg_bytes: Raw JPEG bytes, or None if capture failed /
                         returned delta-skip.
+            ocr_text: OCR-extracted text from the frame, or None.
         """
         if jpeg_bytes is None:
             return
@@ -230,13 +241,23 @@ class StruggleDetector:
         now = time.monotonic()
         frame_hash = hashlib.md5(jpeg_bytes).hexdigest()
 
+        # Compute text hash if OCR text available
+        text_hash: Optional[str] = None
+        if ocr_text and ocr_text.strip():
+            # Normalise whitespace so trivial spacing changes don't
+            # produce different hashes
+            normalised = " ".join(ocr_text.split())
+            text_hash = hashlib.md5(normalised.encode("utf-8", errors="replace")).hexdigest()
+
         # Track screen changes
         if frame_hash != self._current_hash:
             self._last_change_time = now
             self._current_hash = frame_hash
 
         # Add to rolling history
-        self._frame_history.append(_FrameRecord(hash=frame_hash, timestamp=now))
+        self._frame_history.append(
+            _FrameRecord(hash=frame_hash, timestamp=now, text_hash=text_hash)
+        )
 
         # Prune old entries beyond the max window (2 minutes)
         cutoff = now - self.REPEATED_ERROR_WINDOW
@@ -267,11 +288,11 @@ class StruggleDetector:
                 self._error_detected_time = time.monotonic()
                 return
 
-        # If Gemini response has no error keywords, clear the error state
-        # (Gemini successfully helped or topic changed)
-        if self._error_detected:
-            log.debug("struggle.error_cleared", reason="non_error_response")
-            self._error_detected = False
+        # Don't immediately clear error state on a single non-error response.
+        # The error may still be relevant (e.g., Gemini giving fix instructions).
+        # Instead, use a time-based decay: error state clears after 2 minutes
+        # of no new error keywords in Gemini responses.
+        # (Clearing is handled in _signal_long_pause_on_error via timestamp check)
 
     def note_user_activity(self) -> None:
         """Record that the user did something (typed, spoke, etc).
@@ -441,32 +462,53 @@ class StruggleDetector:
     # ------------------------------------------------------------------
 
     def _signal_repeated_error(self, now: float) -> tuple[bool, str]:
-        """Signal 1: Same screen hash appears 3+ times in 2-minute window.
+        """Signal 1: Same screen content appears 3+ times in 2-minute window
+        while an error has been detected in Gemini responses.
 
-        Indicates the developer keeps seeing the same error screen
-        (compile error, test failure, crash output).
+        Requires error_detected=True so the signal fires only when the
+        developer keeps seeing the same error screen (compile error, test
+        failure, crash).  Without error context, a static screen is just 
+        idle — not necessarily struggle.
+
+        When OCR text hashes are available, uses those instead of raw
+        JPEG hashes.  Text hashes are immune to pixel-level noise
+        (cursor blink, clock tick, notification badge) so the signal
+        is much more reliable.
         """
         if not self._frame_history:
             return False, ""
 
-        # Count occurrences of each hash in the window
+        # Only fire when Gemini has identified an error context
+        if not self._error_detected:
+            return False, ""
+
+        # Decide which hash to use: prefer OCR text hash, fall back to JPEG
+        # Check if any recent frame has a text_hash — if so, use text hashes
         cutoff = now - self.REPEATED_ERROR_WINDOW
+        has_text_hashes = any(
+            r.text_hash is not None
+            for r in self._frame_history
+            if r.timestamp >= cutoff
+        )
+
+        # Count occurrences of each hash in the window
         hash_counts: dict[str, int] = {}
         for record in self._frame_history:
             if record.timestamp >= cutoff:
-                hash_counts[record.hash] = hash_counts.get(record.hash, 0) + 1
+                # Use text_hash when available (more robust), else JPEG hash
+                h = (record.text_hash if has_text_hashes and record.text_hash else record.hash)
+                hash_counts[h] = hash_counts.get(h, 0) + 1
 
         # Find the most repeated hash
-        max_hash = ""
         max_count = 0
         for h, c in hash_counts.items():
             if c > max_count:
                 max_count = c
-                max_hash = h
 
         active = max_count >= self.REPEATED_ERROR_COUNT
+        hash_type = "text" if has_text_hashes else "pixel"
         detail = (
-            f"same screen seen {max_count}x in {int(self.REPEATED_ERROR_WINDOW)}s"
+            f"same error screen ({hash_type}) seen {max_count}x in {int(self.REPEATED_ERROR_WINDOW)}s"
             if active else ""
         )
         return active, detail
@@ -476,8 +518,19 @@ class StruggleDetector:
 
         Indicates the developer is staring at an error and not making
         progress — they might be stuck reading / understanding it.
+
+        Error state auto-expires after 2 minutes if no new error keywords
+        appear in Gemini responses (time-based decay instead of clearing
+        on every non-error response).
         """
         if not self._error_detected:
+            return False, ""
+
+        # Auto-expire error state after 2 minutes of no new error keywords
+        ERROR_STATE_TTL = 120.0  # seconds
+        if now - self._error_detected_time > ERROR_STATE_TTL:
+            log.debug("struggle.error_expired", reason="ttl_exceeded")
+            self._error_detected = False
             return False, ""
 
         time_since_change = now - self._last_change_time

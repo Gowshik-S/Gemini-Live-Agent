@@ -28,15 +28,21 @@ SESSION_MAX_LIFETIME_S = 30 * 60  # 30 minutes hard cap
 class SessionManager:
     """Thread-safe manager for per-client GeminiSession instances."""
 
-    def __init__(self, api_key: str, session_mode: str = "live") -> None:
+    def __init__(self, api_key: str, session_mode: str = "live",
+                 text_model: str | None = None, live_model: str | None = None) -> None:
         self._api_key = api_key
         self._session_mode = session_mode
+        self._text_model = text_model
+        self._live_model = live_model
         self._sessions: Dict[str, GeminiSession] = {}
         self._heartbeats: Dict[str, float] = {}
         self._created_at: Dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._heartbeat_task: Optional[asyncio.Task[None]] = None
         self._log = logger.bind(component="session_manager", session_mode=session_mode)
+        # Reconnect notifications — main.py polls this to detect stale sessions
+        self._reconnect_needed: Dict[str, bool] = {}
+        self._reconnected_sessions: Dict[str, GeminiSession] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -69,6 +75,8 @@ class SessionManager:
                 api_key=self._api_key,
                 client_id=client_id,
                 mode=mode,
+                text_model=self._text_model,
+                live_model=self._live_model,
             )
             await session.connect()
 
@@ -117,13 +125,40 @@ class SessionManager:
         System instruction is automatically restored because
         ``GeminiSession.connect()`` always injects it.
         Uses the manager's configured session_mode.
+
+        After reconnect, the new session is flagged in
+        ``_reconnect_needed`` so that ``main.py`` can pick it up
+        and swap the stale reference + restart the relay task.
         """
         self._log.info("session.reconnect", client_id=client_id, mode=self._session_mode)
         async with self._lock:
             await self._close_session_unlocked(client_id)
 
         # create_session acquires its own lock — uses default session_mode
-        return await self.create_session(client_id)
+        new_session = await self.create_session(client_id)
+
+        # Flag for main.py to pick up
+        async with self._lock:
+            self._reconnect_needed[client_id] = True
+            self._reconnected_sessions[client_id] = new_session
+
+        return new_session
+
+    async def check_reconnect(self, client_id: str) -> Optional[GeminiSession]:
+        """Check if a reconnect happened for *client_id*.
+
+        Returns the new GeminiSession if a reconnect occurred (and
+        clears the flag), or None if no reconnect is pending.
+        Called by main.py's WS loop to swap session references.
+        """
+        async with self._lock:
+            if self._reconnect_needed.get(client_id):
+                self._reconnect_needed[client_id] = False
+                new_session = self._reconnected_sessions.pop(client_id, None)
+                if new_session:
+                    self._log.info("session.reconnect.consumed", client_id=client_id)
+                return new_session
+        return None
 
     # ------------------------------------------------------------------
     # Heartbeat monitor
@@ -165,14 +200,17 @@ class SessionManager:
                     expired_ids.append(cid)
                     continue
 
-                # Idle timeout -- attempt reconnect
+                # Idle timeout -- log warning but do NOT reconnect.
+                # Reconnecting server-side orphans the client's relay task
+                # and leaves the connection in a broken state.  Instead,
+                # rely on the client heartbeat to keep the session alive.
                 if idle >= SESSION_TIMEOUT_S:
                     self._log.warning(
                         "session.idle_timeout",
                         client_id=cid,
                         idle_s=round(idle),
+                        note="Session idle but not reconnecting (would orphan relay)",
                     )
-                    idle_ids.append(cid)
 
         # Remove expired sessions (hard lifetime cap -- no reconnect)
         for cid in expired_ids:
@@ -181,13 +219,8 @@ class SessionManager:
             except Exception:
                 self._log.exception("session.remove_failed", client_id=cid)
 
-        # Reconnect idle sessions outside the lock to avoid holding it during I/O
-        for cid in idle_ids:
-            try:
-                await self.reconnect_session(cid)
-            except Exception:
-                self._log.exception("session.reconnect_failed", client_id=cid)
-                await self.remove_session(cid)
+        # NOTE: Idle sessions are no longer auto-reconnected server-side.
+        # The client is responsible for reconnecting if it detects staleness.
 
     # ------------------------------------------------------------------
     # Internal helpers

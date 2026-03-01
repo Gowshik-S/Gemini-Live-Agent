@@ -129,7 +129,7 @@ class ScreenCapture:
                     monitor = sct.monitors[1]  # Primary monitor
                 except IndexError:
                     monitor = sct.monitors[0]  # Fallback to full virtual screen
-                    log.warning("screen_capture.no_primary_monitor, using monitors[0]")
+                    log.warning("screen_capture.no_primary_monitor", note="using monitors[0]")
                 raw = sct.grab(monitor)
 
             # Convert to PIL Image (mss provides .rgb for RGB bytes)
@@ -171,6 +171,33 @@ class ScreenCapture:
         """Run capture in a thread executor to avoid blocking the event loop."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.capture, force)
+
+    # ------------------------------------------------------------------
+    # OCR-enhanced capture
+    # ------------------------------------------------------------------
+
+    async def capture_with_text(
+        self,
+        ocr_engine,
+        force: bool = False,
+    ) -> tuple[Optional[bytes], Optional[str]]:
+        """Capture a screenshot and extract OCR text in one call.
+
+        Returns (jpeg_bytes, ocr_text).  If OCR is unavailable or the
+        engine is None, ocr_text will be None (graceful degradation).
+
+        Args:
+            ocr_engine: An OCREngine instance, or None to skip OCR.
+            force: If True, skip delta detection.
+        """
+        loop = asyncio.get_running_loop()
+        jpeg = await loop.run_in_executor(None, self.capture, force)
+
+        if jpeg is None or ocr_engine is None or not ocr_engine.available:
+            return jpeg, None
+
+        ocr_text = await ocr_engine.extract_text_async(jpeg)
+        return jpeg, ocr_text
 
     # ------------------------------------------------------------------
     # State management

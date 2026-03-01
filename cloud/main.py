@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from model_router import ModelRouter
-from rate_limiter import Priority, RateLimiter
+from rate_limiter import DegradationLevel, Priority, RateLimiter
 from session_manager import SessionManager
 
 # ---------------------------------------------------------------------------
@@ -53,13 +53,17 @@ logger = structlog.get_logger(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SESSION_MODE = os.environ.get("SESSION_MODE", "live")  # "live" or "text"
+TEXT_MODEL = os.environ.get("TEXT_MODEL", None)  # Override via env, else use default
+LIVE_MODEL = os.environ.get("LIVE_MODEL", None)  # Override via env, else use default
+# Shared secret for WebSocket authentication (set via env for production)
+WS_AUTH_TOKEN = os.environ.get("RIO_WS_TOKEN", "")
 
 # ---------------------------------------------------------------------------
 # Shared singletons (created during lifespan)
 # ---------------------------------------------------------------------------
 session_manager: SessionManager | None = None
 rate_limiter: RateLimiter = RateLimiter(budget_rpm=30)
-model_router: ModelRouter = ModelRouter()
+model_router: ModelRouter | None = None  # Initialized in lifespan with api_key
 
 # Connected dashboard WebSocket clients
 dashboard_clients: Set[WebSocket] = set()
@@ -80,20 +84,25 @@ async def _dashboard_health_broadcast_loop() -> None:
             continue
         try:
             usage = rate_limiter.get_usage()
+            routing = model_router.get_routing_stats() if model_router else {}
             await _broadcast_dashboard({
                 "type": "dashboard",
                 "subtype": "health",
                 "rpm": usage["rpm"],
                 "budget": usage["budget"],
                 "utilization_pct": usage["utilization_pct"],
-                "model": "Flash",
+                "model": routing.get("last_model", "Flash") or "Flash",
                 "sessions_active": session_manager.active_count if session_manager else 0,
+                "pro_rpm": routing.get("pro_rpm_current", 0),
+                "pro_budget": routing.get("pro_rpm_budget", 5),
             })
             await _broadcast_dashboard({
                 "type": "dashboard",
                 "subtype": "rate_limit",
                 "current_rpm": usage["rpm"],
                 "status": usage["degradation_level"].lower(),
+                "vision_active": usage["degradation_level"] not in ("EMERGENCY", "CRITICAL"),
+                "pro_active": usage["degradation_level"] not in ("CAUTION", "EMERGENCY", "CRITICAL"),
             })
         except Exception:
             logger.debug("dashboard.health_broadcast.error")
@@ -106,7 +115,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY not set -- Gemini sessions will fail")
 
-    session_manager = SessionManager(api_key=GEMINI_API_KEY, session_mode=SESSION_MODE)
+    session_manager = SessionManager(
+        api_key=GEMINI_API_KEY,
+        session_mode=SESSION_MODE,
+        text_model=TEXT_MODEL,
+        live_model=LIVE_MODEL,
+    )
+
+    model_router = ModelRouter(
+        api_key=GEMINI_API_KEY,
+        rate_limiter=rate_limiter,
+        pro_rpm_budget=int(os.environ.get("PRO_RPM_BUDGET", "5")),
+    )
+
     logger.info("rio.startup", gemini_key_set=bool(GEMINI_API_KEY), session_mode=SESSION_MODE)
 
     # Start background health broadcaster
@@ -132,7 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Rio Cloud Service",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -172,10 +193,10 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "rio-cloud",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "sessions_active": session_manager.active_count if session_manager else 0,
         "rate_limiter": rate_limiter.get_usage(),
-        "routing": model_router.get_routing_stats(),
+        "routing": model_router.get_routing_stats() if model_router else {},
     }
 
 
@@ -209,9 +230,11 @@ async def ws_dashboard(websocket: WebSocket) -> None:
     logger.info("dashboard.connected", total=len(dashboard_clients))
 
     try:
-        # Keep alive -- read pings/ignore data
+        # Keep alive -- read pings and respond with pong for RTT measurement
         while True:
-            await websocket.receive_text()
+            msg = await websocket.receive_text()
+            if msg == "ping":
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
         pass
     finally:
@@ -228,6 +251,21 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     await websocket.accept()
     client_id = str(uuid.uuid4())
     log = logger.bind(client_id=client_id)
+
+    # ---- Authentication via shared secret (Fix #19) ----
+    if WS_AUTH_TOKEN:
+        try:
+            auth_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+            auth_frame = json.loads(auth_msg)
+            if auth_frame.get("type") != "auth" or auth_frame.get("token") != WS_AUTH_TOKEN:
+                log.warning("client.auth_failed")
+                await websocket.close(code=4001, reason="Authentication failed")
+                return
+        except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+            log.warning("client.auth_timeout_or_error")
+            await websocket.close(code=4001, reason="Authentication required")
+            return
+
     log.info("client.connected")
 
     # Broadcast client connection to dashboard
@@ -243,6 +281,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     # ---- Create Gemini session ----
     try:
         gemini = await session_manager.create_session(client_id)
+        # Record session creation in rate limiter (costs 1 RPM)
+        rate_limiter.try_acquire(Priority.USER_ASK)
         # Notify client that Gemini session is ready
         await websocket.send_text(json.dumps({
             "type": "control",
@@ -286,6 +326,35 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             pass
         await websocket.close(code=1011, reason="Failed to create Gemini session")
         return
+
+    # ---- Set up Pro injection callback (routes Pro results through active session) ----
+    async def _inject_pro_into_session(analysis: str) -> None:
+        await gemini.send_context(analysis)
+    model_router.set_inject_callback(_inject_pro_into_session)
+
+    # ---- Pro escalation helper ----
+    async def _pro_escalation(session, user_text: str, cid: str) -> None:
+        """Fire-and-forget: call Pro, inject result, broadcast to dashboard."""
+        try:
+            analysis = await model_router.call_pro(user_text)
+            if analysis:
+                await model_router.inject_pro_result(analysis)
+                await _broadcast_dashboard({
+                    "type": "dashboard",
+                    "subtype": "model_switch",
+                    "model": "Flash",
+                    "reason": "pro_complete",
+                })
+                # In text mode, kick a relay to send Gemini's synthesized response
+                if session.mode == "text":
+                    asyncio.create_task(
+                        _relay_gemini_to_client(),
+                        name=f"relay-pro-{cid}",
+                    )
+            else:
+                log.info("pro_escalation.no_result", client_id=cid)
+        except Exception:
+            log.exception("pro_escalation.error", client_id=cid)
 
     # ---- Background task: read Gemini responses and forward to client ----
     async def _relay_gemini_to_client() -> None:
@@ -515,6 +584,75 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         )
         log.info("relay.live.started")
 
+    # ---- Background: poll for session reconnects ----
+    reconnect_check_task: asyncio.Task | None = None
+
+    async def _reconnect_checker() -> None:
+        """Poll SessionManager for reconnects and swap session + relay."""
+        nonlocal gemini, relay_task
+        try:
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    new_session = await session_manager.check_reconnect(client_id)
+                except Exception:
+                    log.exception("reconnect.check_error")
+                    continue
+
+                if new_session is None:
+                    continue
+
+                log.info("reconnect.detected", client_id=client_id, new_mode=new_session.mode)
+
+                # Stop old relay
+                if relay_task is not None and not relay_task.done():
+                    relay_task.cancel()
+                    try:
+                        await relay_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Swap session reference
+                gemini = new_session
+                # Update the Pro inject callback to use the new session
+                async def _new_inject(analysis: str) -> None:
+                    await gemini.send_context(analysis)
+                model_router.set_inject_callback(_new_inject)
+
+                # Restart relay if live mode
+                if gemini.mode == "live":
+                    relay_task = asyncio.create_task(
+                        _relay_live_to_client(),
+                        name=f"live-relay-{client_id}",
+                    )
+
+                # Notify the client
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "control",
+                        "action": "reconnected",
+                        "detail": "Gemini session reconnected (timeout recovery)",
+                        "mode": gemini.mode,
+                    }))
+                except Exception:
+                    pass
+
+                await _broadcast_dashboard({
+                    "type": "dashboard",
+                    "subtype": "client_event",
+                    "event": "reconnected",
+                    "client_id": client_id,
+                })
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("reconnect_checker.fatal")
+
+    reconnect_check_task = asyncio.create_task(
+        _reconnect_checker(),
+        name=f"reconnect-check-{client_id}",
+    )
+
     # ---- Main loop: read from client WebSocket (text + binary) ----
     try:
         while True:
@@ -540,6 +678,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 elif prefix == b"\x02":
                     # Image frame — L2: forward screenshot to Gemini session
+                    # Degradation: drop vision in EMERGENCY+ to conserve RPM
+                    deg_level = rate_limiter._degradation_level()
+                    if deg_level >= DegradationLevel.EMERGENCY:
+                        log.debug(
+                            "client.image.dropped",
+                            reason=f"degradation={deg_level.name}",
+                        )
+                        continue
+
                     log.debug("client.image", bytes_len=len(payload))
                     try:
                         await gemini.send_image(payload, mime_type="image/jpeg")
@@ -581,15 +728,31 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 # Rate-limit check (text mode only; live session = 0 RPM)
                 if gemini.mode == "text":
-                    if not rate_limiter.can_call(Priority.USER_ASK):
+                    if not rate_limiter.try_acquire(Priority.USER_ASK):
                         await websocket.send_text(json.dumps({
                             "type": "error",
                             "message": "Rate limit exceeded. Please wait.",
                         }))
                         continue
-                    rate_limiter.record_call(Priority.USER_ASK)
 
                 model_router.record_flash_call(reason="user_text")
+
+                # -- Pro escalation check --
+                deg = rate_limiter._degradation_level()
+                if (model_router.should_use_pro(content)
+                        and deg < DegradationLevel.CAUTION):
+                    log.info("client.pro_escalation", content_length=len(content))
+                    await _broadcast_dashboard({
+                        "type": "dashboard",
+                        "subtype": "model_switch",
+                        "model": "Pro",
+                        "reason": "user_request",
+                    })
+                    # Fire-and-forget Pro call (non-blocking)
+                    asyncio.create_task(
+                        _pro_escalation(gemini, content, client_id),
+                        name=f"pro-{client_id}",
+                    )
 
                 log.info("client.text", content_length=len(content))
 
@@ -651,6 +814,21 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     except Exception:
                         log.exception("client.context.send_failed")
 
+                    # In text mode, create a relay task so Gemini's proactive
+                    # response is actually sent to the client (send_context only
+                    # appends to history; we need to call receive() to get the reply)
+                    if gemini.mode == "text":
+                        if relay_task is not None and not relay_task.done():
+                            relay_task.cancel()
+                            try:
+                                await relay_task
+                            except asyncio.CancelledError:
+                                pass
+                        relay_task = asyncio.create_task(
+                            _relay_gemini_to_client(),
+                            name=f"relay-context-{client_id}",
+                        )
+
                     # Broadcast to dashboard
                     await _broadcast_dashboard({
                         "type": "dashboard",
@@ -684,6 +862,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         log.exception("client.error")
     finally:
         # Clean up
+        if reconnect_check_task is not None and not reconnect_check_task.done():
+            reconnect_check_task.cancel()
+            try:
+                await reconnect_check_task
+            except asyncio.CancelledError:
+                pass
         if relay_task is not None and not relay_task.done():
             relay_task.cancel()
             try:

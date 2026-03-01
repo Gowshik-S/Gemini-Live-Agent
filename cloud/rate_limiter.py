@@ -101,6 +101,38 @@ class RateLimiter:
             level=self._degradation_level().name,
         )
 
+    def try_acquire(self, priority: int) -> bool:
+        """Atomically check permission and record the call if allowed.
+
+        Combines ``can_call()`` + ``record_call()`` into a single
+        operation to prevent race conditions between the check and
+        the record.
+
+        Returns True if the call was permitted (and recorded).
+        """
+        self._prune()
+        level = self._degradation_level()
+        cutoff = _PRIORITY_CUTOFFS[level]
+        allowed = priority <= cutoff
+
+        if allowed:
+            now = time.monotonic()
+            self._calls.append(now)
+            self._log.debug(
+                "rate_limiter.acquired",
+                priority=priority,
+                rpm=len(self._calls),
+                level=level.name,
+            )
+        else:
+            self._log.warning(
+                "rate_limiter.rejected",
+                priority=priority,
+                level=level.name,
+                rpm=len(self._calls),
+            )
+        return allowed
+
     def get_usage(self) -> Dict[str, object]:
         """Return current usage stats for the dashboard."""
         self._prune()

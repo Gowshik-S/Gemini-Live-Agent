@@ -231,9 +231,56 @@
   - [x] Added client connect/disconnect dashboard events
 - [x] Version remains v0.5.1 (L6 is UI-only, no local client changes needed)
 
+### Day 13-14: Polish (L7) — COMPLETE
+- [x] **Pro model routing** — ModelRouter fully wired
+  - [x] `ModelRouter` constructor takes `api_key`, `rate_limiter`, `pro_rpm_budget`
+  - [x] `should_use_pro()` — keyword-based trigger detection (PRO_TRIGGER_PHRASES)
+  - [x] `call_pro()` — real `generate_content` call to `gemini-2.5-pro-preview-03-25`
+  - [x] Pro RPM budget tracking (rolling 60s window, default 5 RPM)
+  - [x] Rate limiter integration (BACKGROUND priority for Pro calls)
+  - [x] `inject_pro_result()` — feeds Pro analysis into Flash Live session via callback
+  - [x] `call_pro_and_inject()` — combined fire-and-forget helper
+  - [x] Dashboard model badge updates (Flash ↔ Pro) via broadcast
+  - [x] Health endpoint includes Pro RPM stats
+- [x] **Degradation ladder** — Rate limiter wired to drop features under load
+  - [x] EMERGENCY+: vision frames dropped at cloud (image binary frames rejected)
+  - [x] CAUTION+: Pro escalation blocked (Flash handles everything)
+  - [x] Dashboard rate_limit broadcast includes vision_active + pro_active flags
+- [x] **Reconnect handling** — Gemini session reconnect with relay restart
+  - [x] SessionManager flags reconnects via `_reconnect_needed` dict
+  - [x] `check_reconnect()` method for main.py to poll and consume
+  - [x] `_reconnect_checker` background task in WS handler polls every 5s
+  - [x] On reconnect: cancels old relay, swaps `gemini` reference, restarts relay
+  - [x] Updates Pro inject callback to use new session
+  - [x] Sends `reconnected` control frame to local client
+  - [x] Broadcasts reconnect event to dashboard
+  - [x] Local client: handles `reconnected` control action in receive_loop
+- [x] **Interrupt handling** — Speech-start clears playback buffer
+  - [x] VAD speech-start edge detection (vad_was_speaking flag)
+  - [x] Playback buffer cleared on first speech frame (not just PTT press)
+- [x] **Memory integration** — MemoryStore wired into main loop
+  - [x] Memory initialized from config (db_path, max_recall) in main()
+  - [x] Tool results stored in memory after successful execution
+  - [x] Struggle context queries memory for similar past issues
+  - [x] Memory entries injected into struggle context payload
+  - [x] Struggle trigger events stored in memory
+  - [x] Graceful degradation: memory features skip if chromadb/sentence-transformers missing
+- [x] **Error handling hardened**
+  - [x] Reconnect checker wrap with try/except (no unhandled crashes)
+  - [x] Pro escalation error handling (fire-and-forget with exception logging)
+  - [x] `send_json_resilient()` added to WSClient (retry with backoff)
+  - [x] Global exception handler in local main entry point
+- [x] Version bumped to v0.6.0 (Layer 7: Polish)
+
+## Architecture Decisions (Day 13-14 / L7)
+- **Pro routing**: Keyword-based trigger (simple & predictable). Pro is async fire-and-forget — Flash keeps running.
+- **Pro injection**: Callback-based — main.py sets the callback, ModelRouter calls it. Decouples routing from session management.
+- **Degradation**: Cloud-side only — local client doesn't need to know. Vision frames and Pro calls silently dropped when RPM is high.
+- **Reconnect**: Poll-based rather than event-based for simplicity. 5s polling interval is fast enough, negligible CPU.
+- **Memory in struggle**: RAG context injected into the struggle prompt so Gemini can reference past similar issues.
+- **Interrupt**: VAD edge detection mirrors PTT edge detection pattern — clear playback on speech start, not on every speech frame.
+
 ## Upcoming
-- L5: Memory (Day 11)
-- L7: Polish — keystroke signals, Pro model routing, reconnect (Days 13-14)
 - L8: Demo + Docs (Days 15-16)
 
 ## Lessons
@@ -247,3 +294,8 @@
 - Function calling requires `generate_content` (non-stream) for reliable tool call detection
 - FunctionResponse goes in `role="user"` with `function_response` parts
 - Tool declarations use dict-based Schema (safer than typed Schema with SDK version variance)
+- Pro model calls must be async fire-and-forget — never block the Live relay
+- Degradation gating should be cloud-side only (local client doesn't see RPM counters)
+- Session reconnect requires swapping the gemini reference AND restarting relay tasks
+- VAD interrupt should only fire on speech-start edge, not on every speech-positive frame
+- Memory queries during struggle detection add meaningful context but must be non-blocking

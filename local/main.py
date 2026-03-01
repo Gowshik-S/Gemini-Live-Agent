@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import sys
 from pathlib import Path
 
@@ -73,6 +72,16 @@ try:
 except ImportError:
     StruggleDetector = None
 
+try:
+    from memory import MemoryStore
+except ImportError:
+    MemoryStore = None
+
+try:
+    from ocr import OCREngine
+except ImportError:
+    OCREngine = None
+
 # ---------------------------------------------------------------------------
 # Structlog configuration
 # ---------------------------------------------------------------------------
@@ -103,13 +112,68 @@ BANNER = r"""
  |  _ \(_) ___
  | |_) | |/ _ \
  |  _ <| | (_) |
- |_| \_\_|\___/   v0.5.1 — Screen mode toggle
+ |_| \_\_|\___/   v0.6.0 — L7 Polish
 
  Proactive AI Pair Programmer
- Voice + screen vision + tools + struggle detection with Gemini.
+ Voice + screen vision + tools + struggle detection + memory + Pro routing
  F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
  Text input via stdin.  Ctrl-C to quit.
 """
+
+
+# Decline phrases that indicate user doesn't want proactive help
+DECLINE_PHRASES = frozenset({
+    "no thanks", "no thank you", "i'm fine", "im fine", "i'm good",
+    "im good", "not now", "go away", "leave me alone", "stop",
+    "don't help", "dont help", "i got it", "i've got it",
+    "no need", "nevermind", "never mind", "nah",
+})
+
+
+def _is_decline(text: str) -> bool:
+    """Check if user text indicates declining proactive help.
+
+    Uses substring matching so phrases like 'no thanks, I'm fine'
+    or 'nah I got it' are also caught.
+    """
+    text_lower = text.strip().lower().rstrip(".!?")
+    # Exact match first
+    if text_lower in DECLINE_PHRASES:
+        return True
+    # Substring match: if any decline phrase appears within the text
+    for phrase in DECLINE_PHRASES:
+        if phrase in text_lower:
+            return True
+    return False
+
+
+# Tool names that modify the filesystem / execute commands and need approval
+_DANGEROUS_TOOLS = frozenset({"write_file", "patch_file", "run_command"})
+
+_CONFIRM_TIMEOUT = 15  # seconds to wait before auto-declining
+
+
+async def _confirm_tool_call(tool_name: str, tool_args: dict) -> bool:
+    """Prompt user for confirmation before executing a dangerous tool.
+
+    Returns True if approved, False otherwise.
+    Auto-**approves** after ``_CONFIRM_TIMEOUT`` seconds of silence so
+    tool chains aren't stalled while the user is away or in voice mode.
+    """
+    summary = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+    print(f"\n    Rio wants to run: {tool_name}({summary})")
+    print(f"  Approve? [Y/n] (auto-approve in {_CONFIRM_TIMEOUT}s): ", end="", flush=True)
+
+    loop = asyncio.get_running_loop()
+    try:
+        answer = await asyncio.wait_for(
+            loop.run_in_executor(None, sys.stdin.readline),
+            timeout=_CONFIRM_TIMEOUT,
+        )
+        return answer.strip().lower() not in ("n", "no")
+    except asyncio.TimeoutError:
+        print("  (timed out — auto-approved)")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +199,7 @@ def _audio_mode(ptt, vad) -> str:
 # ---------------------------------------------------------------------------
 
 async def receive_loop(client: WSClient, playback=None, tool_executor=None,
-                       struggle_detector=None, screen=None) -> None:
+                       struggle_detector=None, screen=None, memory_store=None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     async for msg in client.receive():
         if isinstance(msg, dict):
@@ -181,6 +245,10 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     print(f"  [connection error: {msg.get('detail', '')}]")
                 elif action == "reconnecting":
                     print("  [reconnecting...]")
+                elif action == "reconnected":
+                    detail = msg.get("detail", "session reconnected")
+                    print(f"  [{detail}]")
+                    print("  You: ", end="", flush=True)
                 elif action == "turn_complete":
                     log.debug("cloud.turn_complete")
                 elif action == "session_mode":
@@ -240,6 +308,28 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     continue
 
                 if tool_executor is not None:
+                    # Confirmation gate: auto-approve read_file,
+                    # prompt for write_file / patch_file / run_command
+                    if tool_name in ("write_file", "patch_file", "run_command"):
+                        approved = await _confirm_tool_call(tool_name, tool_args)
+                        if not approved:
+                            result = {
+                                "success": False,
+                                "error": f"User declined {tool_name} execution.",
+                            }
+                            log.info("tool_call.declined", name=tool_name)
+                            print(f"  [tool] {tool_name} — declined by user")
+                            try:
+                                await client.send_json({
+                                    "type": "tool_result",
+                                    "name": tool_name,
+                                    "result": result,
+                                })
+                            except ConnectionError:
+                                pass
+                            print("  You: ", end="", flush=True)
+                            continue
+
                     result = await tool_executor.execute(tool_name, tool_args)
                     success = result.get("success", False)
                     log.info("tool_call.executed", name=tool_name, success=success)
@@ -259,6 +349,21 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                         })
                     except ConnectionError:
                         log.warning("tool_call.send_failed", name=tool_name)
+
+                    # L5: Store tool execution in memory
+                    if memory_store is not None and success:
+                        try:
+                            summary = f"Tool {tool_name} executed: {_format_tool_args(tool_args)}"
+                            if tool_name == "run_command":
+                                output = result.get("output", "")[:200]
+                                summary += f" → {output}"
+                            memory_store.add(
+                                summary,
+                                entry_type="tool_use",
+                                metadata={"tool": tool_name},
+                            )
+                        except Exception:
+                            log.debug("memory.store_tool_failed")
                 else:
                     # No tool executor — send error result
                     print("  [tool] tools not available")
@@ -388,6 +493,7 @@ async def audio_capture_loop(
 
     chunks_sent = 0
     ptt_was_active = False  # Track PTT edge transitions
+    vad_was_speaking = False  # Track VAD speech-start edge for interrupt
 
     async for chunk in capture.chunks():
         if not client.is_connected:
@@ -432,7 +538,15 @@ async def audio_capture_loop(
         if has_vad:
             result = vad.process(chunk)
             if not result.is_speech:
+                vad_was_speaking = False
                 continue
+
+            # Speech-start edge: clear playback buffer (interrupt)
+            if not vad_was_speaking:
+                vad_was_speaking = True
+                if playback is not None:
+                    playback.clear()
+                    log.debug("vad.interrupt", note="cleared playback on speech start")
 
         # -- Send audio --------------------------------------------------------
         try:
@@ -602,6 +716,11 @@ async def input_loop(client: WSClient, struggle_detector=None) -> None:
         if text.lower() in {"exit", "quit", "/quit", "/exit"}:
             break
 
+        # L4: Detect decline of proactive help
+        if struggle_detector is not None and _is_decline(text):
+            struggle_detector.record_decline()
+            log.info("input.decline_detected", text=text)
+
         payload = {"type": "text", "content": text}
         try:
             await client.send_json(payload)
@@ -622,12 +741,18 @@ async def struggle_detection_loop(
     client: WSClient,
     screen,
     detector: "StruggleDetector",
+    ocr_engine=None,
+    memory_store=None,
 ) -> None:
     """Periodically evaluate struggle signals and trigger proactive help.
 
     Runs every 2 seconds.  Captures a screen frame (reusing the existing
     ScreenCapture), feeds it to the detector, and sends a context frame
     to the cloud if the detector fires.
+
+    When ``ocr_engine`` is provided, OCR text is extracted from each
+    frame and fed to the detector so Signal 1 hashes text content
+    instead of raw pixels (immune to cursor blink, clock ticks, etc.).
     """
     EVAL_INTERVAL = 2.0  # seconds between evaluations
 
@@ -637,11 +762,17 @@ async def struggle_detection_loop(
         if not client.is_connected:
             continue
 
-        # Feed a fresh screen frame into the detector
+        # Feed a fresh screen frame (+ OCR text) into the detector
         if screen is not None:
             try:
-                jpeg = await screen.capture_async(force=True)
-                detector.feed_frame(jpeg)
+                if ocr_engine is not None and ocr_engine.available:
+                    jpeg, ocr_text = await screen.capture_with_text(
+                        ocr_engine, force=True,
+                    )
+                    detector.feed_frame(jpeg, ocr_text=ocr_text)
+                else:
+                    jpeg = await screen.capture_async(force=True)
+                    detector.feed_frame(jpeg)
             except Exception:
                 log.debug("struggle_loop.capture_error")
 
@@ -660,6 +791,17 @@ async def struggle_detection_loop(
         print(f"\n  [Rio notices you might be stuck — asking if you need help...]")
         print("  You: ", end="", flush=True)
 
+        # L5: Query memory for similar past struggles
+        memory_context = ""
+        if memory_store is not None:
+            try:
+                query_text = f"struggle: {', '.join(result.active_signals)}. {result.reason}"
+                memories = memory_store.query(query_text, top_k=3)
+                if memories:
+                    memory_context = "\n" + memory_store.format_context(memories) + "\n"
+            except Exception:
+                log.debug("struggle_loop.memory_query_failed")
+
         context_payload = {
             "type": "context",
             "subtype": "struggle",
@@ -670,6 +812,7 @@ async def struggle_detection_loop(
                 f"The developer appears to be struggling. Signals: {', '.join(result.active_signals)}. "
                 f"Detail: {result.reason}. "
                 f"Confidence: {result.confidence:.2f}. "
+                f"{memory_context}"
                 f"Ask them a brief, specific question about what they're working on "
                 f"and offer concrete help. Don't be generic — reference what you can "
                 f"see on their screen if possible."
@@ -679,6 +822,16 @@ async def struggle_detection_loop(
         try:
             await client.send_json(context_payload)
             detector.record_trigger()
+            # L5: Store struggle event in memory
+            if memory_store is not None:
+                try:
+                    memory_store.add(
+                        f"Struggle detected: {', '.join(result.active_signals)}. {result.reason}",
+                        entry_type="struggle",
+                        metadata={"confidence": result.confidence},
+                    )
+                except Exception:
+                    log.debug("struggle_loop.memory_store_failed")
         except ConnectionError:
             log.warning("struggle_loop.send_failed")
         except Exception:
@@ -947,12 +1100,39 @@ async def main() -> None:
     elif struggle_detector is not None and config.struggle.demo_mode:
         print("  Demo trigger: unavailable (pynput not installed)")
 
+    # -- Initialize memory store (L5) ------------------------------------------
+    memory_store = None
+    if MemoryStore is not None:
+        try:
+            memory_store = MemoryStore(
+                db_path=config.memory.db_path,
+                max_recall=config.memory.max_recall,
+            )
+            log.info("memory.ready", db_path=config.memory.db_path, entries=memory_store.count())
+            print(f"  Memory: {memory_store.count()} entries in {config.memory.db_path}")
+        except Exception:
+            log.exception("memory.init_failed")
+            print("  Memory: init failed (chromadb/sentence-transformers missing?)")
+            memory_store = None
+    else:
+        print("  Memory: disabled (module not available)")
+
     # -- Build client ------------------------------------------------------
     client = WSClient(
         config.cloud_url,
         on_connect=lambda: log.info("event.connected"),
         on_disconnect=lambda: log.warning("event.disconnected"),
     )
+
+    # -- Initialise OCR engine (L4 enhancement) ----------------------------
+    ocr_engine = None
+    if OCREngine is not None and struggle_detector is not None:
+        ocr_engine = OCREngine()
+        if ocr_engine.available:
+            print("  [OCR engine ready — text-based struggle detection enabled]")
+        else:
+            ocr_engine = None
+            print("  [OCR unavailable — falling back to pixel-hash detection]")
 
     # -- Connect -----------------------------------------------------------
     log.info("rio.starting", cloud_url=config.cloud_url)
@@ -989,7 +1169,7 @@ async def main() -> None:
     # -- Run all loops concurrently ----------------------------------------
     tasks: set[asyncio.Task] = set()
 
-    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen), name="recv"))
+    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen, memory_store), name="recv"))
     tasks.add(asyncio.create_task(input_loop(client, struggle_detector), name="input"))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
 
@@ -1012,7 +1192,7 @@ async def main() -> None:
     # L4: Struggle detection loop
     if struggle_detector is not None and screen is not None:
         tasks.add(asyncio.create_task(
-            struggle_detection_loop(client, screen, struggle_detector),
+            struggle_detection_loop(client, screen, struggle_detector, ocr_engine, memory_store),
             name="struggle",
         ))
 
@@ -1073,14 +1253,13 @@ async def main() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _handle_sigint() -> None:
-    """Allow Ctrl-C to cleanly cancel the asyncio event loop."""
-    raise KeyboardInterrupt
-
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n  Goodbye!")
         sys.exit(0)
+    except Exception as exc:
+        print(f"\n  [fatal error] {exc}")
+        log.exception("rio.fatal")
+        sys.exit(1)

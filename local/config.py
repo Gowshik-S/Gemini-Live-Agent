@@ -69,7 +69,7 @@ class MemoryConfig:
 
 @dataclass
 class ModelConfig:
-    primary: str = "gemini-2.0-flash"
+    primary: str = "gemini-2.5-flash"
     secondary: str = "gemini-2.5-pro-preview-03-25"
     pro_rpm_budget: int = 5
 
@@ -132,9 +132,10 @@ class RioConfig:
     @classmethod
     def _from_dict(cls, d: dict) -> "RioConfig":
         """Build a RioConfig from a raw dictionary, tolerating missing keys."""
+        _defaults = cls()
         return cls(
-            cloud_url=d.get("cloud_url", cls.cloud_url),
-            session_mode=d.get("session_mode", cls.session_mode),
+            cloud_url=d.get("cloud_url", _defaults.cloud_url),
+            session_mode=d.get("session_mode", _defaults.session_mode),
             audio=_build(AudioConfig, d.get("audio")),
             hotkeys=_build(HotkeyConfig, d.get("hotkeys")),
             vad=_build(VadConfig, d.get("vad")),

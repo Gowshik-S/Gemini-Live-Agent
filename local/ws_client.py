@@ -158,6 +158,28 @@ class WSClient:
         log.debug("ws.send_binary", length=len(data))
         await self._ws.send(data)
 
+    async def send_json_resilient(self, obj: dict[str, Any], retries: int = 2) -> bool:
+        """Send JSON with retry on transient failures.
+
+        Returns True if sent successfully, False otherwise.
+        Unlike ``send_json``, this never raises — it logs failures.
+        """
+        for attempt in range(retries + 1):
+            try:
+                await self.send_json(obj)
+                return True
+            except ConnectionError:
+                if attempt < retries:
+                    log.debug("ws.send_json_resilient.retry", attempt=attempt + 1)
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning("ws.send_json_resilient.failed", attempts=retries + 1)
+                    return False
+            except Exception:
+                log.exception("ws.send_json_resilient.error")
+                return False
+        return False
+
     # ------------------------------------------------------------------
     # Receive — async generator
     # ------------------------------------------------------------------

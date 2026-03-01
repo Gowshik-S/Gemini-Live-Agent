@@ -36,21 +36,21 @@ rio:
     resize_factor: 0.5        # downscale factor before sending
     default_mode: "on_demand" # on_demand | autonomous (on_demand saves Gemini credits)
 
-  # Struggle detection settings (Layer 3+)
+  # Struggle detection settings (Layer 4+)
   struggle:
     enabled: true
-    threshold: 0.85           # confidence threshold to trigger proactive help
+    threshold: 0.85           # confidence threshold to trigger proactive help (extreme conservatism)
     cooldown_seconds: 300     # minimum seconds between proactive interventions
     decline_cooldown: 600     # cooldown after user declines help
     demo_mode: false          # if true, lower thresholds for demonstration
 
-  # Local memory / RAG settings (Layer 4+)
+  # Local memory / RAG settings (Layer 5+)
   memory:
     db_path: "./rio_memory"
     max_recall: 5             # max memory entries to inject into context
 
   # Model selection
   models:
-    primary: "gemini-2.0-flash"
+    primary: "gemini-2.5-flash"
     secondary: "gemini-2.5-pro-preview-03-25"
     pro_rpm_budget: 5         # max requests-per-minute to the pro model
