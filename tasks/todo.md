@@ -1,6 +1,43 @@
 # Rio Build Progress
 
-## Current Layer: L4 — Struggle Detection (Day 9-10) ✅ COMPLETE
+## Current Sprint: L8 — Voice Fix + Wake Word + ML + Frontend + Chat DB (March 1, 2026)
+
+### Sprint Tasks
+- [x] 1. Fix voice breaking (audio jitter buffer, larger queue, better resampling)
+- [x] 2. Add wake word detection ("Rio", "Hey Rio") — Alexa-style activation
+- [x] 3. Screen access — switch to autonomous mode by default
+- [x] 4. Write clean plan (this file)
+- [x] 5. ML user-pattern model (learns from user behavior, feeds context)
+- [x] 6. Link frontend dashboard (transcript buffer + chat history API + fetch on connect)
+- [x] 7. Save all chats to local SQLite DB
+- [x] 8. Goodbye message on app close
+
+### Files Created / Modified
+| File | Action |
+|------|--------|
+| `local/audio_io.py` | Modified — jitter buffer, queue 600, block 2400 |
+| `local/wake_word.py` | Created — energy + Vosk wake word detector |
+| `local/chat_store.py` | Created — SQLite chat persistence |
+| `local/user_pattern_model.py` | Created — behavioral ML model |
+| `local/main.py` | Modified — integrated all new modules |
+| `cloud/main.py` | Modified — /api/chat-history endpoint, transcript buffering |
+| `ui/dashboard/js/transcript.js` | Modified — fetch history on WS connect |
+| `config.yaml` | Modified — vision default_mode → autonomous |
+| `local/requirements.txt` | Modified — added vosk |
+
+### LLM Models Used
+| Model | Purpose |
+|-------|---------|
+| `gemini-2.5-flash-native-audio-latest` | Live API bidirectional voice |
+| `gemini-2.5-flash` | Text-only fallback |
+| `gemini-2.5-pro-preview-03-25` | Pro escalation for complex code |
+| `BAAI/bge-small-en-v1.5` | Memory embeddings (local) |
+| Silero VAD | Voice activity detection (local) |
+| UserPatternModel | User behavior learning (local, sqlite+numpy) |
+
+---
+
+## Previous: L4 — Struggle Detection (Day 9-10) ✅ COMPLETE
 
 ### Day 1: Cloud Scaffold — COMPLETE (original agent)
 - [x] Cloud scaffold (FastAPI + WS + Gemini session + rate limiter + model router)

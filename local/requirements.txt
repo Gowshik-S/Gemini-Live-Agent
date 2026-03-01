@@ -26,3 +26,10 @@ Pillow>=10.0.0
 # Uses ONNX runtime for fast CPU inference (~20-50ms per frame)
 # Note: 1.3.x+ requires Python <3.13; latest compatible version for Python 3.14 is 1.2.x
 rapidocr-onnxruntime>=1.2.0
+
+# Wake word — offline speech recognition (optional, energy-based fallback if absent)
+vosk>=0.3.45
+
+# RAG memory (optional)
+# chromadb>=0.4.0
+# sentence-transformers>=2.2.0

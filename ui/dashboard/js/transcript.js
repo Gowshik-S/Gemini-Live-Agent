@@ -49,6 +49,25 @@ const RioTranscript = (() => {
     RioSocket.on('transcript', (data) => {
       addMessage(data.speaker || 'system', data.text || '', data.timestamp);
     });
+
+    // Fetch chat history on connect
+    RioSocket.on('open', _fetchChatHistory);
+  }
+
+  /** Fetch past messages from /api/chat-history on reconnect. */
+  async function _fetchChatHistory() {
+    try {
+      const resp = await fetch('/api/chat-history?limit=100');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.messages && data.messages.length > 0) {
+        data.messages.forEach(msg => {
+          addMessage(msg.speaker || 'system', msg.text || '', msg.timestamp);
+        });
+      }
+    } catch (e) {
+      console.warn('[rio-transcript] failed to fetch chat history:', e);
+    }
   }
 
   function addMessage(speaker, text, timestamp) {

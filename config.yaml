@@ -34,7 +34,7 @@ rio:
     fps: 0.33                 # ~1 frame every 3 seconds
     quality: 60               # JPEG quality (0-100)
     resize_factor: 0.5        # downscale factor before sending
-    default_mode: "on_demand" # on_demand | autonomous (on_demand saves Gemini credits)
+    default_mode: "autonomous" # on_demand | autonomous (autonomous = always watching screen)
 
   # Struggle detection settings (Layer 4+)
   struggle:

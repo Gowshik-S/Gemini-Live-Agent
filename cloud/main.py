@@ -15,6 +15,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator, Set
 
@@ -193,10 +194,35 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "rio-cloud",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "sessions_active": session_manager.active_count if session_manager else 0,
         "rate_limiter": rate_limiter.get_usage(),
         "routing": model_router.get_routing_stats() if model_router else {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Chat history for dashboard (pulls from transcript buffer)
+# ---------------------------------------------------------------------------
+# In-memory transcript buffer for dashboard (last 200 messages)
+_transcript_buffer: list[dict] = []
+_TRANSCRIPT_BUFFER_MAX = 200
+
+
+def _buffer_transcript(entry: dict) -> None:
+    """Add a transcript entry to the in-memory buffer."""
+    _transcript_buffer.append(entry)
+    if len(_transcript_buffer) > _TRANSCRIPT_BUFFER_MAX:
+        _transcript_buffer.pop(0)
+
+
+@app.get("/api/chat-history")
+async def get_chat_history(limit: int = 100) -> dict:
+    """Return recent chat messages for the dashboard."""
+    messages = _transcript_buffer[-limit:]
+    return {
+        "messages": messages,
+        "total": len(_transcript_buffer),
     }
 
 
@@ -383,7 +409,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         }
                         await websocket.send_text(json.dumps(response_frame))
 
-                        # Broadcast to dashboard
+                        # Buffer + broadcast to dashboard
+                        _buffer_transcript({
+                            "speaker": "rio",
+                            "text": item,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
                         await _broadcast_dashboard({
                             "type": "transcript",
                             "speaker": "rio",
@@ -497,6 +528,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         "speaker": "rio",
                         "text": text,
                     }))
+                    _buffer_transcript({
+                        "speaker": "rio",
+                        "text": text,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
                     await _broadcast_dashboard({
                         "type": "transcript",
                         "speaker": "rio",
@@ -756,7 +792,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 log.info("client.text", content_length=len(content))
 
-                # Broadcast user message to dashboard
+                # Buffer + broadcast user message to dashboard
+                _buffer_transcript({
+                    "speaker": "user",
+                    "text": content,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
                 await _broadcast_dashboard({
                     "type": "transcript",
                     "speaker": "user",

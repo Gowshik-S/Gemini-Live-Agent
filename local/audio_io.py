@@ -190,12 +190,16 @@ class AudioPlayback:
         playback.stop()
     """
 
+    # Jitter buffer: accumulate this many bytes before starting playback.
+    # Prevents underflows by ensuring a cushion of audio data.
+    _JITTER_BUFFER_BYTES = 9600  # ~200ms at 24kHz 16-bit mono
+
     def __init__(
         self,
         sample_rate: int = 24_000,
         channels: int = 1,
         output_device: Optional[str | int] = None,
-        max_queue_size: int = 200,
+        max_queue_size: int = 600,
     ) -> None:
         self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
         self._output_sample_rate = sample_rate  # actual device rate (may differ)
@@ -204,6 +208,10 @@ class AudioPlayback:
         self._stream: Optional[sd.OutputStream] = None
         self._running = False
         self._resample_ratio: float = 1.0       # output_rate / input_rate
+
+        # Jitter buffer state: accumulate audio before sending to speaker
+        self._jitter_buf = bytearray()
+        self._jitter_ready = False  # True once we've accumulated enough
 
         # Thread-safe queue: audio callback (audio thread) reads,
         # enqueue() (event-loop thread) writes.
@@ -214,9 +222,9 @@ class AudioPlayback:
         )
 
         # Block size for the output stream callback.
-        # 960 samples at 24kHz = 40ms per callback — good balance
-        # between latency and efficiency.
-        self._block_size = 960
+        # 2400 samples at 48kHz = 50ms per callback — larger blocks
+        # reduce underflow risk significantly.
+        self._block_size = 2400
 
     @property
     def is_playing(self) -> bool:
@@ -410,10 +418,38 @@ class AudioPlayback:
         """Add PCM audio data to the playback queue.
 
         Resamples from Gemini's native rate to the output device rate
-        if they differ.  Thread-safe.  If the queue is full, the oldest
-        chunk is dropped to prevent unbounded latency growth.
+        if they differ.  Uses a jitter buffer to accumulate ~200ms of
+        audio before starting playback, preventing choppy output.
+        Thread-safe.
         """
         data = self._resample(data)
+
+        # Jitter buffer: accumulate until we have enough data
+        if not self._jitter_ready:
+            self._jitter_buf.extend(data)
+            if len(self._jitter_buf) >= self._JITTER_BUFFER_BYTES:
+                self._jitter_ready = True
+                # Flush the entire jitter buffer into the queue
+                buf = bytes(self._jitter_buf)
+                self._jitter_buf.clear()
+                # Split into queue-friendly chunks (~4800 bytes = 100ms at 48kHz)
+                chunk_size = 4800
+                for i in range(0, len(buf), chunk_size):
+                    piece = buf[i:i + chunk_size]
+                    try:
+                        self._queue.put_nowait(piece)
+                    except _queue_mod.Full:
+                        try:
+                            self._queue.get_nowait()
+                        except _queue_mod.Empty:
+                            pass
+                        try:
+                            self._queue.put_nowait(piece)
+                        except _queue_mod.Full:
+                            pass
+                log.debug("playback.jitter_buffer_flushed", bytes=len(buf))
+            return
+
         try:
             self._queue.put_nowait(data)
         except _queue_mod.Full:
@@ -428,11 +464,13 @@ class AudioPlayback:
                 pass
 
     def clear(self) -> None:
-        """Flush the playback queue (e.g. on interrupt).
+        """Flush the playback queue and jitter buffer (e.g. on interrupt).
 
         Thread-safe. Drains all pending audio so the speaker goes silent
-        immediately. Day 5 interrupt handling will call this.
+        immediately.
         """
+        self._jitter_buf.clear()
+        self._jitter_ready = False
         while True:
             try:
                 self._queue.get_nowait()

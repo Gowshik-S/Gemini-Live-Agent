@@ -82,6 +82,22 @@ try:
 except ImportError:
     OCREngine = None
 
+try:
+    from wake_word import WakeWordDetector, WakeWordState
+except ImportError:
+    WakeWordDetector = None
+    WakeWordState = None
+
+try:
+    from chat_store import ChatStore
+except ImportError:
+    ChatStore = None
+
+try:
+    from user_pattern_model import UserPatternModel
+except ImportError:
+    UserPatternModel = None
+
 # ---------------------------------------------------------------------------
 # Structlog configuration
 # ---------------------------------------------------------------------------
@@ -112,10 +128,11 @@ BANNER = r"""
  |  _ \(_) ___
  | |_) | |/ _ \
  |  _ <| | (_) |
- |_| \_\_|\___/   v0.6.0 — L7 Polish
+ |_| \_\_|\___/   v0.7.0 — L8 Wake Word + ML
 
  Proactive AI Pair Programmer
  Voice + screen vision + tools + struggle detection + memory + Pro routing
+ Wake word: say "Rio" or "Hey Rio" to activate
  F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
  Text input via stdin.  Ctrl-C to quit.
 """
@@ -200,7 +217,9 @@ def _audio_mode(ptt, vad) -> str:
 
 async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                        struggle_detector=None, screen=None, memory_store=None,
-                       session_ready: asyncio.Event | None = None) -> None:
+                       session_ready: asyncio.Event | None = None,
+                       chat_store=None, session_id: str = "",
+                       pattern_model=None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     audio_frames_received = 0
     async for msg in client.receive():
@@ -214,9 +233,21 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 if speaker == "rio" and text:
                     print(f"\n  Rio: {text}")
                     print("  You: ", end="", flush=True)
+                    # Save to chat store
+                    if chat_store is not None and session_id:
+                        try:
+                            chat_store.add_message(session_id, "rio", text)
+                        except Exception:
+                            log.debug("chat_store.save_failed")
                     # L4: Feed response to struggle detector for error keyword tracking
                     if struggle_detector is not None:
                         struggle_detector.feed_gemini_response(text)
+                    # ML: Record language patterns from Rio's response
+                    if pattern_model is not None:
+                        try:
+                            pattern_model.record_language(text, source="rio_response")
+                        except Exception:
+                            pass
                 elif speaker == "user":
                     # Echo of our own message — ignore
                     pass
@@ -486,6 +517,7 @@ async def audio_capture_loop(
     ptt=None,
     vad=None,
     playback=None,
+    wake_word=None,
 ) -> None:
     """Read audio chunks from the microphone and send as binary frames.
 
@@ -494,6 +526,9 @@ async def audio_capture_loop(
       ptt-only  — F2 gates capture, all audio sent while held
       vad-only  — always captures, VAD filters silence
       always-on — streams everything (Day 3 behaviour)
+    
+    When wake_word is provided, audio is only sent when the wake word
+    has been detected (Alexa-style activation).
     """
     has_ptt = ptt is not None
     has_vad = vad is not None and vad.available
@@ -507,6 +542,15 @@ async def audio_capture_loop(
             log.debug("audio_loop.skipping", reason="not connected")
             await asyncio.sleep(0.5)
             continue
+
+        # -- Wake word gate (Alexa-style) -----------------------------------
+        if wake_word is not None and wake_word.available:
+            ww_result = wake_word.process(chunk)
+            if not ww_result.should_send_audio:
+                continue  # Still sleeping — don't send audio
+            # If just activated, clear playback so Rio stops mid-sentence
+            if ww_result.activated and playback is not None:
+                playback.clear()
 
         # -- PTT edge detection ------------------------------------------------
         if has_ptt:
@@ -698,7 +742,9 @@ async def screen_mode_toggle_loop(
 # Input loop — reads from stdin in a thread
 # ---------------------------------------------------------------------------
 
-async def input_loop(client: WSClient, struggle_detector=None) -> None:
+async def input_loop(client: WSClient, struggle_detector=None,
+                     wake_word=None, chat_store=None, session_id: str = "",
+                     pattern_model=None) -> None:
     """Read user text from stdin and send to the cloud.
 
     Because ``input()`` is blocking, we run it in the default executor
@@ -723,10 +769,34 @@ async def input_loop(client: WSClient, struggle_detector=None) -> None:
         if text.lower() in {"exit", "quit", "/quit", "/exit"}:
             break
 
+        # Wake word: text input always activates listening
+        if wake_word is not None and wake_word.available:
+            wake_word.force_activate()
+
+        # Save to chat store
+        if chat_store is not None and session_id:
+            try:
+                chat_store.add_message(session_id, "user", text)
+            except Exception:
+                log.debug("chat_store.save_failed")
+
+        # ML: Record activity and language patterns
+        if pattern_model is not None:
+            try:
+                pattern_model.record_activity("message", {"source": "text_input"})
+                pattern_model.record_language(text, source="user_input")
+            except Exception:
+                pass
+
         # L4: Detect decline of proactive help
         if struggle_detector is not None and _is_decline(text):
             struggle_detector.record_decline()
             log.info("input.decline_detected", text=text)
+            if pattern_model is not None:
+                try:
+                    pattern_model.record_help_response(accepted=False, context=text)
+                except Exception:
+                    pass
 
         payload = {"type": "text", "content": text}
         try:
@@ -1128,6 +1198,63 @@ async def main() -> None:
     else:
         print("  Memory: disabled (module not available)")
 
+    # -- Initialize wake word detector (L8) ------------------------------------
+    wake_word = None
+    if WakeWordDetector is not None:
+        try:
+            wake_word = WakeWordDetector(
+                sample_rate=config.audio.sample_rate,
+                enabled=True,
+            )
+            if wake_word.available:
+                log.info("wake_word.ready")
+                print("  Wake word: enabled (say 'Rio' or 'Hey Rio' to activate)")
+            else:
+                wake_word = None
+                print("  Wake word: disabled")
+        except Exception:
+            log.exception("wake_word.init_failed")
+            print("  Wake word: init failed")
+            wake_word = None
+    else:
+        print("  Wake word: disabled (module not found)")
+
+    # -- Initialize chat store (L8) --------------------------------------------
+    chat_store = None
+    import uuid as _uuid
+    session_id = str(_uuid.uuid4())[:8]
+    if ChatStore is not None:
+        try:
+            chat_store = ChatStore()
+            chat_store.start_session(session_id)
+            log.info("chat_store.ready", total_messages=chat_store.count())
+            print(f"  Chat DB: {chat_store.count()} messages stored ({chat_store.db_path})")
+        except Exception:
+            log.exception("chat_store.init_failed")
+            print("  Chat DB: init failed")
+            chat_store = None
+    else:
+        print("  Chat DB: disabled (module not found)")
+
+    # -- Initialize user pattern model (L8/ML) ---------------------------------
+    pattern_model = None
+    if UserPatternModel is not None:
+        try:
+            pattern_model = UserPatternModel()
+            pattern_model.record_activity("session_start", {"session_id": session_id})
+            ctx = pattern_model.get_context_string()
+            if ctx:
+                log.info("user_pattern.context", context=ctx[:200])
+                print(f"  ML Model: active — {len(pattern_model._language_counter)} languages tracked")
+            else:
+                print("  ML Model: active (no patterns yet)")
+        except Exception:
+            log.exception("user_pattern.init_failed")
+            print("  ML Model: init failed")
+            pattern_model = None
+    else:
+        print("  ML Model: disabled (module not found)")
+
     # -- Build client ------------------------------------------------------
     client = WSClient(
         config.cloud_url,
@@ -1153,7 +1280,10 @@ async def main() -> None:
     if capture is not None:
         try:
             capture.start()
-            print("  [audio capture started — speak into your mic]")
+            if wake_word is not None and wake_word.available:
+                print("  [audio capture started — say 'Rio' or 'Hey Rio' to activate]")
+            else:
+                print("  [audio capture started — speak into your mic]")
             # Start PTT listener after audio capture
             if ptt is not None:
                 ptt.start(asyncio.get_running_loop())
@@ -1181,13 +1311,26 @@ async def main() -> None:
     tasks: set[asyncio.Task] = set()
 
     session_ready = asyncio.Event()
-    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen, memory_store, session_ready=session_ready), name="recv"))
-    tasks.add(asyncio.create_task(input_loop(client, struggle_detector), name="input"))
+    tasks.add(asyncio.create_task(
+        receive_loop(client, playback, tool_executor, struggle_detector,
+                     screen, memory_store, session_ready=session_ready,
+                     chat_store=chat_store, session_id=session_id,
+                     pattern_model=pattern_model),
+        name="recv",
+    ))
+    tasks.add(asyncio.create_task(
+        input_loop(client, struggle_detector, wake_word=wake_word,
+                   chat_store=chat_store, session_id=session_id,
+                   pattern_model=pattern_model),
+        name="input",
+    ))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
 
     if capture is not None:
         tasks.add(asyncio.create_task(
-            audio_capture_loop(client, capture, ptt, vad_instance, playback), name="audio"
+            audio_capture_loop(client, capture, ptt, vad_instance, playback,
+                               wake_word=wake_word),
+            name="audio",
         ))
 
     if screen is not None:
@@ -1234,7 +1377,7 @@ async def main() -> None:
         await asyncio.sleep(2.0)
         await client.send_json({
             "type": "text",
-            "content": "Hey Rio, say hello and introduce yourself!",
+            "content": "Hey Rio, say hello and introduce yourself briefly!",
         })
         log.info("startup.greeting_sent")
     except asyncio.TimeoutError:
@@ -1250,6 +1393,35 @@ async def main() -> None:
 
     # -- Shutdown ----------------------------------------------------------
     log.info("rio.shutting_down")
+
+    # Send goodbye message to Rio before closing
+    try:
+        if client.is_connected:
+            print("\n  [sending goodbye to Rio...]")
+            await client.send_json({
+                "type": "text",
+                "content": "The user is closing the app. Say a brief, warm goodbye!",
+            })
+            # Wait briefly to receive goodbye response
+            await asyncio.sleep(3.0)
+    except Exception:
+        log.debug("shutdown.goodbye_failed")
+
+    # Save session end to chat store
+    if chat_store is not None:
+        try:
+            chat_store.add_message(session_id, "system", "Session ended")
+            chat_store.end_session(session_id)
+        except Exception:
+            log.debug("chat_store.end_session_failed")
+
+    # Save session end to pattern model
+    if pattern_model is not None:
+        try:
+            pattern_model.record_activity("session_end", {"session_id": session_id})
+            pattern_model.close()
+        except Exception:
+            log.debug("user_pattern.close_failed")
 
     # Stop PTT + screenshot + audio to avoid sending on a closing connection
     if ptt is not None:
@@ -1267,6 +1439,13 @@ async def main() -> None:
 
     await client.close()
 
+    # Close stores
+    if chat_store is not None:
+        try:
+            chat_store.close()
+        except Exception:
+            pass
+
     for task in pending:
         task.cancel()
         try:
@@ -1274,6 +1453,7 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
 
+    print("  [Rio session saved. Goodbye!]")
     log.info("rio.stopped")
 
 
