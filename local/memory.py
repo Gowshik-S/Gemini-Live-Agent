@@ -1,4 +1,4 @@
-ing . . """
+"""
 Rio Local — RAG Memory (L5)
 ChromaDB + sentence-transformers (bge-small-en-v1.5) for cross-session recall.
 

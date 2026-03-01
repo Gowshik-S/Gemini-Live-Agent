@@ -603,7 +603,8 @@ class GeminiSession:
 
                             model_turn = getattr(server_content, "model_turn", None)
                             if model_turn is not None:
-                                for part in getattr(model_turn, "parts", None) or []:
+                                parts = getattr(model_turn, "parts", None) or []
+                                for part in parts:
                                     # Audio data
                                     inline = getattr(part, "inline_data", None)
                                     if inline is not None:

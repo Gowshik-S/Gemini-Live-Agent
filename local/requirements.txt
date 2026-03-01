@@ -10,12 +10,13 @@ sounddevice>=0.5.0
 numpy>=1.24.0
 
 # VAD — Silero (Day 5)
-# For CPU-only (lighter): pip install torch --index-url https://download.pytorch.org/whl/cpu
-torch>=2.0.0
+# For CPU-only (lighter): significantly smaller download, sufficient for VAD inference
+torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
 
 # Push-to-Talk hotkeys (Day 5) + Screenshot hotkey (Day 6)
-# Note: On Wayland Linux, pynput may require X11 compatibility layer
-pynput>=1.7.0
+# TODO: Re-enable after kernel headers available. For now, use manual keyboard input.
+# evdev-binary>=1.3
+# pynput>=1.7.0
 
 # Screen capture (Day 6 / L2 — Vision)
 mss>=9.0.0
@@ -23,4 +24,5 @@ Pillow>=10.0.0
 
 # OCR — screen text extraction for struggle detection (L4 enhancement)
 # Uses ONNX runtime for fast CPU inference (~20-50ms per frame)
-rapidocr-onnxruntime>=1.3.0
+# Note: 1.3.x+ requires Python <3.13; latest compatible version for Python 3.14 is 1.2.x
+rapidocr-onnxruntime>=1.2.0

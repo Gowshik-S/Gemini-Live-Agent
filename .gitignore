@@ -16,3 +16,11 @@ rio_memory/
 # IDE
 .vscode/
 .idea/
+tests/*
+tests/**/*
+
+# Virtual environments
+venv/
+*/venv/
+cloud/venv/
+local/venv/

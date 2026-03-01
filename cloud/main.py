@@ -110,7 +110,7 @@ async def _dashboard_health_broadcast_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global session_manager
+    global session_manager, model_router
 
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY not set -- Gemini sessions will fail")

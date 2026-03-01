@@ -176,9 +176,14 @@ class AudioPlayback:
     enqueued from the async event loop via ``enqueue()`` and consumed
     by the audio callback running in a separate thread.
 
+    On Linux with PipeWire, the virtual 'default'/'pulse' ALSA devices
+    often hang with PortAudio's callback-based streaming.  This class
+    auto-detects a working hardware output device and resamples
+    Gemini's 24 kHz audio to the device's native rate (typically 48 kHz).
+
     Usage::
 
-        playback = AudioPlayback(sample_rate=24000)
+        playback = AudioPlayback(input_sample_rate=24000)
         playback.start()
         playback.enqueue(pcm_bytes)   # called from async receive loop
         ...
@@ -192,11 +197,13 @@ class AudioPlayback:
         output_device: Optional[str | int] = None,
         max_queue_size: int = 200,
     ) -> None:
-        self._sample_rate = sample_rate
+        self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
+        self._output_sample_rate = sample_rate  # actual device rate (may differ)
         self._channels = channels
         self._output_device = output_device
         self._stream: Optional[sd.OutputStream] = None
         self._running = False
+        self._resample_ratio: float = 1.0       # output_rate / input_rate
 
         # Thread-safe queue: audio callback (audio thread) reads,
         # enqueue() (event-loop thread) writes.
@@ -221,6 +228,100 @@ class AudioPlayback:
         return self._running
 
     # ------------------------------------------------------------------
+    # Device auto-detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_working_output_device(
+        preferred_rate: int = 24_000,
+    ) -> tuple[int | None, int]:
+        """Probe output devices and return (device_index, sample_rate).
+
+        On Linux with PipeWire, virtual ALSA devices (default, pulse,
+        pipewire) often hang with PortAudio's callback-based streams.
+        We therefore prefer real ALSA hardware devices at their native
+        sample rate and resample in software.
+
+        Strategy:
+        1. Try ALSA hardware devices at their native rate (most reliable).
+        2. Try virtual devices at the preferred rate as fallback.
+        3. Fall back to (None, preferred_rate) and hope for the best.
+        """
+        import time as _time
+        import threading
+
+        devices = sd.query_devices()
+
+        virtual_names = {"default", "pulse", "pipewire"}
+        hw_devs: list[tuple[int, dict]] = []
+        virtual_devs: list[tuple[int, dict]] = []
+
+        for i, dev in enumerate(devices):
+            if dev["max_output_channels"] < 1:
+                continue
+            name = dev["name"].lower()
+            if any(vn in name for vn in virtual_names):
+                virtual_devs.append((i, dev))
+            elif "hdmi" not in name:
+                # Skip HDMI since user probably wants speakers
+                hw_devs.append((i, dev))
+
+        def _probe_device(idx: int, rate: int, timeout: float = 1.0) -> bool:
+            """Open an OutputStream, write a tiny sine burst, and check
+            that the callback actually fires (doesn't hang).
+            """
+            callback_fired = threading.Event()
+
+            def _cb(outdata, frames, time_info, status):
+                outdata[:] = 0  # silence
+                callback_fired.set()
+
+            try:
+                stream = sd.OutputStream(
+                    samplerate=rate,
+                    blocksize=960,
+                    dtype="int16",
+                    channels=1,
+                    device=idx,
+                    callback=_cb,
+                )
+                stream.start()
+                ok = callback_fired.wait(timeout=timeout)
+                stream.stop()
+                stream.close()
+                return ok
+            except Exception:
+                return False
+
+        # --- 1. Try hardware devices at native rate ---
+        for idx, dev in hw_devs:
+            native_rate = int(dev["default_samplerate"])
+            if _probe_device(idx, native_rate):
+                log.info(
+                    "playback.device_probe.ok",
+                    device=idx,
+                    name=dev["name"],
+                    rate=native_rate,
+                    kind="hardware",
+                )
+                return idx, native_rate
+
+        # --- 2. Try virtual devices at preferred rate ---
+        for idx, dev in virtual_devs:
+            if _probe_device(idx, preferred_rate):
+                log.info(
+                    "playback.device_probe.ok",
+                    device=idx,
+                    name=dev["name"],
+                    rate=preferred_rate,
+                    kind="virtual",
+                )
+                return idx, preferred_rate
+
+        log.warning("playback.device_probe.no_working_device")
+        return None, preferred_rate
+
+    # ------------------------------------------------------------------
     # Start / Stop
     # ------------------------------------------------------------------
 
@@ -230,15 +331,32 @@ class AudioPlayback:
             log.warning("playback.already_running")
             return
 
+        # --- Auto-detect working device if none specified ---
+        if self._output_device is None:
+            dev_idx, dev_rate = self._find_working_output_device(
+                preferred_rate=self._input_sample_rate,
+            )
+            self._output_device = dev_idx
+            self._output_sample_rate = dev_rate
+        else:
+            self._output_sample_rate = self._input_sample_rate
+
+        self._resample_ratio = self._output_sample_rate / self._input_sample_rate
+
+        # Adjust block size proportionally to the output rate
+        self._block_size = int(960 * self._resample_ratio)
+
         log.info(
             "playback.starting",
-            sample_rate=self._sample_rate,
+            input_rate=self._input_sample_rate,
+            output_rate=self._output_sample_rate,
+            resample_ratio=round(self._resample_ratio, 4),
             block_size=self._block_size,
             device=self._output_device,
         )
 
         self._stream = sd.OutputStream(
-            samplerate=self._sample_rate,
+            samplerate=self._output_sample_rate,
             blocksize=self._block_size,
             dtype="int16",
             channels=self._channels,
@@ -267,13 +385,35 @@ class AudioPlayback:
     # Enqueue / Clear
     # ------------------------------------------------------------------
 
+    def _resample(self, data: bytes) -> bytes:
+        """Resample PCM int16 audio from input rate to output rate.
+
+        Uses numpy linear interpolation — fast and good enough for
+        voice.  For the common 24 kHz → 48 kHz case (ratio 2.0) this
+        simply doubles the sample count with smooth interpolation.
+        """
+        if self._resample_ratio == 1.0:
+            return data
+
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return data
+
+        old_len = len(samples)
+        new_len = int(old_len * self._resample_ratio)
+        old_indices = np.arange(old_len)
+        new_indices = np.linspace(0, old_len - 1, new_len)
+        resampled = np.interp(new_indices, old_indices, samples).astype(np.int16)
+        return resampled.tobytes()
+
     def enqueue(self, data: bytes) -> None:
         """Add PCM audio data to the playback queue.
 
-        Thread-safe. Can be called from the asyncio event loop thread.
-        If the queue is full, the oldest chunk is dropped to prevent
-        unbounded latency growth.
+        Resamples from Gemini's native rate to the output device rate
+        if they differ.  Thread-safe.  If the queue is full, the oldest
+        chunk is dropped to prevent unbounded latency growth.
         """
+        data = self._resample(data)
         try:
             self._queue.put_nowait(data)
         except _queue_mod.Full:

@@ -199,8 +199,10 @@ def _audio_mode(ptt, vad) -> str:
 # ---------------------------------------------------------------------------
 
 async def receive_loop(client: WSClient, playback=None, tool_executor=None,
-                       struggle_detector=None, screen=None, memory_store=None) -> None:
+                       struggle_detector=None, screen=None, memory_store=None,
+                       session_ready: asyncio.Event | None = None) -> None:
     """Continuously read messages from the cloud and print/play them."""
+    audio_frames_received = 0
     async for msg in client.receive():
         if isinstance(msg, dict):
             msg_type = msg.get("type", "")
@@ -241,6 +243,8 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 log.info("cloud.control", action=action)
                 if action == "connected":
                     print("  [connected to Gemini session]")
+                    if session_ready is not None:
+                        session_ready.set()
                 elif action == "error":
                     print(f"  [connection error: {msg.get('detail', '')}]")
                 elif action == "reconnecting":
@@ -395,6 +399,9 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
 
                 if prefix == b"\x01":
                     # Audio frame from Gemini — enqueue for playback
+                    audio_frames_received += 1
+                    if audio_frames_received == 1:
+                        log.info("audio.first_frame_received", bytes=len(payload))
                     if playback is not None:
                         playback.enqueue(payload)
                     else:
@@ -1110,9 +1117,13 @@ async def main() -> None:
             )
             log.info("memory.ready", db_path=config.memory.db_path, entries=memory_store.count())
             print(f"  Memory: {memory_store.count()} entries in {config.memory.db_path}")
+        except RuntimeError as e:
+            log.warning("memory.deps_missing", detail=str(e))
+            print("  Memory: disabled (chromadb/sentence-transformers not installed)")
+            memory_store = None
         except Exception:
             log.exception("memory.init_failed")
-            print("  Memory: init failed (chromadb/sentence-transformers missing?)")
+            print("  Memory: init failed")
             memory_store = None
     else:
         print("  Memory: disabled (module not available)")
@@ -1169,7 +1180,8 @@ async def main() -> None:
     # -- Run all loops concurrently ----------------------------------------
     tasks: set[asyncio.Task] = set()
 
-    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen, memory_store), name="recv"))
+    session_ready = asyncio.Event()
+    tasks.add(asyncio.create_task(receive_loop(client, playback, tool_executor, struggle_detector, screen, memory_store, session_ready=session_ready), name="recv"))
     tasks.add(asyncio.create_task(input_loop(client, struggle_detector), name="input"))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
 
@@ -1213,6 +1225,22 @@ async def main() -> None:
             screen_mode_toggle_loop(screen_mode_trigger, autonomous_mode),
             name="screen_mode",
         ))
+
+    # -- Send startup greeting -------------------------------------------------
+    try:
+        await asyncio.wait_for(session_ready.wait(), timeout=30.0)
+        log.info("startup.session_ready")
+        # Brief pause to let the Live session fully stabilise
+        await asyncio.sleep(2.0)
+        await client.send_json({
+            "type": "text",
+            "content": "Hey Rio, say hello and introduce yourself!",
+        })
+        log.info("startup.greeting_sent")
+    except asyncio.TimeoutError:
+        log.warning("startup.session_not_ready", note="Gemini session did not connect within 30s")
+    except ConnectionError:
+        log.warning("startup.greeting_failed", reason="not connected")
 
     # Wait until any task exits (user typed /quit, Ctrl-C, or fatal error)
     done, pending = await asyncio.wait(

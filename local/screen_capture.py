@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import subprocess
+import shutil
 from typing import Optional
 
 import structlog
@@ -29,6 +31,10 @@ log = structlog.get_logger(__name__)
 
 # Wire protocol prefix for image frames
 IMAGE_PREFIX = b"\x02"
+
+# Circuit breaker: after this many consecutive failures, pause captures
+_MAX_CONSECUTIVE_FAILURES = 3
+_CIRCUIT_BREAKER_COOLDOWN = 30.0  # seconds to wait before retrying
 
 # ---------------------------------------------------------------------------
 # Lazy-import helpers (avoid hard crash if deps missing)
@@ -52,6 +58,20 @@ def _ensure_deps() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _detect_wayland() -> bool:
+    """Check if the session is running under Wayland."""
+    import os
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _find_wayland_tool() -> Optional[str]:
+    """Find a Wayland-compatible screenshot tool."""
+    for tool in ("grim", "spectacle", "gnome-screenshot"):
+        if shutil.which(tool):
+            return tool
+    return None
 
 
 class ScreenCapture:
@@ -78,12 +98,35 @@ class ScreenCapture:
         self._last_hash: Optional[str] = None
         self._available = _ensure_deps()
 
+        # Circuit breaker state
+        self._consecutive_failures = 0
+        self._circuit_open_until: float = 0.0
+
+        # Backend selection: prefer mss (X11), fallback to CLI tools (Wayland)
+        self._use_wayland_fallback = False
+        self._wayland_tool: Optional[str] = None
+
         if not self._available:
             log.warning(
                 "screen_capture.deps_missing",
                 note="Install mss and Pillow: pip install mss Pillow",
             )
         else:
+            # Detect Wayland and pre-select fallback tool
+            if _detect_wayland():
+                self._wayland_tool = _find_wayland_tool()
+                if self._wayland_tool:
+                    log.info(
+                        "screen_capture.wayland_detected",
+                        fallback_tool=self._wayland_tool,
+                        note="Will use CLI fallback if mss fails",
+                    )
+                else:
+                    log.warning(
+                        "screen_capture.wayland_no_fallback",
+                        note="Install 'grim' (Sway) or 'gnome-screenshot' for Wayland support",
+                    )
+
             log.info(
                 "screen_capture.init",
                 fps=fps,
@@ -116,26 +159,50 @@ class ScreenCapture:
         Returns None if:
           - Dependencies are missing
           - The frame is identical to the last one (delta detection)
+          - Circuit breaker is open (too many consecutive failures)
 
         Args:
             force: If True, skip delta detection and always return the frame.
         """
-        if not self._available or _mss_mod is None or _pil_image is None:
+        if not self._available or _pil_image is None:
             return None
 
-        try:
-            with _mss_mod.mss() as sct:
-                try:
-                    monitor = sct.monitors[1]  # Primary monitor
-                except IndexError:
-                    monitor = sct.monitors[0]  # Fallback to full virtual screen
-                    log.warning("screen_capture.no_primary_monitor", note="using monitors[0]")
-                raw = sct.grab(monitor)
+        # Circuit breaker: if open, check cooldown
+        import time
+        if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+            now = time.monotonic()
+            if now < self._circuit_open_until:
+                return None  # silently skip — circuit is open
+            # Cooldown expired — try again
+            log.info("screen_capture.circuit_breaker.retry")
+            self._consecutive_failures = 0
 
-            # Convert to PIL Image (mss provides .rgb for RGB bytes)
-            img = _pil_image.frombytes(
-                "RGB", (raw.width, raw.height), raw.rgb
-            )
+        try:
+            img = None
+
+            # Try mss first (fast, no subprocess), unless we know it fails
+            if not self._use_wayland_fallback and _mss_mod is not None:
+                try:
+                    img = self._capture_mss()
+                except Exception as exc:
+                    # mss failed — if we have a Wayland fallback, switch to it
+                    if self._wayland_tool:
+                        log.info(
+                            "screen_capture.mss_failed_switching_to_wayland",
+                            tool=self._wayland_tool,
+                            error=str(exc),
+                        )
+                        self._use_wayland_fallback = True
+                    else:
+                        raise  # No fallback — let it fail normally
+
+            # Wayland fallback via CLI tool
+            if img is None and self._use_wayland_fallback and self._wayland_tool:
+                img = self._capture_wayland()
+
+            if img is None:
+                self._record_failure()
+                return None
 
             # Resize to reduce size before compression
             if self._resize_factor < 1.0:
@@ -156,16 +223,82 @@ class ScreenCapture:
                     return None
                 self._last_hash = frame_hash
 
+            # Success — reset failure counter
+            self._consecutive_failures = 0
+
             log.debug(
                 "screen_capture.captured",
                 size_kb=round(len(jpeg_bytes) / 1024, 1),
                 resolution=f"{img.width}x{img.height}",
+                backend="wayland" if self._use_wayland_fallback else "mss",
             )
             return jpeg_bytes
 
         except Exception:
-            log.exception("screen_capture.error")
+            self._record_failure()
             return None
+
+    def _capture_mss(self):
+        """Capture using mss (X11). Returns a PIL Image or raises."""
+        with _mss_mod.mss() as sct:
+            try:
+                monitor = sct.monitors[1]  # Primary monitor
+            except IndexError:
+                monitor = sct.monitors[0]  # Fallback to full virtual screen
+                log.warning("screen_capture.no_primary_monitor", note="using monitors[0]")
+            raw = sct.grab(monitor)
+        return _pil_image.frombytes("RGB", (raw.width, raw.height), raw.rgb)
+
+    def _capture_wayland(self):
+        """Capture using a Wayland-compatible CLI tool. Returns a PIL Image or None."""
+        import tempfile
+        import os
+
+        tmp_path = os.path.join(tempfile.gettempdir(), "rio_screenshot.png")
+
+        try:
+            if self._wayland_tool == "grim":
+                subprocess.run(
+                    ["grim", tmp_path],
+                    capture_output=True, timeout=5, check=True,
+                )
+            elif self._wayland_tool == "spectacle":
+                subprocess.run(
+                    ["spectacle", "-b", "-n", "-f", "-o", tmp_path],
+                    capture_output=True, timeout=10, check=True,
+                )
+            elif self._wayland_tool == "gnome-screenshot":
+                subprocess.run(
+                    ["gnome-screenshot", "-f", tmp_path],
+                    capture_output=True, timeout=5, check=True,
+                )
+            else:
+                return None
+
+            if os.path.exists(tmp_path):
+                img = _pil_image.open(tmp_path).convert("RGB")
+                os.unlink(tmp_path)
+                return img
+        except subprocess.TimeoutExpired:
+            log.warning("screen_capture.wayland_timeout", tool=self._wayland_tool)
+        except subprocess.CalledProcessError as exc:
+            log.warning("screen_capture.wayland_failed", tool=self._wayland_tool, error=str(exc))
+        except Exception:
+            log.exception("screen_capture.wayland_error")
+        return None
+
+    def _record_failure(self):
+        """Record a capture failure and open circuit breaker if needed."""
+        import time
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+            self._circuit_open_until = time.monotonic() + _CIRCUIT_BREAKER_COOLDOWN
+            log.warning(
+                "screen_capture.circuit_breaker.open",
+                failures=self._consecutive_failures,
+                cooldown_s=_CIRCUIT_BREAKER_COOLDOWN,
+                note="Screen capture paused — will retry after cooldown",
+            )
 
     async def capture_async(self, force: bool = False) -> Optional[bytes]:
         """Run capture in a thread executor to avoid blocking the event loop."""
