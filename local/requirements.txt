@@ -33,3 +33,6 @@ vosk>=0.3.45
 # RAG memory (optional)
 # chromadb>=0.4.0
 # sentence-transformers>=2.2.0
+
+# ML ensemble pipeline — user pattern learning (v0.8.0)
+scikit-learn>=1.3.0

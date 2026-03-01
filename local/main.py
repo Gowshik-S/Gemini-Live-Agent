@@ -98,6 +98,18 @@ try:
 except ImportError:
     UserPatternModel = None
 
+# ML Pipeline (ensemble learning)
+try:
+    import sys as _sys
+    _ml_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ml_parent not in _sys.path:
+        _sys.path.insert(0, _ml_parent)
+    from ml.user_model_manager import UserModelManager
+    from ml.ensemble_model import SKLEARN_AVAILABLE as _ML_READY
+except ImportError:
+    UserModelManager = None
+    _ML_READY = False
+
 # ---------------------------------------------------------------------------
 # Structlog configuration
 # ---------------------------------------------------------------------------
@@ -128,10 +140,10 @@ BANNER = r"""
  |  _ \(_) ___
  | |_) | |/ _ \
  |  _ <| | (_) |
- |_| \_\_|\___/   v0.7.0 — L8 Wake Word + ML
+ |_| \_\_|\___/   v0.8.0 — ML Ensemble Pipeline
 
  Proactive AI Pair Programmer
- Voice + screen vision + tools + struggle detection + memory + Pro routing
+ Voice + screen vision + tools + struggle detection + ML ensemble + Pro routing
  Wake word: say "Rio" or "Hey Rio" to activate
  F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
  Text input via stdin.  Ctrl-C to quit.
@@ -219,7 +231,7 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                        struggle_detector=None, screen=None, memory_store=None,
                        session_ready: asyncio.Event | None = None,
                        chat_store=None, session_id: str = "",
-                       pattern_model=None) -> None:
+                       pattern_model=None, ml_manager=None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     audio_frames_received = 0
     async for msg in client.receive():
@@ -246,6 +258,12 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     if pattern_model is not None:
                         try:
                             pattern_model.record_language(text, source="rio_response")
+                        except Exception:
+                            pass
+                    # ML Pipeline: Record Rio's response
+                    if ml_manager is not None:
+                        try:
+                            ml_manager.record_interaction("rio", text, time.time())
                         except Exception:
                             pass
                 elif speaker == "user":
@@ -744,7 +762,7 @@ async def screen_mode_toggle_loop(
 
 async def input_loop(client: WSClient, struggle_detector=None,
                      wake_word=None, chat_store=None, session_id: str = "",
-                     pattern_model=None) -> None:
+                     pattern_model=None, ml_manager=None) -> None:
     """Read user text from stdin and send to the cloud.
 
     Because ``input()`` is blocking, we run it in the default executor
@@ -785,6 +803,13 @@ async def input_loop(client: WSClient, struggle_detector=None,
             try:
                 pattern_model.record_activity("message", {"source": "text_input"})
                 pattern_model.record_language(text, source="user_input")
+            except Exception:
+                pass
+
+        # ML Pipeline: Record user interaction for ensemble learning
+        if ml_manager is not None:
+            try:
+                ml_manager.record_interaction("user", text, time.time())
             except Exception:
                 pass
 
@@ -1255,6 +1280,34 @@ async def main() -> None:
     else:
         print("  ML Model: disabled (module not found)")
 
+    # -- Initialize ML ensemble pipeline (v0.8.0) -----------------------------
+    ml_manager = None
+    if _ML_READY:
+        try:
+            ml_manager = UserModelManager(user_id="default")
+            # Warm-start from historical DB data if available
+            try:
+                hist = ml_manager.train_on_history(days=30)
+                if hist > 0:
+                    log.info("ml_pipeline.warmstart", samples=hist)
+                    print(f"  ML Pipeline: warm-started on {hist} historical samples")
+                else:
+                    print("  ML Pipeline: active (no history yet — cold start)")
+            except Exception:
+                print("  ML Pipeline: active (cold start)")
+            # Get initial prediction context
+            pred = ml_manager.predict_current()
+            if pred:
+                log.info("ml_pipeline.initial_prediction",
+                         style=pred.get("chat_style", {}).get("label", "unknown"),
+                         engagement=pred.get("engagement", {}).get("label", "unknown"))
+        except Exception:
+            log.exception("ml_pipeline.init_failed")
+            print("  ML Pipeline: init failed (falling back to basic model)")
+            ml_manager = None
+    else:
+        print("  ML Pipeline: disabled (scikit-learn not found)")
+
     # -- Build client ------------------------------------------------------
     client = WSClient(
         config.cloud_url,
@@ -1315,13 +1368,13 @@ async def main() -> None:
         receive_loop(client, playback, tool_executor, struggle_detector,
                      screen, memory_store, session_ready=session_ready,
                      chat_store=chat_store, session_id=session_id,
-                     pattern_model=pattern_model),
+                     pattern_model=pattern_model, ml_manager=ml_manager),
         name="recv",
     ))
     tasks.add(asyncio.create_task(
         input_loop(client, struggle_detector, wake_word=wake_word,
                    chat_store=chat_store, session_id=session_id,
-                   pattern_model=pattern_model),
+                   pattern_model=pattern_model, ml_manager=ml_manager),
         name="input",
     ))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
@@ -1422,6 +1475,14 @@ async def main() -> None:
             pattern_model.close()
         except Exception:
             log.debug("user_pattern.close_failed")
+
+    # Train & save ML ensemble model on session data
+    if ml_manager is not None:
+        try:
+            ml_manager.close()  # trains on session + saves pkl
+            log.info("ml_pipeline.saved")
+        except Exception:
+            log.debug("ml_pipeline.close_failed")
 
     # Stop PTT + screenshot + audio to avoid sending on a closing connection
     if ptt is not None:
