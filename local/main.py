@@ -140,10 +140,11 @@ BANNER = r"""
  |  _ \(_) ___
  | |_) | |/ _ \
  |  _ <| | (_) |
- |_| \_\_|\___/   v0.8.0 — ML Ensemble Pipeline
+ |_| \_\_|\___/   v0.9.0 — Low-Latency Audio Pipeline
 
  Proactive AI Pair Programmer
  Voice + screen vision + tools + struggle detection + ML ensemble + Pro routing
+ WASAPI low-latency audio, 20ms capture chunks, 40ms jitter buffer
  Wake word: say "Rio" or "Hey Rio" to activate
  F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
  Text input via stdin.  Ctrl-C to quit.
@@ -545,6 +546,7 @@ async def audio_capture_loop(
       vad-only  — always captures, VAD filters silence
       always-on — streams everything (Day 3 behaviour)
     
+    Chunks are 20ms (320 samples @ 16kHz) for low-latency capture.
     When wake_word is provided, audio is only sent when the wake word
     has been detected (Alexa-style activation).
     """
@@ -621,7 +623,7 @@ async def audio_capture_loop(
         try:
             await client.send_binary(AUDIO_PREFIX + chunk)
             chunks_sent += 1
-            if chunks_sent % 100 == 0:  # Log every ~10 seconds
+            if chunks_sent % 500 == 0:  # Log every ~10 seconds (500 * 20ms)
                 log.debug("audio_loop.progress", chunks_sent=chunks_sent)
         except ConnectionError:
             log.warning("audio_loop.send_failed", reason="disconnected")
@@ -1025,6 +1027,7 @@ async def main() -> None:
                 sample_rate=config.audio.sample_rate,
                 block_size=config.audio.block_size,
                 input_device=config.audio.input_device,
+                use_wasapi=config.audio.use_wasapi,
             )
         except Exception:
             log.exception("audio.init_failed")
@@ -1045,6 +1048,7 @@ async def main() -> None:
             playback = AudioPlayback(
                 sample_rate=24_000,  # Gemini output is 24kHz
                 output_device=config.audio.output_device,
+                use_wasapi=config.audio.use_wasapi,
             )
         except Exception:
             log.exception("playback.init_failed")

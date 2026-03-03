@@ -5,8 +5,8 @@ Wraps Silero VAD (torch.hub) for per-chunk speech detection.
 Accepts PCM 16-bit LE bytes, returns boolean speech decision.
 
 Silero VAD valid window sizes at 16kHz: 256, 512, 768, 1024, 1280, 1536.
-Our 1600-sample chunks (100ms) are trimmed to 1536 (96ms) for inference.
-The 64 discarded samples (4ms) are negligible.
+With 20ms chunks (320 samples), we use exactly 256 samples for inference
+and accumulate the rest. For larger chunks we use the nearest valid window.
 
 If torch is not installed, the module degrades gracefully: process()
 returns is_speech=True (pass-through), enabling PTT-only mode.
@@ -23,7 +23,16 @@ import structlog
 log = structlog.get_logger(__name__)
 
 # Silero expects one of these window sizes at 16kHz
-_SILERO_WINDOW_16K = 1536  # 96ms -- largest valid size fitting in 1600
+_SILERO_VALID_WINDOWS = [256, 512, 768, 1024, 1280, 1536]
+_SILERO_WINDOW_16K = 512  # Default: 32ms -- good balance of speed & accuracy
+
+
+def _best_window_size(num_samples: int) -> int:
+    """Find the largest valid Silero window that fits in num_samples."""
+    for ws in reversed(_SILERO_VALID_WINDOWS):
+        if ws <= num_samples:
+            return ws
+    return _SILERO_VALID_WINDOWS[0]  # 256 minimum
 
 
 @dataclass
@@ -117,7 +126,8 @@ class SileroVAD:
 
         Args:
             pcm_bytes: Raw PCM 16-bit LE mono audio.
-                       Expected 1600 samples (3200 bytes) from AudioCapture.
+                       Supports variable chunk sizes (320 samples/20ms,
+                       640 samples/40ms, 1600 samples/100ms, etc.).
 
         Returns:
             VadResult with probability and is_speech boolean.
@@ -129,9 +139,15 @@ class SileroVAD:
         # Convert PCM bytes -> int16 numpy array
         audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
 
-        # Trim to valid Silero window size (1536 samples from 1600)
-        if len(audio_int16) > _SILERO_WINDOW_16K:
-            audio_int16 = audio_int16[:_SILERO_WINDOW_16K]
+        # Find the best valid Silero window size for this chunk
+        window_size = _best_window_size(len(audio_int16))
+
+        # Trim to valid Silero window size
+        if len(audio_int16) > window_size:
+            audio_int16 = audio_int16[:window_size]
+        elif len(audio_int16) < _SILERO_VALID_WINDOWS[0]:
+            # Chunk too small for any valid window — pass through
+            return VadResult(probability=0.5, is_speech=True)
 
         # Normalize to float32 [-1.0, 1.0]
         audio_float = audio_int16.astype(np.float32) / 32768.0

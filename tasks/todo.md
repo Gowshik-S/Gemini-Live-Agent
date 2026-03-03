@@ -1,6 +1,87 @@
 # Rio Build Progress
 
-## Current Sprint: ML Pipeline — Ensemble Learning (March 1, 2026)
+## Current Sprint: Skills Integration — Customer Care + Tutor (March 2, 2026)
+
+### What Was Done
+Two new skills integrated into Rio via openclaw SKILL.md format + Rio tool pipeline.
+
+### Completed Tasks
+- [x] 1. Research openclaw skills system (SKILL.md format, discovery, prompt injection)
+- [x] 2. Create rio-customer-care skill (SKILL.md + escalation-workflows.md + response-templates.md)
+- [x] 3. Create rio-tutor skill (SKILL.md + socratic-method.md + learning-patterns.md + quiz_generator.py)
+- [x] 4. Add 4 tool declarations to cloud/gemini_session.py (create_ticket, generate_quiz, track_progress, explain_concept)
+- [x] 5. Add 4 tool handlers to local/tools.py (_create_ticket, _generate_quiz, _track_progress, _explain_concept)
+- [x] 6. Update system instruction with Customer Care Mode + Tutor Mode guidance
+- [x] 7. Add SkillsConfig to config.py (CustomerCareConfig + TutorConfig dataclasses)
+- [x] 8. Add skills section to config.yaml
+- [x] 9. Update context.txt with skills documentation
+- [x] 10. Update todo.md (this file)
+
+### Files Modified
+- `cloud/gemini_session.py` — 4 new FunctionDeclarations + system instruction update
+- `local/tools.py` — 4 new handler methods + dispatch entries + new imports
+- `local/config.py` — CustomerCareConfig, TutorConfig, SkillsConfig dataclasses
+- `config.yaml` — skills.customer_care + skills.tutor config blocks
+
+### Files Created
+- `openclaw/skills/rio-customer-care/SKILL.md`
+- `openclaw/skills/rio-customer-care/references/escalation-workflows.md`
+- `openclaw/skills/rio-customer-care/references/response-templates.md`
+- `openclaw/skills/rio-tutor/SKILL.md`
+- `openclaw/skills/rio-tutor/references/socratic-method.md`
+- `openclaw/skills/rio-tutor/references/learning-patterns.md`
+- `openclaw/skills/rio-tutor/scripts/quiz_generator.py`
+
+### Version: v0.7.0
+
+---
+
+## Previous Sprint: Audio Overhaul — Low-Latency Voice (March 3, 2026)
+
+### Problem
+Voice is breaking/choppy, can't hear responses properly, response time too slow.
+
+### Root Cause Analysis
+1. **200ms jitter buffer** — Accumulates 9600 bytes before first playback, adds 200ms latency
+2. **100ms audio chunks** (1600 samples @ 16kHz) — Too large for responsive voice input
+3. **No WASAPI low-latency mode** — Using default PortAudio settings on Windows (MME/DirectSound)
+4. **Large output block size** — 2400 samples @ 48kHz = 50ms per callback
+5. **Linear interpolation resampling** — Can introduce artifacts on rate mismatch
+6. **Queue backpressure drops** — Aggressive dropping causes audio gaps
+7. **No latency parameter** — sounddevice `latency` not set (defaults to 'high')
+
+### Research: Best Audio Module for Voice Assistant (Python on Windows)
+| Library | Backend | WASAPI Support | Latency | Maintained |
+|---------|---------|----------------|---------|------------|
+| **sounddevice** | PortAudio (CFFI) | Yes (via `WasapiSettings`) | **Low with tuning** | Active (Jan 2026) |
+| PyAudio | PortAudio (ctypes) | Yes (host API 13) | Low | Stale (Nov 2023) |
+| PyAudioWPatch | PortAudio fork | Yes (loopback) | Low | Active (Jan 2026) |
+
+**Decision: Keep sounddevice** — both sd and PyAudio wrap PortAudio. sounddevice is better maintained, has native `latency='low'` param and `WasapiSettings(exclusive=True)` support. The real fix is configuration + architecture, not changing the library.
+
+### Sprint Tasks
+- [ ] 1. Reduce capture chunk size: 100ms → 20ms (320 samples @ 16kHz)
+- [ ] 2. Enable WASAPI low-latency with `sd.WasapiSettings(exclusive=True)` on Windows
+- [ ] 3. Set `latency='low'` on both input and output streams
+- [ ] 4. Reduce jitter buffer: 200ms → 40ms (cut first-sound latency by 160ms)
+- [ ] 5. Reduce output block size: 2400 → 480 samples (10ms @ 48kHz)
+- [ ] 6. Optimize queue sizes and backpressure strategy
+- [ ] 7. Add audio latency config to config.yaml
+- [ ] 8. Update VAD to handle smaller 20ms chunks (trim to nearest valid Silero window)
+- [ ] 9. Verify and test changes
+
+### Expected Improvement
+| Metric | Before | After |
+|--------|--------|-------|
+| First-sound latency | ~250ms | ~50ms |
+| Capture chunk granularity | 100ms | 20ms |
+| Output callback interval | 50ms | 10ms |
+| Audio API | MME/DirectSound | WASAPI exclusive |
+| End-to-end voice round-trip | ~500ms+ | ~150ms |
+
+---
+
+## Previous Sprint: ML Pipeline — Ensemble Learning (March 1, 2026)
 
 ### Sprint Tasks
 - [x] 1. Design 48-dimensional feature vector (7 feature groups)

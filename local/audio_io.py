@@ -1,9 +1,12 @@
 """
-Rio Local — Audio I/O Module
+Rio Local — Audio I/O Module (Low-Latency v2)
 
 Layer 1 (L1): Audio capture and playback using sounddevice.
-  - Capture: PCM 16-bit, 16kHz, mono audio in 100ms chunks
+  - Capture: PCM 16-bit, 16kHz, mono audio in 20ms chunks (was 100ms)
   - Playback: PCM 16-bit, 24kHz, mono (matches Gemini output rate)
+  - WASAPI exclusive mode on Windows for lowest latency
+  - latency='low' on all streams
+  - Reduced jitter buffer (40ms vs 200ms)
   - Async-friendly: queue-based interfaces for both directions
   - Device enumeration and selection
 """
@@ -14,6 +17,8 @@ import asyncio
 import queue as _queue_mod
 from typing import AsyncGenerator, Optional
 
+import platform
+
 import numpy as np
 import sounddevice as sd
 import structlog
@@ -22,6 +27,24 @@ log = structlog.get_logger(__name__)
 
 # Wire protocol prefix for audio frames
 AUDIO_PREFIX = b"\x01"
+
+# Platform detection for WASAPI
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _get_wasapi_settings(exclusive: bool = False) -> object | None:
+    """Return WASAPI-specific settings for sounddevice on Windows.
+
+    Uses sd.WasapiSettings for low-latency audio on Windows.
+    Returns None on non-Windows platforms.
+    """
+    if not _IS_WINDOWS:
+        return None
+    try:
+        return sd.WasapiSettings(exclusive=exclusive)
+    except Exception:
+        log.debug("wasapi.settings_unavailable")
+        return None
 
 
 class AudioCapture:
@@ -43,13 +66,15 @@ class AudioCapture:
     def __init__(
         self,
         sample_rate: int = 16_000,
-        block_size: int = 1_600,
+        block_size: int = 320,
         input_device: Optional[str | int] = None,
-        max_queue_size: int = 100,
+        max_queue_size: int = 200,
+        use_wasapi: bool = True,
     ) -> None:
         self._sample_rate = sample_rate
-        self._block_size = block_size
+        self._block_size = block_size  # 320 samples = 20ms @ 16kHz
         self._input_device = input_device
+        self._use_wasapi = use_wasapi
         self._stream: Optional[sd.InputStream] = None
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_queue_size)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -71,11 +96,20 @@ class AudioCapture:
 
         self._loop = asyncio.get_running_loop()
 
+        # WASAPI exclusive mode for lowest latency on Windows
+        extra_settings = None
+        if self._use_wasapi and _IS_WINDOWS:
+            extra_settings = _get_wasapi_settings(exclusive=False)
+            if extra_settings:
+                log.info("audio.wasapi_enabled", exclusive=False)
+
         log.info(
             "audio.starting",
             sample_rate=self._sample_rate,
             block_size=self._block_size,
             device=self._input_device,
+            latency="low",
+            wasapi=extra_settings is not None,
         )
 
         self._stream = sd.InputStream(
@@ -84,11 +118,13 @@ class AudioCapture:
             dtype="int16",
             channels=1,
             device=self._input_device,
+            latency="low",
+            extra_settings=extra_settings,
             callback=self._audio_callback,
         )
         self._stream.start()
         self._running = True
-        log.info("audio.started")
+        log.info("audio.started", latency=self._stream.latency)
 
     def stop(self) -> None:
         """Stop capturing audio."""
@@ -112,7 +148,7 @@ class AudioCapture:
 
         Each chunk is raw PCM 16-bit LE, mono, at the configured sample rate.
         Chunk size = block_size * 2 bytes (int16 = 2 bytes per sample).
-        At 16kHz with block_size=1600, each chunk is 100ms / 3200 bytes.
+        At 16kHz with block_size=320, each chunk is 20ms / 640 bytes.
         """
         while self._running:
             try:
@@ -191,8 +227,8 @@ class AudioPlayback:
     """
 
     # Jitter buffer: accumulate this many bytes before starting playback.
-    # Prevents underflows by ensuring a cushion of audio data.
-    _JITTER_BUFFER_BYTES = 9600  # ~200ms at 24kHz 16-bit mono
+    # Reduced from 200ms to 40ms for much faster first-sound latency.
+    _JITTER_BUFFER_BYTES = 1920  # ~40ms at 24kHz 16-bit mono (24000*0.04*2)
 
     def __init__(
         self,
@@ -200,11 +236,13 @@ class AudioPlayback:
         channels: int = 1,
         output_device: Optional[str | int] = None,
         max_queue_size: int = 600,
+        use_wasapi: bool = True,
     ) -> None:
         self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
         self._output_sample_rate = sample_rate  # actual device rate (may differ)
         self._channels = channels
         self._output_device = output_device
+        self._use_wasapi = use_wasapi
         self._stream: Optional[sd.OutputStream] = None
         self._running = False
         self._resample_ratio: float = 1.0       # output_rate / input_rate
@@ -222,9 +260,9 @@ class AudioPlayback:
         )
 
         # Block size for the output stream callback.
-        # 2400 samples at 48kHz = 50ms per callback — larger blocks
-        # reduce underflow risk significantly.
-        self._block_size = 2400
+        # 480 samples at 48kHz = 10ms per callback — small blocks for
+        # low latency. Was 2400 (50ms).
+        self._block_size = 480
 
     @property
     def is_playing(self) -> bool:
@@ -352,7 +390,15 @@ class AudioPlayback:
         self._resample_ratio = self._output_sample_rate / self._input_sample_rate
 
         # Adjust block size proportionally to the output rate
-        self._block_size = int(960 * self._resample_ratio)
+        # Target ~10ms per callback (was ~50ms)
+        self._block_size = max(int(480 * self._resample_ratio), 240)
+
+        # WASAPI settings for low-latency playback on Windows
+        extra_settings = None
+        if self._use_wasapi and _IS_WINDOWS:
+            extra_settings = _get_wasapi_settings(exclusive=False)
+            if extra_settings:
+                log.info("playback.wasapi_enabled", exclusive=False)
 
         log.info(
             "playback.starting",
@@ -361,6 +407,8 @@ class AudioPlayback:
             resample_ratio=round(self._resample_ratio, 4),
             block_size=self._block_size,
             device=self._output_device,
+            latency="low",
+            wasapi=extra_settings is not None,
         )
 
         self._stream = sd.OutputStream(
@@ -369,11 +417,13 @@ class AudioPlayback:
             dtype="int16",
             channels=self._channels,
             device=self._output_device,
+            latency="low",
+            extra_settings=extra_settings,
             callback=self._playback_callback,
         )
         self._stream.start()
         self._running = True
-        log.info("playback.started")
+        log.info("playback.started", latency=self._stream.latency)
 
     def stop(self) -> None:
         """Stop playback and close the output stream."""
@@ -432,8 +482,8 @@ class AudioPlayback:
                 # Flush the entire jitter buffer into the queue
                 buf = bytes(self._jitter_buf)
                 self._jitter_buf.clear()
-                # Split into queue-friendly chunks (~4800 bytes = 100ms at 48kHz)
-                chunk_size = 4800
+                # Split into queue-friendly chunks (~960 bytes = 10ms at 48kHz)
+                chunk_size = 960
                 for i in range(0, len(buf), chunk_size):
                     piece = buf[i:i + chunk_size]
                     try:

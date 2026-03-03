@@ -25,9 +25,11 @@ log = structlog.get_logger(__name__)
 @dataclass
 class AudioConfig:
     sample_rate: int = 16_000
-    block_size: int = 1_600
+    block_size: int = 320        # 20ms chunks (was 1600/100ms)
     input_device: Optional[str] = None
     output_device: Optional[str] = None
+    latency: str = "low"         # "low" for voice assistant, "high" for stability
+    use_wasapi: bool = True      # Enable WASAPI low-latency on Windows
 
 
 @dataclass
@@ -74,6 +76,29 @@ class ModelConfig:
     pro_rpm_budget: int = 5
 
 
+@dataclass
+class CustomerCareConfig:
+    enabled: bool = True
+    ticket_dir: str = "./rio_tickets"
+    auto_escalate_after: int = 300
+    default_priority: str = "medium"
+
+
+@dataclass
+class TutorConfig:
+    enabled: bool = True
+    progress_dir: str = "./rio_progress"
+    default_difficulty: str = "intermediate"
+    quiz_num_questions: int = 5
+    socratic_mode: bool = True
+
+
+@dataclass
+class SkillsConfig:
+    customer_care: CustomerCareConfig = field(default_factory=CustomerCareConfig)
+    tutor: TutorConfig = field(default_factory=TutorConfig)
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -91,6 +116,7 @@ class RioConfig:
     struggle: StruggleConfig = field(default_factory=StruggleConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
 
     # ------------------------------------------------------------------
     # Factory: load from YAML
@@ -143,6 +169,7 @@ class RioConfig:
             struggle=_build(StruggleConfig, d.get("struggle")),
             memory=_build(MemoryConfig, d.get("memory")),
             models=_build(ModelConfig, d.get("models")),
+            skills=_build_skills(d.get("skills")),
         )
 
     # ------------------------------------------------------------------
@@ -185,3 +212,13 @@ def _build(klass: type, raw: dict | None):
     valid_keys = {f.name for f in klass.__dataclass_fields__.values()}
     filtered = {k: v for k, v in raw.items() if k in valid_keys}
     return klass(**filtered)
+
+
+def _build_skills(raw: dict | None) -> SkillsConfig:
+    """Build the nested SkillsConfig from a raw dict."""
+    if raw is None:
+        return SkillsConfig()
+    return SkillsConfig(
+        customer_care=_build(CustomerCareConfig, raw.get("customer_care")),
+        tutor=_build(TutorConfig, raw.get("tutor")),
+    )

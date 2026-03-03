@@ -1,13 +1,22 @@
 """
-Rio Local -- Tool Executor (Day 8 / L3)
+Rio Local -- Tool Executor (Day 8 / L3 + Skills)
 
 Executes tool calls from Gemini on the local machine.
 
 Available tools:
+  Core:
   - read_file(path)         -- Read file contents (auto-approve)
   - write_file(path, content) -- Backup to .rio.bak, then write
   - patch_file(path, old_text, new_text) -- Find-and-replace with backup
   - run_command(command)     -- Shell command with 30s timeout + blocklist
+
+  Customer Care skill:
+  - create_ticket(title, ...) -- Create a support ticket (JSON file)
+
+  Tutor skill:
+  - generate_quiz(topic, ...) -- Generate quiz questions for a topic
+  - track_progress(action, ...) -- Record/query student learning progress
+  - explain_concept(concept, ...) -- Structured explanation scaffold
 
 Security:
   - Dangerous commands (rm -rf /, format, dd, fork bombs) are blocked
@@ -19,11 +28,14 @@ Security:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +106,10 @@ class ToolExecutor:
             "write_file": self._write_file,
             "patch_file": self._patch_file,
             "run_command": self._run_command,
+            "create_ticket": self._create_ticket,
+            "generate_quiz": self._generate_quiz,
+            "track_progress": self._track_progress,
+            "explain_concept": self._explain_concept,
         }
 
         handler = handlers.get(name)
@@ -290,3 +306,283 @@ class ToolExecutor:
             }
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # create_ticket  (Customer Care skill)
+    # ------------------------------------------------------------------
+
+    async def _create_ticket(
+        self,
+        title: str,
+        category: str = "general",
+        priority: str = "medium",
+        description: str = "",
+        customer_id: str = "",
+        tags: str = "",
+    ) -> dict[str, Any]:
+        """Create a support ticket and persist it as a JSON file.
+
+        Tickets are stored in ``<working_dir>/rio_tickets/`` with UUID-based
+        filenames so they survive across sessions and can be queried later.
+        """
+        ticket_dir = Path(self._cwd) / "rio_tickets"
+        ticket_dir.mkdir(parents=True, exist_ok=True)
+
+        ticket_id = str(uuid.uuid4())[:8].upper()
+        now = datetime.now(timezone.utc).isoformat()
+
+        ticket = {
+            "id": f"RIO-{ticket_id}",
+            "title": title,
+            "category": category,
+            "priority": priority,
+            "description": description,
+            "customer_id": customer_id or "anonymous",
+            "tags": [t.strip() for t in tags.split(",") if t.strip()] if tags else [],
+            "status": "open",
+            "created_at": now,
+            "updated_at": now,
+            "history": [{"action": "created", "timestamp": now}],
+        }
+
+        ticket_path = ticket_dir / f"{ticket['id']}.json"
+        ticket_path.write_text(json.dumps(ticket, indent=2), encoding="utf-8")
+
+        log.info(
+            "tool.create_ticket",
+            ticket_id=ticket["id"],
+            category=category,
+            priority=priority,
+        )
+        return {
+            "success": True,
+            "ticket_id": ticket["id"],
+            "path": str(ticket_path),
+            "message": f"Ticket {ticket['id']} created — {title}",
+        }
+
+    # ------------------------------------------------------------------
+    # generate_quiz  (Tutor skill)
+    # ------------------------------------------------------------------
+
+    async def _generate_quiz(
+        self,
+        topic: str,
+        difficulty: str = "intermediate",
+        num_questions: int = 5,
+        question_types: str = "multiple_choice,short_answer",
+        focus_areas: str = "",
+    ) -> dict[str, Any]:
+        """Build a prompt for Gemini to generate a quiz on any topic.
+
+        No hardcoded question banks — the LLM handles all subjects:
+        math, science, history, literature, languages, law, medicine,
+        programming, music, philosophy, or anything else.
+        """
+        types_readable = question_types.replace("_", " ").replace(",", ", ")
+        focus_clause = f" Focus specifically on: {focus_areas}." if focus_areas else ""
+
+        prompt = (
+            f"Generate exactly {num_questions} quiz questions about '{topic}' "
+            f"at {difficulty} level.{focus_clause}\n"
+            f"Question types to use: {types_readable}.\n\n"
+            f"Rules:\n"
+            f"- Each question must test genuine understanding, not just memorisation.\n"
+            f"- For multiple-choice: provide 4 options (A-D), mark the correct one.\n"
+            f"- For short-answer / problem-solving: give the expected answer clearly.\n"
+            f"- For true-false: state why the false option is wrong.\n"
+            f"- Include a one-line hint per question (don't give the answer away).\n"
+            f"- Include a one-line explanation after the answer.\n"
+            f"- Difficulty guide: "
+            f"beginner=recall, novice=basic application, "
+            f"intermediate=analysis, advanced=synthesis/edge-cases.\n\n"
+            f"Format each question as:\n"
+            f"Q<n>. [question text]\n"
+            f"Options: A) ... B) ... C) ... D) ...  (omit for non-MC)\n"
+            f"Answer: [correct answer]\n"
+            f"Hint: [hint]\n"
+            f"Explanation: [why this is the answer]\n"
+        )
+
+        log.info("tool.generate_quiz", topic=topic, difficulty=difficulty, n=num_questions)
+        return {
+            "success": True,
+            "source": "llm",
+            "prompt": prompt,
+            "meta": {
+                "topic": topic,
+                "difficulty": difficulty,
+                "num_questions": num_questions,
+                "question_types": question_types,
+                "focus_areas": focus_areas,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # track_progress  (Tutor skill)
+    # ------------------------------------------------------------------
+
+    async def _track_progress(
+        self,
+        action: str,
+        subject: str = "",
+        topic: str = "",
+        score: float = 0.0,
+        notes: str = "",
+        student_id: str = "default",
+    ) -> dict[str, Any]:
+        """Track student learning progress.
+
+        Supported actions:
+          - ``record``  — Add a new progress entry (quiz score, topic mastery, etc.)
+          - ``query``   — Retrieve recent progress for a subject/topic
+          - ``summary`` — Get an overall learning summary
+        """
+        progress_dir = Path(self._cwd) / "rio_progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+
+        progress_file = progress_dir / f"{student_id}.json"
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Load existing progress
+        if progress_file.exists():
+            data = json.loads(progress_file.read_text(encoding="utf-8"))
+        else:
+            data = {"student_id": student_id, "entries": [], "created_at": now}
+
+        if action == "record":
+            entry = {
+                "subject": subject,
+                "topic": topic,
+                "score": score,
+                "notes": notes,
+                "timestamp": now,
+            }
+            data["entries"].append(entry)
+            data["updated_at"] = now
+            progress_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            log.info("tool.track_progress.record", student=student_id, subject=subject, topic=topic)
+            return {
+                "success": True,
+                "action": "record",
+                "entry": entry,
+                "total_entries": len(data["entries"]),
+            }
+
+        elif action == "query":
+            # Filter entries by subject/topic
+            filtered = data["entries"]
+            if subject:
+                filtered = [e for e in filtered if e.get("subject", "").lower() == subject.lower()]
+            if topic:
+                filtered = [e for e in filtered if topic.lower() in e.get("topic", "").lower()]
+            # Return last 10 entries
+            recent = filtered[-10:]
+            avg_score = sum(e.get("score", 0) for e in recent) / max(len(recent), 1)
+            log.info("tool.track_progress.query", student=student_id, results=len(recent))
+            return {
+                "success": True,
+                "action": "query",
+                "entries": recent,
+                "count": len(recent),
+                "average_score": round(avg_score, 2),
+            }
+
+        elif action == "summary":
+            entries = data["entries"]
+            if not entries:
+                return {"success": True, "action": "summary", "message": "No progress data yet."}
+
+            # Build per-subject summary
+            subjects: dict[str, list[float]] = {}
+            for e in entries:
+                subj = e.get("subject", "unknown")
+                subjects.setdefault(subj, []).append(e.get("score", 0))
+
+            summary = {}
+            for subj, scores in subjects.items():
+                summary[subj] = {
+                    "sessions": len(scores),
+                    "average_score": round(sum(scores) / len(scores), 2),
+                    "latest_score": scores[-1],
+                    "trend": "improving" if len(scores) >= 2 and scores[-1] > scores[-2] else "stable",
+                }
+
+            log.info("tool.track_progress.summary", student=student_id, subjects=list(summary.keys()))
+            return {
+                "success": True,
+                "action": "summary",
+                "subjects": summary,
+                "total_sessions": len(entries),
+            }
+
+        else:
+            return {"success": False, "error": f"Unknown action: {action}. Use record/query/summary."}
+
+    # ------------------------------------------------------------------
+    # explain_concept  (Tutor skill)
+    # ------------------------------------------------------------------
+
+    async def _explain_concept(
+        self,
+        concept: str,
+        level: str = "intermediate",
+        context: str = "",
+    ) -> dict[str, Any]:
+        """Return a structured explanation scaffold for a concept.
+
+        This doesn't generate the full explanation itself — it returns a
+        structured template that guides Gemini to produce a well-organized,
+        level-appropriate explanation using the Socratic method.
+        """
+        level_guidance = {
+            "beginner": {
+                "vocabulary": "everyday language, no jargon",
+                "analogies": True,
+                "depth": "surface-level intuition, concrete examples",
+                "prereqs": "assume no prior knowledge",
+            },
+            "novice": {
+                "vocabulary": "simple terms, define any jargon",
+                "analogies": True,
+                "depth": "basic understanding with 1-2 examples",
+                "prereqs": "assume minimal background",
+            },
+            "intermediate": {
+                "vocabulary": "standard technical terms OK",
+                "analogies": True,
+                "depth": "conceptual + procedural, why + how",
+                "prereqs": "assume foundational knowledge",
+            },
+            "advanced": {
+                "vocabulary": "full technical vocabulary",
+                "analogies": False,
+                "depth": "theory, edge cases, connections to other concepts",
+                "prereqs": "assume strong background",
+            },
+        }
+
+        guidance = level_guidance.get(level, level_guidance["intermediate"])
+
+        log.info("tool.explain_concept", concept=concept, level=level)
+        return {
+            "success": True,
+            "concept": concept,
+            "level": level,
+            "guidance": guidance,
+            "structure": [
+                f"1. Hook: Ask a thought-provoking question about '{concept}'",
+                f"2. Connect: Link to something the student already knows",
+                f"3. Build: Explain the core idea ({guidance['depth']})",
+                "4. Example: Walk through a concrete example together",
+                "5. Check: Ask the student to explain it back in their own words",
+                "6. Extend: Pose a 'what if' question to deepen understanding",
+            ],
+            "context": context,
+            "anti_patterns": [
+                "Don't lecture — ask questions that lead to discovery",
+                "Don't give the answer — guide toward it",
+                "Don't overwhelm — one concept at a time",
+                "Don't use 'it's easy' or 'obviously' — these shame learners",
+            ],
+        }

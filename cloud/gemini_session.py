@@ -42,7 +42,20 @@ RIO_SYSTEM_INSTRUCTION = (
     "'check my screen' — call the capture_screen tool to take a screenshot. "
     "The screenshot will be sent to your vision context. If the user has "
     "enabled autonomous mode, you will receive periodic screen frames "
-    "automatically and do NOT need to call capture_screen."
+    "automatically and do NOT need to call capture_screen.\n\n"
+    "CUSTOMER CARE MODE: When the user is handling customer support, you can "
+    "create and track support tickets using create_ticket. Follow the HEAR "
+    "framework: Hear (listen fully), Empathize (validate), Act (resolve), "
+    "Resolve (confirm). Use empathetic language. Never blame the customer. "
+    "Detect frustration through voice/text signals and escalate when needed. "
+    "Reference past interactions via memory.\n\n"
+    "TUTOR MODE: When helping a student learn, use the Socratic method — "
+    "guide with questions instead of giving direct answers. Use generate_quiz "
+    "to create practice problems, track_progress to monitor learning, and "
+    "explain_concept for structured explanations. Assess the student's level "
+    "(novice/intermediate/advanced) and adapt accordingly. Never do homework "
+    "for the student — help them understand so they can do it themselves. "
+    "Celebrate progress and use growth mindset language."
 )
 
 # Model identifiers — defaults; can be overridden via constructor args
@@ -155,6 +168,147 @@ RIO_TOOL_DECLARATIONS = [
                     "type": "OBJECT",
                     "properties": {},
                     "required": [],
+                },
+            ),
+            # --- Customer Care Tools ---
+            types.FunctionDeclaration(
+                name="create_ticket",
+                description=(
+                    "Create a customer support ticket to track an issue. "
+                    "Use when a customer reports a problem, requests help, or "
+                    "needs follow-up. The ticket is saved locally for tracking."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {
+                            "type": "STRING",
+                            "description": "Brief ticket title summarizing the issue",
+                        },
+                        "category": {
+                            "type": "STRING",
+                            "description": "Issue category: bug, feature, how-to, billing, or account",
+                        },
+                        "priority": {
+                            "type": "STRING",
+                            "description": "Priority level: low, medium, high, or critical",
+                        },
+                        "description": {
+                            "type": "STRING",
+                            "description": "Full description with context, steps to reproduce, and current state",
+                        },
+                        "customer_id": {
+                            "type": "STRING",
+                            "description": "Optional customer identifier for tracking",
+                        },
+                        "tags": {
+                            "type": "STRING",
+                            "description": "Comma-separated tags for categorization",
+                        },
+                    },
+                    "required": ["title", "category", "priority", "description"],
+                },
+            ),
+            # --- Tutor Tools ---
+            types.FunctionDeclaration(
+                name="generate_quiz",
+                description=(
+                    "Generate a quiz or practice problems for a student on a "
+                    "specific topic. Supports math, programming, and science. "
+                    "Use when a student needs practice, wants to test their "
+                    "understanding, or after explaining a concept to reinforce "
+                    "learning."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "topic": {
+                            "type": "STRING",
+                            "description": "The subject topic (e.g., 'quadratic equations', 'python loops', 'cell biology')",
+                        },
+                        "difficulty": {
+                            "type": "STRING",
+                            "description": "Difficulty level: novice, intermediate, or advanced",
+                        },
+                        "num_questions": {
+                            "type": "INTEGER",
+                            "description": "Number of questions to generate (default: 5)",
+                        },
+                        "question_types": {
+                            "type": "STRING",
+                            "description": "Comma-separated types: multiple-choice, short-answer, problem-solving, true-false",
+                        },
+                        "focus_areas": {
+                            "type": "STRING",
+                            "description": "Comma-separated subtopics to focus on (from student's weak areas)",
+                        },
+                    },
+                    "required": ["topic"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="track_progress",
+                description=(
+                    "Track or retrieve a student's learning progress. Use to "
+                    "record quiz scores, note mastered/struggling topics, "
+                    "generate progress reports, or update study plans."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "action": {
+                            "type": "STRING",
+                            "description": "Action: record (save progress), report (generate report), update (modify plan), or status (current state)",
+                        },
+                        "subject": {
+                            "type": "STRING",
+                            "description": "Subject area (e.g., 'math', 'programming', 'science')",
+                        },
+                        "topic": {
+                            "type": "STRING",
+                            "description": "Specific topic within the subject",
+                        },
+                        "score": {
+                            "type": "STRING",
+                            "description": "Quiz score or performance metric (e.g., '4/5', '80%')",
+                        },
+                        "notes": {
+                            "type": "STRING",
+                            "description": "Additional context (struggles, breakthroughs, patterns noticed)",
+                        },
+                        "student_id": {
+                            "type": "STRING",
+                            "description": "Optional student identifier for multi-student tracking",
+                        },
+                    },
+                    "required": ["action", "subject"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="explain_concept",
+                description=(
+                    "Retrieve a structured explanation of a concept at the "
+                    "student's level. Includes analogies, examples, and "
+                    "practice suggestions. Use when a student asks 'what is' "
+                    "or 'explain' or when they're struggling with fundamentals."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "concept": {
+                            "type": "STRING",
+                            "description": "The concept to explain (e.g., 'recursion', 'photosynthesis', 'derivatives')",
+                        },
+                        "level": {
+                            "type": "STRING",
+                            "description": "Student level: novice, intermediate, or advanced",
+                        },
+                        "context": {
+                            "type": "STRING",
+                            "description": "What the student is working on that prompted this explanation",
+                        },
+                    },
+                    "required": ["concept"],
                 },
             ),
         ]
