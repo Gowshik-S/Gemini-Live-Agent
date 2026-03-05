@@ -24,7 +24,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Rio system instruction
 # ---------------------------------------------------------------------------
-RIO_SYSTEM_INSTRUCTION = (
+RIO_BASE_INSTRUCTION = (
     "You are Rio, a proactive AI pair programmer. You are a LIVE AGENT — "
     "you see the developer's screen in real-time, hear their voice, and can "
     "execute code changes. Your key differentiator: you detect when the "
@@ -42,21 +42,72 @@ RIO_SYSTEM_INSTRUCTION = (
     "'check my screen' — call the capture_screen tool to take a screenshot. "
     "The screenshot will be sent to your vision context. If the user has "
     "enabled autonomous mode, you will receive periodic screen frames "
-    "automatically and do NOT need to call capture_screen.\n\n"
-    "CUSTOMER CARE MODE: When the user is handling customer support, you can "
-    "create and track support tickets using create_ticket. Follow the HEAR "
-    "framework: Hear (listen fully), Empathize (validate), Act (resolve), "
-    "Resolve (confirm). Use empathetic language. Never blame the customer. "
-    "Detect frustration through voice/text signals and escalate when needed. "
-    "Reference past interactions via memory.\n\n"
-    "TUTOR MODE: When helping a student learn, use the Socratic method — "
-    "guide with questions instead of giving direct answers. Use generate_quiz "
-    "to create practice problems, track_progress to monitor learning, and "
-    "explain_concept for structured explanations. Assess the student's level "
-    "(novice/intermediate/advanced) and adapt accordingly. Never do homework "
-    "for the student — help them understand so they can do it themselves. "
-    "Celebrate progress and use growth mindset language."
+    "automatically and do NOT need to call capture_screen."
 )
+
+
+def build_system_instruction() -> str:
+    """Build the full system instruction from base + loaded profiles.
+
+    Deterministic: same profile files = same instruction every time.
+    Loads profiles from rio_profiles/ directory (adjacent to rio/ project root).
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    parts = [RIO_BASE_INSTRUCTION]
+
+    # Attempt to load profiles — gracefully degrade if profiles module not available
+    try:
+        _local_dir = str(_Path(__file__).resolve().parent.parent / "local")
+        if _local_dir not in sys.path:
+            sys.path.insert(0, _local_dir)
+        from profiles import (
+            build_customer_care_instruction,
+            build_tutor_instruction,
+            load_customer_care_profile,
+            load_tutor_profile,
+        )
+
+        _profiles_base = str(_Path(__file__).resolve().parent.parent / "rio_profiles")
+
+        cc_profile = load_customer_care_profile(_profiles_base)
+        if cc_profile.enabled and cc_profile.business.business_name:
+            parts.append("")
+            parts.append(build_customer_care_instruction(cc_profile))
+
+        tutor_profile = load_tutor_profile(_profiles_base)
+        if tutor_profile.enabled and tutor_profile.student.student_name:
+            parts.append("")
+            parts.append(build_tutor_instruction(tutor_profile))
+
+    except ImportError:
+        # profiles.py not available — use fallback generic instructions
+        parts.append(
+            "\n\nCUSTOMER CARE MODE: When the user is handling customer support, you can "
+            "create and track support tickets using create_ticket and update_ticket. Follow the HEAR "
+            "framework: Hear (listen fully), Empathize (validate), Act (resolve), "
+            "Resolve (confirm). Use empathetic language. Never blame the customer. "
+            "Detect frustration through voice/text signals and escalate when needed. "
+            "Reference past interactions via memory."
+        )
+        parts.append(
+            "\n\nTUTOR MODE: When helping a student learn, use the Socratic method — "
+            "guide with questions instead of giving direct answers. Use generate_quiz "
+            "to create practice problems, track_progress to monitor learning, and "
+            "explain_concept for structured explanations. Assess the student's level "
+            "(novice/intermediate/advanced) and adapt accordingly. Never do homework "
+            "for the student — help them understand so they can do it themselves. "
+            "Celebrate progress and use growth mindset language."
+        )
+
+    return "\n".join(parts)
+
+
+# Module-level fallback — safe constant, no filesystem access at import time.
+# The real instruction is built fresh per-session inside GeminiSession.connect()
+# by calling build_system_instruction() which loads profile files.
+RIO_SYSTEM_INSTRUCTION = RIO_BASE_INSTRUCTION
 
 # Model identifiers — defaults; can be overridden via constructor args
 DEFAULT_TEXT_MODEL = "gemini-2.5-flash"  # Standard API for L0 text mode
@@ -209,6 +260,40 @@ RIO_TOOL_DECLARATIONS = [
                     "required": ["title", "category", "priority", "description"],
                 },
             ),
+            types.FunctionDeclaration(
+                name="update_ticket",
+                description=(
+                    "Update an existing support ticket: change status, priority, "
+                    "escalation tier, or add notes. Use to escalate issues, close "
+                    "resolved tickets, or log follow-up actions."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "ticket_id": {
+                            "type": "STRING",
+                            "description": "The ticket ID to update (e.g., 'TKT-abc123')",
+                        },
+                        "status": {
+                            "type": "STRING",
+                            "description": "New status: open, in-progress, escalated, resolved, closed",
+                        },
+                        "priority": {
+                            "type": "STRING",
+                            "description": "New priority: low, medium, high, critical",
+                        },
+                        "escalation_tier": {
+                            "type": "STRING",
+                            "description": "Escalation tier: tier_0, tier_1, tier_2, tier_3",
+                        },
+                        "notes": {
+                            "type": "STRING",
+                            "description": "Notes about the update (reason for escalation, resolution details, etc.)",
+                        },
+                    },
+                    "required": ["ticket_id"],
+                },
+            ),
             # --- Tutor Tools ---
             types.FunctionDeclaration(
                 name="generate_quiz",
@@ -352,6 +437,8 @@ class GeminiSession:
         self._live_session = None  # Live API session object
         self._live_ctx = None      # Async context manager for Live session
         self._live_connect_error: str | None = None  # Error detail when Live API fails
+        # System instruction — rebuilt fresh per session from profiles
+        self._system_instruction: str = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -369,6 +456,13 @@ class GeminiSession:
             self._client = genai.Client(api_key=self._api_key)
             self._history = []
             self._pending_image = None
+
+            # Build system instruction fresh from current profile files
+            self._system_instruction = build_system_instruction()
+            self._log.info(
+                "gemini.connect.instruction_built",
+                length=len(self._system_instruction),
+            )
 
             if self._mode == "live":
                 try:
@@ -549,7 +643,7 @@ class GeminiSession:
                     model=self._text_model,
                     contents=self._history,
                     config=types.GenerateContentConfig(
-                        system_instruction=RIO_SYSTEM_INSTRUCTION,
+                        system_instruction=self._system_instruction or RIO_SYSTEM_INSTRUCTION,
                         tools=tool_config,
                         temperature=0.7,
                         max_output_tokens=2048,
@@ -668,7 +762,7 @@ class GeminiSession:
                 )
             ),
             system_instruction=types.Content(
-                parts=[types.Part(text=RIO_SYSTEM_INSTRUCTION)]
+                parts=[types.Part(text=self._system_instruction or RIO_SYSTEM_INSTRUCTION)]
             ),
             tools=RIO_TOOL_DECLARATIONS if self._tools_enabled else None,
         )
@@ -748,6 +842,13 @@ class GeminiSession:
                         # Reset error counter on successful receive
                         consecutive_errors = 0
 
+                        # Track whether we yielded anything from this
+                        # response so we don't double-emit via the
+                        # shorthand property accessors (response.data /
+                        # response.text are aliases for server_content
+                        # fields in the Gemini SDK).
+                        _yielded = False
+
                         # -- Server content (model turn / turn complete) --
                         server_content = getattr(response, "server_content", None)
                         if server_content is not None:
@@ -765,11 +866,13 @@ class GeminiSession:
                                         raw = getattr(inline, "data", None)
                                         if raw:
                                             yield {"type": "audio", "data": raw}
+                                            _yielded = True
 
                                     # Text data
                                     txt = getattr(part, "text", None)
                                     if txt:
                                         yield {"type": "text", "text": txt}
+                                        _yielded = True
 
                                     # Function call within model turn
                                     fc = getattr(part, "function_call", None)
@@ -779,17 +882,24 @@ class GeminiSession:
                                             "name": fc.name,
                                             "args": dict(fc.args) if fc.args else {},
                                         }
+                                        _yielded = True
 
-                            continue  # already processed server_content
+                            if _yielded:
+                                continue  # already processed server_content
 
                         # -- Shorthand: response.data / response.text ------
-                        raw_data = getattr(response, "data", None)
-                        if raw_data and isinstance(raw_data, (bytes, bytearray)):
-                            yield {"type": "audio", "data": bytes(raw_data)}
+                        # Only use these if server_content didn't yield
+                        # anything, to avoid duplicate audio/text.
+                        if not _yielded:
+                            raw_data = getattr(response, "data", None)
+                            if raw_data and isinstance(raw_data, (bytes, bytearray)):
+                                yield {"type": "audio", "data": bytes(raw_data)}
+                                _yielded = True
 
-                        raw_text = getattr(response, "text", None)
-                        if raw_text and isinstance(raw_text, str):
-                            yield {"type": "text", "text": raw_text}
+                            raw_text = getattr(response, "text", None)
+                            if raw_text and isinstance(raw_text, str):
+                                yield {"type": "text", "text": raw_text}
+                                _yielded = True
 
                         # -- Tool call at response level -------------------
                         tool_call = getattr(response, "tool_call", None)

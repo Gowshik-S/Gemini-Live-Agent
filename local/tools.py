@@ -107,6 +107,7 @@ class ToolExecutor:
             "patch_file": self._patch_file,
             "run_command": self._run_command,
             "create_ticket": self._create_ticket,
+            "update_ticket": self._update_ticket,
             "generate_quiz": self._generate_quiz,
             "track_progress": self._track_progress,
             "explain_concept": self._explain_concept,
@@ -359,6 +360,111 @@ class ToolExecutor:
             "ticket_id": ticket["id"],
             "path": str(ticket_path),
             "message": f"Ticket {ticket['id']} created — {title}",
+        }
+
+    # ------------------------------------------------------------------
+    # update_ticket  (Customer Care skill — escalation + status changes)
+    # ------------------------------------------------------------------
+
+    async def _update_ticket(
+        self,
+        ticket_id: str,
+        status: str = "",
+        priority: str = "",
+        escalation_tier: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """Update an existing ticket: status, priority, escalation tier, or notes.
+
+        Supports the escalation workflow:
+          tier_0 → tier_1 → tier_2 → tier_3
+        Each update appends to the ticket's history log for auditability.
+        """
+        ticket_dir = Path(self._cwd) / "rio_tickets"
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Normalize ticket_id (accept with or without prefix)
+        tid = ticket_id.upper()
+        if not tid.startswith("RIO-"):
+            tid = f"RIO-{tid}"
+
+        # Find the ticket file
+        ticket_path = ticket_dir / f"{tid}.json"
+        if not ticket_path.exists():
+            # Try glob search in case of format mismatch
+            candidates = list(ticket_dir.glob(f"*{ticket_id.upper()}*"))
+            if candidates:
+                ticket_path = candidates[0]
+            else:
+                return {
+                    "success": False,
+                    "error": f"Ticket not found: {ticket_id}. Check the ticket ID.",
+                }
+
+        # Load ticket
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+
+        # Apply updates
+        changes: list[str] = []
+
+        valid_statuses = {"open", "in-progress", "escalated", "resolved", "closed"}
+        if status and status.lower() in valid_statuses:
+            old = ticket.get("status", "unknown")
+            ticket["status"] = status.lower()
+            changes.append(f"status: {old} → {status.lower()}")
+
+        valid_priorities = {"low", "medium", "high", "critical"}
+        if priority and priority.lower() in valid_priorities:
+            old = ticket.get("priority", "unknown")
+            ticket["priority"] = priority.lower()
+            changes.append(f"priority: {old} → {priority.lower()}")
+
+        valid_tiers = {"tier_0", "tier_1", "tier_2", "tier_3"}
+        if escalation_tier and escalation_tier.lower() in valid_tiers:
+            old = ticket.get("escalation_tier", "none")
+            ticket["escalation_tier"] = escalation_tier.lower()
+            # Auto-set status to escalated if moving to tier_2+
+            if escalation_tier.lower() in ("tier_2", "tier_3"):
+                ticket["status"] = "escalated"
+            changes.append(f"escalation: {old} → {escalation_tier.lower()}")
+
+        if notes:
+            ticket.setdefault("notes_log", []).append({
+                "timestamp": now,
+                "note": notes,
+            })
+            changes.append("notes added")
+
+        if not changes:
+            return {
+                "success": False,
+                "error": "No valid updates provided. Specify status, priority, escalation_tier, or notes.",
+            }
+
+        # Append to history
+        ticket["updated_at"] = now
+        ticket.setdefault("history", []).append({
+            "action": "updated",
+            "changes": changes,
+            "timestamp": now,
+        })
+
+        # Save
+        ticket_path.write_text(json.dumps(ticket, indent=2), encoding="utf-8")
+
+        log.info(
+            "tool.update_ticket",
+            ticket_id=ticket["id"],
+            changes=changes,
+        )
+        return {
+            "success": True,
+            "ticket_id": ticket["id"],
+            "changes": changes,
+            "current_status": ticket.get("status"),
+            "current_priority": ticket.get("priority"),
+            "escalation_tier": ticket.get("escalation_tier", "none"),
+            "message": f"Ticket {ticket['id']} updated: {', '.join(changes)}",
         }
 
     # ------------------------------------------------------------------

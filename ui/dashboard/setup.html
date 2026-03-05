@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rio — Setup</title>
+
+  <!-- IBM Plex Sans + Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/setup.css">
+</head>
+<body>
+
+  <!-- ================================================================== -->
+  <!-- TOP BAR                                                            -->
+  <!-- ================================================================== -->
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__logo" viewBox="0 0 32 32" width="28" height="28" fill="none">
+        <rect x="2" y="2" width="28" height="28" rx="6" stroke="currentColor" stroke-width="2"/>
+        <path d="M10 22V10h5a4 4 0 010 8h-5m5-8l5 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="topbar__title">Rio</span>
+      <span class="topbar__subtitle">Setup</span>
+    </div>
+
+    <div class="topbar__status">
+      <a href="index.html" class="status-pill status-pill--muted">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M6 3l-4 5 4 5M10 3l4 5-4 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Dashboard</span>
+      </a>
+    </div>
+  </header>
+
+  <!-- ================================================================== -->
+  <!-- SETUP  CONTENT                                                     -->
+  <!-- ================================================================== -->
+  <main class="setup">
+
+    <!-- Tab bar -->
+    <nav class="setup__tabs">
+      <button class="tab-btn tab-btn--active" data-tab="customer-care">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M8 1a5 5 0 015 5c0 4-5 9-5 9S3 10 3 6a5 5 0 015-5z" stroke="currentColor" stroke-width="1.5"/>
+          <circle cx="8" cy="6" r="1.5" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        Customer Care
+      </button>
+      <button class="tab-btn" data-tab="tutor">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M2 6l6-4 6 4-6 4-6-4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          <path d="M2 10l6 4 6-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Tutor
+      </button>
+    </nav>
+
+    <!-- ============================================================== -->
+    <!-- CUSTOMER CARE TAB                                              -->
+    <!-- ============================================================== -->
+    <section class="tab-content tab-content--active" id="tab-customer-care">
+      <form id="form-customer-care" autocomplete="off">
+
+        <!-- Toast -->
+        <div class="toast" id="toast-cc" style="display:none">
+          <span class="toast__icon">✓</span>
+          <span class="toast__msg">Profile saved</span>
+        </div>
+
+        <!-- ---- Enable toggle ---- -->
+        <div class="form-row form-row--toggle">
+          <label class="toggle">
+            <input type="checkbox" id="cc-enabled" checked>
+            <span class="toggle__track"></span>
+          </label>
+          <span class="form-label">Enable Customer Care Skill</span>
+        </div>
+
+        <!-- ---- Section: Business Identity ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Business Identity</legend>
+
+          <div class="form-group">
+            <label for="cc-business-name">Business Name <span class="req">*</span></label>
+            <input type="text" id="cc-business-name" placeholder="e.g., Acme Corp" required>
+          </div>
+
+          <div class="form-group">
+            <label for="cc-tagline">Tagline</label>
+            <input type="text" id="cc-tagline" placeholder="e.g., Making widgets since 1999">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cc-industry">Industry</label>
+              <select id="cc-industry">
+                <option value="">Select...</option>
+                <option value="e-commerce">E-Commerce</option>
+                <option value="saas">SaaS</option>
+                <option value="healthcare">Healthcare</option>
+                <option value="education">Education</option>
+                <option value="finance">Finance</option>
+                <option value="retail">Retail</option>
+                <option value="food">Food & Beverage</option>
+                <option value="travel">Travel & Hospitality</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="cc-website">Website</label>
+              <input type="url" id="cc-website" placeholder="https://...">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Products & Services ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Products & Services</legend>
+          <p class="form-hint">One per line. The agent will ONLY answer about these.</p>
+          <div class="form-group">
+            <textarea id="cc-products" rows="4" placeholder="Premium Plan - $29/mo&#10;Basic Plan - $9/mo&#10;Enterprise - custom pricing"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Policies ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Policies</legend>
+
+          <div class="form-group">
+            <label for="cc-return-policy">Return Policy</label>
+            <textarea id="cc-return-policy" rows="2" placeholder="30-day return for unused items"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="cc-refund-policy">Refund Policy</label>
+            <textarea id="cc-refund-policy" rows="2" placeholder="Full refund within 14 days"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="cc-shipping-policy">Shipping Policy</label>
+            <textarea id="cc-shipping-policy" rows="2" placeholder="Free shipping on orders over $50"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="cc-warranty-policy">Warranty Policy</label>
+            <textarea id="cc-warranty-policy" rows="2" placeholder="1-year warranty on all products"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Support ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Support Details</legend>
+
+          <div class="form-group">
+            <label for="cc-hours">Business Hours</label>
+            <input type="text" id="cc-hours" placeholder="Mon-Fri 9AM-6PM EST">
+          </div>
+
+          <div class="form-group">
+            <label for="cc-channels">Support Channels</label>
+            <p class="form-hint">One per line</p>
+            <textarea id="cc-channels" rows="3" placeholder="email: support@acme.com&#10;phone: 1-800-ACME&#10;live chat on website"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Escalation ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Escalation</legend>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cc-escalation-email">Escalation Email</label>
+              <input type="email" id="cc-escalation-email" placeholder="escalations@acme.com">
+            </div>
+            <div class="form-group">
+              <label for="cc-escalation-phone">Escalation Phone</label>
+              <input type="tel" id="cc-escalation-phone" placeholder="+1-555-0100">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="cc-sla">SLA Response Time</label>
+            <input type="text" id="cc-sla" placeholder="24 hours for standard, 4 hours for critical">
+          </div>
+
+          <!-- Tier rules (pre-filled, editable) -->
+          <div class="form-group">
+            <label>Escalation Tier Rules</label>
+            <p class="form-hint">Define what happens at each tier</p>
+          </div>
+          <div class="tier-grid">
+            <div class="tier-card">
+              <span class="tier-card__label">Tier 0 — Self-serve</span>
+              <input type="text" id="cc-tier-0" value="Point to FAQ or docs. No ticket needed.">
+            </div>
+            <div class="tier-card">
+              <span class="tier-card__label">Tier 1 — Agent</span>
+              <input type="text" id="cc-tier-1" value="Create ticket, resolve within SLA.">
+            </div>
+            <div class="tier-card">
+              <span class="tier-card__label">Tier 2 — Specialist</span>
+              <input type="text" id="cc-tier-2" value="Escalate if unresolved after 2 attempts or customer requests.">
+            </div>
+            <div class="tier-card">
+              <span class="tier-card__label">Tier 3 — Engineering</span>
+              <input type="text" id="cc-tier-3" value="Escalate if bug confirmed or system outage.">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: FAQ ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">FAQ</legend>
+          <p class="form-hint">Add common questions and answers the agent should know.</p>
+          <div id="faq-list">
+            <!-- JS will populate -->
+          </div>
+          <button type="button" class="btn btn--ghost" id="btn-add-faq">+ Add FAQ</button>
+        </fieldset>
+
+        <!-- ---- Section: Tone & Greeting ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Tone & Greeting</legend>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cc-tone">Tone</label>
+              <select id="cc-tone">
+                <option value="professional and friendly">Professional & Friendly</option>
+                <option value="casual">Casual</option>
+                <option value="formal">Formal</option>
+                <option value="empathetic">Empathetic</option>
+                <option value="enthusiastic">Enthusiastic</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="cc-language">Language</label>
+              <input type="text" id="cc-language" value="English">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="cc-greeting">Custom Greeting</label>
+            <input type="text" id="cc-greeting" placeholder="Welcome to Acme! How can I help you today?">
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Boundaries ---- -->
+        <fieldset class="form-section form-section--danger">
+          <legend class="form-section__title">Boundaries (Scope Limits)</legend>
+          <p class="form-hint">The agent will REFUSE to answer about these topics.</p>
+
+          <div class="form-group">
+            <label for="cc-out-of-scope">Off-Limits Topics</label>
+            <p class="form-hint">One per line — e.g., legal advice, competitor comparisons</p>
+            <textarea id="cc-out-of-scope" rows="3" placeholder="legal advice&#10;medical advice&#10;competitor comparisons"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="cc-redirect">Redirect Message</label>
+            <p class="form-hint">Shown when someone asks an out-of-scope question</p>
+            <textarea id="cc-redirect" rows="2" placeholder="I can only help with questions about our products and services."></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Save ---- -->
+        <div class="form-actions">
+          <button type="button" class="btn btn--ghost" id="btn-reset-cc">Reset to Defaults</button>
+          <button type="submit" class="btn btn--primary" id="btn-save-cc">
+            <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+              <path d="M12 3H4a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V6l-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M10 3v3H6V3" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            Save Profile
+          </button>
+        </div>
+
+      </form>
+    </section>
+
+    <!-- ============================================================== -->
+    <!-- TUTOR TAB                                                      -->
+    <!-- ============================================================== -->
+    <section class="tab-content" id="tab-tutor">
+      <form id="form-tutor" autocomplete="off">
+
+        <!-- Toast -->
+        <div class="toast" id="toast-tutor" style="display:none">
+          <span class="toast__icon">✓</span>
+          <span class="toast__msg">Profile saved</span>
+        </div>
+
+        <!-- ---- Enable toggle ---- -->
+        <div class="form-row form-row--toggle">
+          <label class="toggle">
+            <input type="checkbox" id="tutor-enabled" checked>
+            <span class="toggle__track"></span>
+          </label>
+          <span class="form-label">Enable Tutor Skill</span>
+        </div>
+
+        <!-- ---- Section: Student Identity ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Student Identity</legend>
+
+          <div class="form-group">
+            <label for="tutor-name">Student Name</label>
+            <input type="text" id="tutor-name" placeholder="e.g., Alex">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="tutor-grade">Grade / Level</label>
+              <input type="text" id="tutor-grade" placeholder="e.g., 10th grade, college freshman">
+            </div>
+            <div class="form-group">
+              <label for="tutor-age">Age Group</label>
+              <select id="tutor-age">
+                <option value="">Select...</option>
+                <option value="under-13">Under 13</option>
+                <option value="13-15">13–15</option>
+                <option value="16-18">16–18</option>
+                <option value="18-22">18–22 (College)</option>
+                <option value="adult">Adult Learner</option>
+              </select>
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Learning Context ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Learning Context</legend>
+
+          <div class="form-group">
+            <label for="tutor-subjects">Subjects</label>
+            <p class="form-hint">One per line — can be anything</p>
+            <textarea id="tutor-subjects" rows="3" placeholder="algebra&#10;python programming&#10;essay writing&#10;world history"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="tutor-courses">Current Courses</label>
+            <p class="form-hint">One per line — optional</p>
+            <textarea id="tutor-courses" rows="2" placeholder="AP Calculus BC&#10;CS50 Introduction to Computer Science"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="tutor-goals">Learning Goals</label>
+            <p class="form-hint">One per line</p>
+            <textarea id="tutor-goals" rows="3" placeholder="Pass AP Calculus exam&#10;Build a web app by semester end"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Strengths & Weaknesses ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Strengths & Weaknesses</legend>
+
+          <div class="form-group">
+            <label for="tutor-strengths">Known Strengths</label>
+            <textarea id="tutor-strengths" rows="2" placeholder="good at geometry&#10;strong reading comprehension"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="tutor-weaknesses">Known Weaknesses</label>
+            <p class="form-hint">The tutor will focus extra help on these</p>
+            <textarea id="tutor-weaknesses" rows="2" placeholder="struggles with fractions&#10;forgets to show work"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Preferences ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Preferences</legend>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="tutor-style">Learning Style</label>
+              <select id="tutor-style">
+                <option value="visual">Visual</option>
+                <option value="auditory">Auditory</option>
+                <option value="kinesthetic">Kinesthetic (Hands-on)</option>
+                <option value="reading/writing">Reading/Writing</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="tutor-difficulty">Difficulty Level</label>
+              <select id="tutor-difficulty">
+                <option value="beginner">Beginner</option>
+                <option value="novice">Novice</option>
+                <option value="intermediate" selected>Intermediate</option>
+                <option value="advanced">Advanced</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="tutor-homework-mode">Homework Help Mode</label>
+            <div class="radio-group">
+              <label class="radio-card">
+                <input type="radio" name="homework-mode" value="guide" checked>
+                <span class="radio-card__title">Guide (Socratic)</span>
+                <span class="radio-card__desc">Never give direct answers. Ask questions that lead to discovery.</span>
+              </label>
+              <label class="radio-card">
+                <input type="radio" name="homework-mode" value="explain">
+                <span class="radio-card__title">Explain</span>
+                <span class="radio-card__desc">Explain concepts clearly, but still don't do the homework.</span>
+              </label>
+              <label class="radio-card">
+                <input type="radio" name="homework-mode" value="review">
+                <span class="radio-card__title">Review</span>
+                <span class="radio-card__desc">Review completed work. Point out errors, suggest corrections.</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="tutor-socratic" checked>
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Always use Socratic method</span>
+          </div>
+
+          <div class="form-group">
+            <label for="tutor-language">Language</label>
+            <input type="text" id="tutor-language" value="English">
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: Boundaries ---- -->
+        <fieldset class="form-section form-section--danger">
+          <legend class="form-section__title">Boundaries</legend>
+
+          <div class="form-group">
+            <label for="tutor-off-limits">Off-Limits Topics</label>
+            <p class="form-hint">Topics the tutor should NOT cover (one per line)</p>
+            <textarea id="tutor-off-limits" rows="2" placeholder="e.g., topics restricted by parent"></textarea>
+          </div>
+        </fieldset>
+
+        <!-- ---- Save ---- -->
+        <div class="form-actions">
+          <button type="button" class="btn btn--ghost" id="btn-reset-tutor">Reset to Defaults</button>
+          <button type="submit" class="btn btn--primary" id="btn-save-tutor">
+            <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+              <path d="M12 3H4a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V6l-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M10 3v3H6V3" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            Save Profile
+          </button>
+        </div>
+
+      </form>
+    </section>
+
+  </main>
+
+  <!-- ================================================================== -->
+  <!-- SCRIPTS                                                            -->
+  <!-- ================================================================== -->
+  <script src="js/setup.js"></script>
+
+</body>
+</html>

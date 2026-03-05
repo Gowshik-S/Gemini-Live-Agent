@@ -454,8 +454,9 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                         log.info("audio.first_frame_received", bytes=len(payload))
                     if playback is not None:
                         playback.enqueue(payload)
-                    else:
-                        log.debug("playback.skipped", reason="no playback device")
+                    elif audio_frames_received == 1:
+                        # Log only once — repeated per-frame logs flood the console
+                        log.warning("playback.skipped", reason="no playback device")
                 else:
                     log.debug("cloud.unknown_binary_prefix", prefix=prefix.hex())
             else:
@@ -1388,6 +1389,13 @@ async def main() -> None:
             audio_capture_loop(client, capture, ptt, vad_instance, playback,
                                wake_word=wake_word),
             name="audio",
+        ))
+
+    # PyAudio playback drain loop — writes audio to speaker via blocking write
+    if playback is not None:
+        tasks.add(asyncio.create_task(
+            playback.drain_loop(),
+            name="playback_drain",
         ))
 
     if screen is not None:

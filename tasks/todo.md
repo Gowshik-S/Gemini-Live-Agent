@@ -1,38 +1,114 @@
 # Rio Build Progress
 
-## Current Sprint: Skills Integration — Customer Care + Tutor (March 2, 2026)
+## Next Sprint: Screen Navigation — Computer Use (March 5, 2026)
+
+### Research Complete
+Full research report in `tasks/screen_nav_research.md`. Covers 11 tools/approaches evaluated, coordinate mapping solutions, tool declarations, architecture, safety, and implementation phases.
+
+### Recommended Stack
+- **Action execution:** pyautogui (cross-platform)
+- **Unicode typing:** pynput.keyboard.Controller (already in deps)
+- **DPI fix:** ctypes SetProcessDpiAwareness(2) at startup
+- **Element detection (Phase 2):** Set-of-Mark overlay using existing rapidocr bounding boxes
+- **Window management:** pyautogui (Windows) + wmctrl/xdotool (Linux)
+
+### Phase 1 Tasks (Core Navigation — 2-3 days)
+- [ ] 1. Add `pyautogui>=0.9.54` to requirements.txt
+- [ ] 2. Create `local/screen_nav.py` — ScreenNavigator class
+- [ ] 3. Add DPI awareness call at top of `local/main.py`
+- [ ] 4. Modify `screen_capture.py` → return CaptureResult with metadata
+- [ ] 5. Implement coordinate mapping (screenshot → screen coords)
+- [ ] 6. Implement actions: click, type_text, press_key, scroll, wait
+- [ ] 7. Add screen nav tool declarations to `cloud/gemini_session.py`
+- [ ] 8. Add screen nav dispatch to `local/tools.py`
+- [ ] 9. Wire into main.py receive_loop
+- [ ] 10. Add safety gate + dangerous key blocklist
+- [ ] 11. Add ScreenNavConfig to config.py + config.yaml
+- [ ] 12. Post-action screenshot: auto-capture after every action
+- [ ] 13. Update system instruction with nav capabilities
+
+### Phase 2 Tasks (Set-of-Mark + OCR — 1-2 days)
+- [ ] 14. Add `extract_with_boxes()` to ocr.py
+- [ ] 15. Create `local/som_overlay.py`
+- [ ] 16. Add `click_element` tool declaration + handler
+- [ ] 17. Integrate SoM into navigation screenshot flow
+- [ ] 18. Test accuracy improvement vs pure vision
+
+### Phase 3 Tasks (Window Management + Drag — 1 day)
+- [ ] 19. Implement find_window, focus_window (cross-platform)
+- [ ] 20. Implement drag action
+- [ ] 21. Add window management tool declarations
+
+### Key Risks
+- Coordinate misalignment (DPI/resize) — P0, mitigated by metadata-based mapping
+- Wayland incompatibility — P1, detect + degrade gracefully
+- Infinite click loop — P0, rate limit + fail-safe + emergency stop
+
+---
+
+## Current Sprint: Profile System + Dynamic Instructions (March 2, 2026)
 
 ### What Was Done
-Two new skills integrated into Rio via openclaw SKILL.md format + Rio tool pipeline.
+Fixed-schema profile system with setup page, API endpoints, dynamic system instruction builder, and update_ticket tool. Follows openclaw dashboard pattern — NO LLM-generated config.
 
 ### Completed Tasks
-- [x] 1. Research openclaw skills system (SKILL.md format, discovery, prompt injection)
-- [x] 2. Create rio-customer-care skill (SKILL.md + escalation-workflows.md + response-templates.md)
-- [x] 3. Create rio-tutor skill (SKILL.md + socratic-method.md + learning-patterns.md + quiz_generator.py)
-- [x] 4. Add 4 tool declarations to cloud/gemini_session.py (create_ticket, generate_quiz, track_progress, explain_concept)
-- [x] 5. Add 4 tool handlers to local/tools.py (_create_ticket, _generate_quiz, _track_progress, _explain_concept)
-- [x] 6. Update system instruction with Customer Care Mode + Tutor Mode guidance
-- [x] 7. Add SkillsConfig to config.py (CustomerCareConfig + TutorConfig dataclasses)
-- [x] 8. Add skills section to config.yaml
-- [x] 9. Update context.txt with skills documentation
-- [x] 10. Update todo.md (this file)
+- [x] 1. Research openclaw config/dashboard pattern (JSON5 → Zod schema → form UI)
+- [x] 2. Design fixed profile templates (BusinessProfile + StudentProfile)
+- [x] 3. Create rio/local/profiles.py (dataclasses, I/O, system instruction builders)
+- [x] 4. Build setup page — rio/ui/dashboard/setup.html + css/setup.css + js/setup.js
+- [x] 5. Add profile API endpoints to cloud/main.py (GET/POST /api/profiles/)
+- [x] 6. Make system instruction dynamic — build_system_instruction() in gemini_session.py
+- [x] 7. Add update_ticket tool (FunctionDeclaration + handler in tools.py)
+- [x] 8. Wire proactive behaviors (adaptive tutor, escalation tiers, scope boundaries)
+- [x] 9. Update context.txt + todo.md, verify all Python syntax
 
 ### Files Modified
-- `cloud/gemini_session.py` — 4 new FunctionDeclarations + system instruction update
-- `local/tools.py` — 4 new handler methods + dispatch entries + new imports
-- `local/config.py` — CustomerCareConfig, TutorConfig, SkillsConfig dataclasses
-- `config.yaml` — skills.customer_care + skills.tutor config blocks
+- `cloud/gemini_session.py` — Dynamic system instruction (build_system_instruction()), update_ticket FunctionDeclaration, per-session instruction rebuild
+- `cloud/main.py` — Profile API endpoints (GET/POST /api/profiles/), Request import
+- `local/tools.py` — update_ticket handler, dispatch registration
+- `ui/dashboard/index.html` — Added Setup link in topbar
+- `context.txt` — Documentation for profile system
 
 ### Files Created
-- `openclaw/skills/rio-customer-care/SKILL.md`
-- `openclaw/skills/rio-customer-care/references/escalation-workflows.md`
-- `openclaw/skills/rio-customer-care/references/response-templates.md`
-- `openclaw/skills/rio-tutor/SKILL.md`
+- `local/profiles.py` — BusinessProfile, StudentProfile, CustomerCareProfile, TutorProfile dataclasses + save/load + build_customer_care_instruction() + build_tutor_instruction()
+- `ui/dashboard/setup.html` — Two-tab setup form (Customer Care + Tutor)
+- `ui/dashboard/css/setup.css` — Form styling matching Obsidian Slate theme
+- `ui/dashboard/js/setup.js` — Form logic, API calls, populate/collect helpers
+
+### Design Decisions
+- **Fixed schemas, NOT LLM-generated**: Every field is predetermined. Users fill in manually.
+- **Same profile = same instruction**: Deterministic. No randomness in config.
+- **Per-session rebuild**: System instruction rebuilt from profile files at each session connect.
+- **Graceful fallback**: If profiles.py can't be imported, generic instructions are used.
+- **Setup page matches dashboard theme**: Obsidian Slate, IBM Plex fonts, same design tokens.
+
+---
+
+## Previous Sprint: Skills Integration — Customer Care + Tutor (v0.7.0)
 - `openclaw/skills/rio-tutor/references/socratic-method.md`
 - `openclaw/skills/rio-tutor/references/learning-patterns.md`
 - `openclaw/skills/rio-tutor/scripts/quiz_generator.py`
 
 ### Version: v0.7.0
+
+---
+
+## Current Sprint: Audio Architecture Fix — Blocking Write (March 5, 2026)
+
+### Research Findings (see tasks/audio_research_report.md)
+- Google's official Gemini Live API docs use **PyAudio with blocking `stream.write()`** — no callbacks
+- Pipecat (10.6k★, #1 voice AI framework) uses **PyAudio with blocking write via ThreadPoolExecutor**
+- The real bug is the **callback-based architecture**, not the audio library
+- `miniaudio` is a strong backup option (native WASAPI/PulseAudio, built-in resampling, generator-based)
+
+### Sprint Tasks
+- [ ] 1. Switch `AudioPlayback` to PyAudio blocking write (`asyncio.to_thread(stream.write, data)`)
+- [ ] 2. Remove callback + queue + jitter buffer architecture from playback
+- [ ] 3. Keep `AudioCapture` on sounddevice (input capture is working fine)
+- [ ] 4. Keep scipy resampling, move to thread pool
+- [ ] 5. Test on Windows + Linux
+- [ ] 6. Benchmark first-sound latency (target: <50ms)
+- [ ] 7. Evaluate miniaudio as fallback for PipeWire Linux systems
 
 ---
 

@@ -1,0 +1,505 @@
+/* ==========================================================================
+   Rio Setup Page — Styles
+   Extends the base Obsidian Slate theme from style.css
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Layout
+   -------------------------------------------------------------------------- */
+.setup {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px var(--gap);
+  height: calc(100vh - var(--topbar-h));
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* --------------------------------------------------------------------------
+   Tabs
+   -------------------------------------------------------------------------- */
+.setup__tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  background: var(--bg-elevated);
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.tab-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all var(--transition-base);
+}
+
+.tab-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-surface-hover);
+}
+
+.tab-btn--active {
+  background: var(--primary);
+  color: #fff;
+}
+
+.tab-btn--active .icon {
+  color: #fff;
+}
+
+.tab-btn--active:hover {
+  background: var(--primary);
+  color: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Tab content
+   -------------------------------------------------------------------------- */
+.tab-content {
+  display: none;
+}
+
+.tab-content--active {
+  display: block;
+}
+
+/* --------------------------------------------------------------------------
+   Form sections (fieldsets)
+   -------------------------------------------------------------------------- */
+.form-section {
+  border: 1px solid var(--border);
+  border-radius: var(--panel-radius);
+  padding: var(--panel-padding);
+  margin-bottom: 16px;
+  background: var(--bg-surface);
+}
+
+.form-section--danger {
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.form-section--danger .form-section__title {
+  color: var(--error);
+}
+
+.form-section__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 12px;
+  padding: 0;
+}
+
+/* --------------------------------------------------------------------------
+   Form groups
+   -------------------------------------------------------------------------- */
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group:last-child {
+  margin-bottom: 0;
+}
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+
+.form-hint {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-bottom: 6px;
+}
+
+.req {
+  color: var(--error);
+}
+
+/* --------------------------------------------------------------------------
+   Inputs
+   -------------------------------------------------------------------------- */
+input[type="text"],
+input[type="url"],
+input[type="email"],
+input[type="tel"],
+textarea,
+select {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  transition: border-color var(--transition-fast);
+  outline: none;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(108, 99, 255, 0.15);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+select {
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 5l3 3 3-3' stroke='%235C5C72' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 32px;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 40px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* --------------------------------------------------------------------------
+   Layout helpers
+   -------------------------------------------------------------------------- */
+.form-row {
+  display: flex;
+  gap: 12px;
+}
+
+.form-row > .form-group {
+  flex: 1;
+}
+
+.form-row--toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.form-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   Toggle switch
+   -------------------------------------------------------------------------- */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle__track {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--border);
+  border-radius: 22px;
+  transition: background var(--transition-base);
+}
+
+.toggle__track::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--text-secondary);
+  border-radius: 50%;
+  transition: all var(--transition-base);
+}
+
+.toggle input:checked + .toggle__track {
+  background: var(--primary);
+}
+
+.toggle input:checked + .toggle__track::after {
+  transform: translateX(18px);
+  background: #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Radio cards (homework mode)
+   -------------------------------------------------------------------------- */
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.radio-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all var(--transition-base);
+}
+
+.radio-card:hover {
+  border-color: var(--primary-dim);
+  background: var(--bg-surface-hover);
+}
+
+.radio-card input[type="radio"] {
+  display: none;
+}
+
+.radio-card input[type="radio"]:checked ~ .radio-card__title {
+  color: var(--primary);
+}
+
+.radio-card input[type="radio"]:checked ~ .radio-card__title::before {
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+.radio-card__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.radio-card__title::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: all var(--transition-fast);
+}
+
+.radio-card__desc {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-left: 22px;
+}
+
+/* --------------------------------------------------------------------------
+   Tier cards
+   -------------------------------------------------------------------------- */
+.tier-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.tier-card {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.tier-card__label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.tier-card input {
+  font-size: 11px;
+  padding: 5px 8px;
+}
+
+/* --------------------------------------------------------------------------
+   FAQ dynamic list
+   -------------------------------------------------------------------------- */
+.faq-item {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  align-items: flex-start;
+}
+
+.faq-item__fields {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.faq-item input {
+  font-size: 12px;
+}
+
+.faq-item .btn-remove {
+  margin-top: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--error);
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.faq-item .btn-remove:hover {
+  background: var(--error-dim);
+}
+
+/* --------------------------------------------------------------------------
+   Buttons
+   -------------------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-base);
+}
+
+.btn--primary {
+  background: var(--primary);
+  color: #fff;
+}
+
+.btn--primary:hover {
+  background: var(--primary-dim);
+}
+
+.btn--primary .icon {
+  color: #fff;
+}
+
+.btn--ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.btn--ghost:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   Form actions (save row)
+   -------------------------------------------------------------------------- */
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 0 40px;
+}
+
+/* --------------------------------------------------------------------------
+   Toast notification
+   -------------------------------------------------------------------------- */
+.toast {
+  position: fixed;
+  top: 64px;
+  right: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--success-dim);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 8px;
+  color: var(--success);
+  font-size: 13px;
+  font-weight: 500;
+  z-index: 999;
+  animation: toast-in 0.3s ease;
+}
+
+.toast__icon {
+  font-size: 16px;
+}
+
+.toast--error {
+  background: var(--error-dim);
+  border-color: rgba(248, 113, 113, 0.3);
+  color: var(--error);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Responsive
+   -------------------------------------------------------------------------- */
+@media (max-width: 600px) {
+  .form-row {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .tier-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .setup {
+    padding: 12px 8px;
+  }
+}

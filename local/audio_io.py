@@ -1,20 +1,19 @@
 """
-Rio Local — Audio I/O Module (Low-Latency v2)
+Rio Local — Audio I/O Module (Low-Latency v3)
 
-Layer 1 (L1): Audio capture and playback using sounddevice.
-  - Capture: PCM 16-bit, 16kHz, mono audio in 20ms chunks (was 100ms)
-  - Playback: PCM 16-bit, 24kHz, mono (matches Gemini output rate)
-  - WASAPI exclusive mode on Windows for lowest latency
-  - latency='low' on all streams
-  - Reduced jitter buffer (40ms vs 200ms)
-  - Async-friendly: queue-based interfaces for both directions
+Layer 1 (L1): Audio capture and playback.
+  - Capture: PCM 16-bit, 16kHz, mono audio in 20ms chunks via sounddevice
+  - Playback: PCM 16-bit, 24kHz, mono via PyAudio blocking write
+    (matches Google's own Gemini Live sample and Pipecat framework)
+  - WASAPI fallback on Windows for capture
+  - scipy.signal.resample_poly for high-quality resampling
+  - Async-friendly: asyncio.to_thread for blocking writes
   - Device enumeration and selection
 """
 
 from __future__ import annotations
 
 import asyncio
-import queue as _queue_mod
 from typing import AsyncGenerator, Optional
 
 import platform
@@ -112,17 +111,39 @@ class AudioCapture:
             wasapi=extra_settings is not None,
         )
 
-        self._stream = sd.InputStream(
-            samplerate=self._sample_rate,
-            blocksize=self._block_size,
-            dtype="int16",
-            channels=1,
-            device=self._input_device,
-            latency="low",
-            extra_settings=extra_settings,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self._sample_rate,
+                blocksize=self._block_size,
+                dtype="int16",
+                channels=1,
+                device=self._input_device,
+                latency="low",
+                extra_settings=extra_settings,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except sd.PortAudioError as _pa_err:
+            if extra_settings is not None:
+                # WASAPI settings incompatible with this device (e.g. error -9984).
+                # Retry without host-API-specific settings.
+                log.warning(
+                    "audio.wasapi_failed_retrying",
+                    error=str(_pa_err),
+                    device=self._input_device,
+                )
+                self._stream = sd.InputStream(
+                    samplerate=self._sample_rate,
+                    blocksize=self._block_size,
+                    dtype="int16",
+                    channels=1,
+                    device=self._input_device,
+                    latency="low",
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+            else:
+                raise
         self._running = True
         log.info("audio.started", latency=self._stream.latency)
 
@@ -208,27 +229,28 @@ class AudioCapture:
 class AudioPlayback:
     """Plays PCM 24kHz 16-bit mono audio received from Gemini.
 
-    Uses sounddevice's callback-based OutputStream. Audio chunks are
-    enqueued from the async event loop via ``enqueue()`` and consumed
-    by the audio callback running in a separate thread.
+    Uses PyAudio's blocking ``stream.write()`` — the same approach used by:
+      - Google's official Gemini Live API starter code
+      - Pipecat (Daily.co's voice AI framework, 10k+ stars)
+      - LiveKit Python agents
 
-    On Linux with PipeWire, the virtual 'default'/'pulse' ALSA devices
-    often hang with PortAudio's callback-based streaming.  This class
-    auto-detects a working hardware output device and resamples
-    Gemini's 24 kHz audio to the device's native rate (typically 48 kHz).
+    The blocking write lets the OS audio driver manage its own internal
+    buffer and timing.  No application-level callback threading, no
+    jitter buffer, no silence padding.  Audio data is enqueued from the
+    async event loop via ``enqueue()``, and a dedicated writer coroutine
+    drains the queue with ``asyncio.to_thread(stream.write, chunk)``.
 
     Usage::
 
         playback = AudioPlayback(input_sample_rate=24000)
         playback.start()
-        playback.enqueue(pcm_bytes)   # called from async receive loop
+        # In the receive loop:
+        playback.enqueue(pcm_bytes)
+        # Start the async writer task:
+        asyncio.create_task(playback.drain_loop())
         ...
         playback.stop()
     """
-
-    # Jitter buffer: accumulate this many bytes before starting playback.
-    # Reduced from 200ms to 40ms for much faster first-sound latency.
-    _JITTER_BUFFER_BYTES = 1920  # ~40ms at 24kHz 16-bit mono (24000*0.04*2)
 
     def __init__(
         self,
@@ -236,37 +258,25 @@ class AudioPlayback:
         channels: int = 1,
         output_device: Optional[str | int] = None,
         max_queue_size: int = 600,
-        use_wasapi: bool = True,
+        use_wasapi: bool = True,  # kept for API compat, not used by PyAudio path
     ) -> None:
         self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
-        self._output_sample_rate = sample_rate  # actual device rate (may differ)
+        self._output_sample_rate: int = 0       # actual device rate (set in start())
         self._channels = channels
         self._output_device = output_device
         self._use_wasapi = use_wasapi
-        self._stream: Optional[sd.OutputStream] = None
         self._running = False
-        self._resample_ratio: float = 1.0       # output_rate / input_rate
+        self._resample_ratio: float = 1.0
 
-        # Jitter buffer state: accumulate audio before sending to speaker
-        self._jitter_buf = bytearray()
-        self._jitter_ready = False  # True once we've accumulated enough
+        # Thread-safe queue: enqueue() writes, drain_loop() reads
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_queue_size)
 
-        # Thread-safe queue: audio callback (audio thread) reads,
-        # enqueue() (event-loop thread) writes.
-        # We use queue.Queue (not asyncio.Queue) because the consumer
-        # is the sounddevice callback running outside asyncio.
-        self._queue: _queue_mod.Queue[bytes] = _queue_mod.Queue(
-            maxsize=max_queue_size
-        )
-
-        # Block size for the output stream callback.
-        # 480 samples at 48kHz = 10ms per callback — small blocks for
-        # low latency. Was 2400 (50ms).
-        self._block_size = 480
+        # PyAudio objects
+        self._pa = None   # pyaudio.PyAudio instance
+        self._stream = None  # pyaudio.Stream
 
     @property
     def is_playing(self) -> bool:
-        """True if the stream is active and there is audio in the queue."""
         return self._running and not self._queue.empty()
 
     @property
@@ -274,181 +284,88 @@ class AudioPlayback:
         return self._running
 
     # ------------------------------------------------------------------
-    # Device auto-detection
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _find_working_output_device(
-        preferred_rate: int = 24_000,
-    ) -> tuple[int | None, int]:
-        """Probe output devices and return (device_index, sample_rate).
-
-        On Linux with PipeWire, virtual ALSA devices (default, pulse,
-        pipewire) often hang with PortAudio's callback-based streams.
-        We therefore prefer real ALSA hardware devices at their native
-        sample rate and resample in software.
-
-        Strategy:
-        1. Try ALSA hardware devices at their native rate (most reliable).
-        2. Try virtual devices at the preferred rate as fallback.
-        3. Fall back to (None, preferred_rate) and hope for the best.
-        """
-        import time as _time
-        import threading
-
-        devices = sd.query_devices()
-
-        virtual_names = {"default", "pulse", "pipewire"}
-        hw_devs: list[tuple[int, dict]] = []
-        virtual_devs: list[tuple[int, dict]] = []
-
-        for i, dev in enumerate(devices):
-            if dev["max_output_channels"] < 1:
-                continue
-            name = dev["name"].lower()
-            if any(vn in name for vn in virtual_names):
-                virtual_devs.append((i, dev))
-            elif "hdmi" not in name:
-                # Skip HDMI since user probably wants speakers
-                hw_devs.append((i, dev))
-
-        def _probe_device(idx: int, rate: int, timeout: float = 1.0) -> bool:
-            """Open an OutputStream, write a tiny sine burst, and check
-            that the callback actually fires (doesn't hang).
-            """
-            callback_fired = threading.Event()
-
-            def _cb(outdata, frames, time_info, status):
-                outdata[:] = 0  # silence
-                callback_fired.set()
-
-            try:
-                stream = sd.OutputStream(
-                    samplerate=rate,
-                    blocksize=960,
-                    dtype="int16",
-                    channels=1,
-                    device=idx,
-                    callback=_cb,
-                )
-                stream.start()
-                ok = callback_fired.wait(timeout=timeout)
-                stream.stop()
-                stream.close()
-                return ok
-            except Exception:
-                return False
-
-        # --- 1. Try hardware devices at native rate ---
-        for idx, dev in hw_devs:
-            native_rate = int(dev["default_samplerate"])
-            if _probe_device(idx, native_rate):
-                log.info(
-                    "playback.device_probe.ok",
-                    device=idx,
-                    name=dev["name"],
-                    rate=native_rate,
-                    kind="hardware",
-                )
-                return idx, native_rate
-
-        # --- 2. Try virtual devices at preferred rate ---
-        for idx, dev in virtual_devs:
-            if _probe_device(idx, preferred_rate):
-                log.info(
-                    "playback.device_probe.ok",
-                    device=idx,
-                    name=dev["name"],
-                    rate=preferred_rate,
-                    kind="virtual",
-                )
-                return idx, preferred_rate
-
-        log.warning("playback.device_probe.no_working_device")
-        return None, preferred_rate
-
-    # ------------------------------------------------------------------
     # Start / Stop
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open the output stream and begin playback."""
+        """Open the PyAudio output stream."""
         if self._running:
             log.warning("playback.already_running")
             return
 
-        # --- Auto-detect working device if none specified ---
-        if self._output_device is None:
-            dev_idx, dev_rate = self._find_working_output_device(
-                preferred_rate=self._input_sample_rate,
-            )
-            self._output_device = dev_idx
-            self._output_sample_rate = dev_rate
+        import pyaudio
+
+        self._pa = pyaudio.PyAudio()
+
+        # Determine output device and native sample rate
+        if self._output_device is not None:
+            dev_info = self._pa.get_device_info_by_index(int(self._output_device))
         else:
-            self._output_sample_rate = self._input_sample_rate
+            dev_info = self._pa.get_default_output_device_info()
 
+        self._output_sample_rate = int(dev_info["defaultSampleRate"])
         self._resample_ratio = self._output_sample_rate / self._input_sample_rate
-
-        # Adjust block size proportionally to the output rate
-        # Target ~10ms per callback (was ~50ms)
-        self._block_size = max(int(480 * self._resample_ratio), 240)
-
-        # WASAPI settings for low-latency playback on Windows
-        extra_settings = None
-        if self._use_wasapi and _IS_WINDOWS:
-            extra_settings = _get_wasapi_settings(exclusive=False)
-            if extra_settings:
-                log.info("playback.wasapi_enabled", exclusive=False)
 
         log.info(
             "playback.starting",
+            device=dev_info["name"],
             input_rate=self._input_sample_rate,
             output_rate=self._output_sample_rate,
             resample_ratio=round(self._resample_ratio, 4),
-            block_size=self._block_size,
-            device=self._output_device,
-            latency="low",
-            wasapi=extra_settings is not None,
+            engine="pyaudio_blocking_write",
         )
 
-        self._stream = sd.OutputStream(
-            samplerate=self._output_sample_rate,
-            blocksize=self._block_size,
-            dtype="int16",
+        # Open the stream at the device's native rate.
+        # frames_per_buffer=1024 is a good default — the OS driver
+        # handles the rest.  No callback needed.
+        self._stream = self._pa.open(
+            format=pyaudio.paInt16,
             channels=self._channels,
-            device=self._output_device,
-            latency="low",
-            extra_settings=extra_settings,
-            callback=self._playback_callback,
+            rate=self._output_sample_rate,
+            output=True,
+            output_device_index=(
+                int(self._output_device) if self._output_device is not None else None
+            ),
+            frames_per_buffer=1024,
         )
-        self._stream.start()
+
         self._running = True
-        log.info("playback.started", latency=self._stream.latency)
+        log.info("playback.started", engine="pyaudio_blocking_write",
+                 device=dev_info["name"], rate=self._output_sample_rate)
 
     def stop(self) -> None:
-        """Stop playback and close the output stream."""
+        """Stop playback and release PyAudio resources."""
         self._running = False
         if self._stream is not None:
             try:
-                self._stream.stop()
+                self._stream.stop_stream()
                 self._stream.close()
             except Exception:
                 log.exception("playback.stop_error")
             finally:
                 self._stream = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
         self.clear()
         log.info("playback.stopped")
 
     # ------------------------------------------------------------------
-    # Enqueue / Clear
+    # Resampling (scipy polyphase filter)
     # ------------------------------------------------------------------
 
     def _resample(self, data: bytes) -> bytes:
         """Resample PCM int16 audio from input rate to output rate.
 
-        Uses numpy linear interpolation — fast and good enough for
-        voice.  For the common 24 kHz → 48 kHz case (ratio 2.0) this
-        simply doubles the sample count with smooth interpolation.
+        Uses scipy.signal.resample_poly with a proper FIR anti-aliasing
+        filter for high-quality audio resampling.  Falls back to numpy
+        linear interpolation only when scipy is unavailable.
+
+        For the common 24 kHz → 44.1 kHz case the polyphase filter
+        uses up=147, down=80 (GCD of rates = 300).
         """
         if self._resample_ratio == 1.0:
             return data
@@ -457,123 +374,94 @@ class AudioPlayback:
         if len(samples) == 0:
             return data
 
-        old_len = len(samples)
-        new_len = int(old_len * self._resample_ratio)
-        old_indices = np.arange(old_len)
-        new_indices = np.linspace(0, old_len - 1, new_len)
-        resampled = np.interp(new_indices, old_indices, samples).astype(np.int16)
-        return resampled.tobytes()
+        try:
+            from scipy.signal import resample_poly
+            from math import gcd
+
+            g = gcd(self._output_sample_rate, self._input_sample_rate)
+            up = self._output_sample_rate // g
+            down = self._input_sample_rate // g
+            resampled = resample_poly(samples, up, down).astype(np.int16)
+            return resampled.tobytes()
+        except ImportError:
+            # Fallback: linear interpolation (lower quality)
+            log.warning("playback.resample.scipy_unavailable",
+                        note="Install scipy for high-quality audio resampling")
+            old_len = len(samples)
+            new_len = int(old_len * self._resample_ratio)
+            old_indices = np.arange(old_len)
+            new_indices = np.linspace(0, old_len - 1, new_len)
+            resampled = np.interp(new_indices, old_indices, samples).astype(np.int16)
+            return resampled.tobytes()
+
+    # ------------------------------------------------------------------
+    # Enqueue / Clear / Drain
+    # ------------------------------------------------------------------
 
     def enqueue(self, data: bytes) -> None:
         """Add PCM audio data to the playback queue.
 
         Resamples from Gemini's native rate to the output device rate
-        if they differ.  Uses a jitter buffer to accumulate ~200ms of
-        audio before starting playback, preventing choppy output.
-        Thread-safe.
+        if they differ.  Thread-safe.
         """
-        data = self._resample(data)
-
-        # Jitter buffer: accumulate until we have enough data
-        if not self._jitter_ready:
-            self._jitter_buf.extend(data)
-            if len(self._jitter_buf) >= self._JITTER_BUFFER_BYTES:
-                self._jitter_ready = True
-                # Flush the entire jitter buffer into the queue
-                buf = bytes(self._jitter_buf)
-                self._jitter_buf.clear()
-                # Split into queue-friendly chunks (~960 bytes = 10ms at 48kHz)
-                chunk_size = 960
-                for i in range(0, len(buf), chunk_size):
-                    piece = buf[i:i + chunk_size]
-                    try:
-                        self._queue.put_nowait(piece)
-                    except _queue_mod.Full:
-                        try:
-                            self._queue.get_nowait()
-                        except _queue_mod.Empty:
-                            pass
-                        try:
-                            self._queue.put_nowait(piece)
-                        except _queue_mod.Full:
-                            pass
-                log.debug("playback.jitter_buffer_flushed", bytes=len(buf))
+        if not self._running:
             return
-
+        data = self._resample(data)
         try:
             self._queue.put_nowait(data)
-        except _queue_mod.Full:
+        except asyncio.QueueFull:
             # Drop oldest to prevent backpressure / growing latency
             try:
                 self._queue.get_nowait()
-            except _queue_mod.Empty:
+            except asyncio.QueueEmpty:
                 pass
             try:
                 self._queue.put_nowait(data)
-            except _queue_mod.Full:
+            except asyncio.QueueFull:
                 pass
 
     def clear(self) -> None:
-        """Flush the playback queue and jitter buffer (e.g. on interrupt).
-
-        Thread-safe. Drains all pending audio so the speaker goes silent
-        immediately.
-        """
-        self._jitter_buf.clear()
-        self._jitter_ready = False
+        """Flush the playback queue so the speaker goes silent immediately."""
         while True:
             try:
                 self._queue.get_nowait()
-            except _queue_mod.Empty:
+            except asyncio.QueueEmpty:
                 break
 
-    # ------------------------------------------------------------------
-    # sounddevice callback (runs in audio thread)
-    # ------------------------------------------------------------------
+    async def drain_loop(self) -> None:
+        """Async coroutine that drains audio from the queue to the speaker.
 
-    def _playback_callback(
-        self,
-        outdata: np.ndarray,
-        frames: int,
-        time_info,
-        status,
-    ) -> None:
-        """sounddevice output callback -- runs in a separate audio thread.
+        Must be run as an asyncio task.  Uses ``asyncio.to_thread()``
+        to call the blocking ``stream.write()`` — this is exactly the
+        pattern used by Google's Gemini Live API sample code and the
+        Pipecat framework.
 
-        Pulls PCM bytes from the queue and fills the output buffer.
-        If the queue is empty (or data insufficient), fill remainder
-        with silence (zeros) to avoid underrun noise.
+        The OS audio driver manages internal buffering and timing.
+        ``stream.write()`` blocks until the hardware consumes the data,
+        which provides natural back-pressure without needing an
+        application-level jitter buffer.
         """
-        if status:
-            log.warning("playback.callback_status", status=str(status))
-
-        # Total bytes needed: frames * channels * 2 (int16 = 2 bytes/sample)
-        bytes_needed = frames * self._channels * 2
-        collected = bytearray()
-
-        while len(collected) < bytes_needed:
+        log.info("playback.drain_loop.started")
+        while self._running:
             try:
-                chunk = self._queue.get_nowait()
-                collected.extend(chunk)
-            except _queue_mod.Empty:
-                break
-
-        if len(collected) >= bytes_needed:
-            # We have enough data — use exactly what we need,
-            # push any excess back onto the queue
-            audio_bytes = bytes(collected[:bytes_needed])
-            remainder = bytes(collected[bytes_needed:])
-            if remainder:
+                # Wait for audio data with a timeout so we can check _running
                 try:
-                    self._queue.put_nowait(remainder)
-                except _queue_mod.Full:
-                    pass  # drop excess if queue somehow full
-        else:
-            # Not enough data — pad with silence
-            audio_bytes = bytes(collected) + b"\x00" * (bytes_needed - len(collected))
+                    chunk = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
 
-        # Convert raw bytes to numpy int16 array and write to output
-        outdata[:] = np.frombuffer(audio_bytes, dtype=np.int16).reshape(-1, self._channels)
+                if self._stream is not None and chunk:
+                    # Blocking write in a thread — lets the event loop continue
+                    await asyncio.to_thread(self._stream.write, chunk)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("playback.drain_loop.error")
+                # Brief pause to avoid tight error loops
+                await asyncio.sleep(0.1)
+
+        log.info("playback.drain_loop.ended")
 
 
 # ---------------------------------------------------------------------------

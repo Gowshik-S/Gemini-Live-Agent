@@ -22,7 +22,7 @@ from typing import AsyncGenerator, Set
 import structlog
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -224,6 +224,75 @@ async def get_chat_history(limit: int = 100) -> dict:
         "messages": messages,
         "total": len(_transcript_buffer),
     }
+
+
+# ---------------------------------------------------------------------------
+# Profile API — fixed-schema config for customer care & tutor skills
+# ---------------------------------------------------------------------------
+# Lazy import to avoid circular deps at module level
+_profiles_mod = None
+
+def _get_profiles_mod():
+    global _profiles_mod
+    if _profiles_mod is None:
+        import importlib
+        # profiles.py lives at rio/local/profiles.py — add parent to sys.path
+        import sys
+        _local_dir = str(Path(__file__).resolve().parent.parent / "local")
+        if _local_dir not in sys.path:
+            sys.path.insert(0, _local_dir)
+        _profiles_mod = importlib.import_module("profiles")
+    return _profiles_mod
+
+# Resolve profiles directory: same level as rio/ project root
+_profiles_base = str(Path(__file__).resolve().parent.parent / "rio_profiles")
+
+
+@app.get("/api/profiles/{skill_name}")
+async def get_profile(skill_name: str) -> dict:
+    """Load a saved profile. Returns defaults if none exists."""
+    mod = _get_profiles_mod()
+    if skill_name == "customer_care":
+        profile = mod.load_customer_care_profile(_profiles_base)
+        return {"profile": mod.asdict(profile)}
+    elif skill_name == "tutor":
+        profile = mod.load_tutor_profile(_profiles_base)
+        return {"profile": mod.asdict(profile)}
+    else:
+        return {"error": f"Unknown skill: {skill_name}"}, 404
+
+
+@app.post("/api/profiles/{skill_name}")
+async def save_profile(skill_name: str, request: Request) -> dict:
+    """Save a profile from the setup form. Accepts the full JSON object."""
+    mod = _get_profiles_mod()
+    body = await request.json()
+    try:
+        if skill_name == "customer_care":
+            profile = mod._dict_to_customer_care(body)
+            path = mod.save_profile(profile, _profiles_base)
+            return {"status": "saved", "path": str(path)}
+        elif skill_name == "tutor":
+            profile = mod._dict_to_tutor(body)
+            path = mod.save_profile(profile, _profiles_base)
+            return {"status": "saved", "path": str(path)}
+        else:
+            return {"error": f"Unknown skill: {skill_name}"}
+    except Exception as exc:
+        logger.error("profile.save_error", skill=skill_name, error=str(exc))
+        return {"error": str(exc)}
+
+
+@app.get("/api/profiles/{skill_name}/defaults")
+async def get_profile_defaults(skill_name: str) -> dict:
+    """Return the default/template profile for a skill."""
+    mod = _get_profiles_mod()
+    if skill_name == "customer_care":
+        return {"profile": mod.get_default_customer_care_json()}
+    elif skill_name == "tutor":
+        return {"profile": mod.get_default_tutor_json()}
+    else:
+        return {"error": f"Unknown skill: {skill_name}"}
 
 
 # ---------------------------------------------------------------------------
