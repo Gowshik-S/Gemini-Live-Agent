@@ -145,7 +145,12 @@ class WSClient:
         self._ensure_connected()
         assert self._ws is not None
         log.debug("ws.send_text", length=len(text))
-        await self._ws.send(text)
+        try:
+            await self._ws.send(text)
+        except websockets.exceptions.ConnectionClosed as exc:
+            self._state = ConnectionState.DISCONNECTED
+            self._stop_heartbeat()
+            raise ConnectionError(f"WebSocket closed: {exc}") from exc
 
     async def send_json(self, obj: dict[str, Any]) -> None:
         """Convenience: serialize *obj* as JSON and send as a text frame."""
@@ -156,7 +161,12 @@ class WSClient:
         self._ensure_connected()
         assert self._ws is not None
         log.debug("ws.send_binary", length=len(data))
-        await self._ws.send(data)
+        try:
+            await self._ws.send(data)
+        except websockets.exceptions.ConnectionClosed as exc:
+            self._state = ConnectionState.DISCONNECTED
+            self._stop_heartbeat()
+            raise ConnectionError(f"WebSocket closed: {exc}") from exc
 
     async def send_json_resilient(self, obj: dict[str, Any], retries: int = 2) -> bool:
         """Send JSON with retry on transient failures.
@@ -256,6 +266,7 @@ class WSClient:
 
     async def _heartbeat_loop(self) -> None:
         """Send a WebSocket ping every ``_HEARTBEAT_INTERVAL`` seconds."""
+        consecutive_failures = 0
         try:
             while True:
                 await asyncio.sleep(self._HEARTBEAT_INTERVAL)
@@ -264,9 +275,19 @@ class WSClient:
                         pong = await self._ws.ping()
                         await asyncio.wait_for(pong, timeout=5.0)
                         log.debug("ws.heartbeat_ok")
+                        consecutive_failures = 0
                     except Exception as exc:
-                        log.warning("ws.heartbeat_failed", error=str(exc))
-                        # The receive loop will detect the broken connection
+                        consecutive_failures += 1
+                        log.warning("ws.heartbeat_failed", error=str(exc), failures=consecutive_failures)
+                        if consecutive_failures >= 2:
+                            log.warning("ws.heartbeat_dead", note="marking connection dead after 2 consecutive failures")
+                            self._state = ConnectionState.DISCONNECTED
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+                            await self._fire_callback(self._on_disconnect)
+                            return
         except asyncio.CancelledError:
             pass
 

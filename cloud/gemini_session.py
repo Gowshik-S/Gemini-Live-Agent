@@ -18,6 +18,7 @@ import structlog
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
+from websockets.exceptions import ConnectionClosed
 
 logger = structlog.get_logger(__name__)
 
@@ -42,7 +43,59 @@ RIO_BASE_INSTRUCTION = (
     "'check my screen' — call the capture_screen tool to take a screenshot. "
     "The screenshot will be sent to your vision context. If the user has "
     "enabled autonomous mode, you will receive periodic screen frames "
-    "automatically and do NOT need to call capture_screen."
+    "automatically and do NOT need to call capture_screen.\n\n"
+    "SCREEN NAVIGATION: You can interact with the user's screen using these "
+    "tools. Screenshots are captured at 50% resolution. When you want to "
+    "interact, use coordinate values as they appear in the screenshot image. "
+    "The system automatically maps them to real screen positions.\n"
+    "Available screen actions:\n"
+    "- screen_click(x, y) — click at a position (supports left/right/middle, double-click)\n"
+    "- screen_type(text) — type text at the current cursor position\n"
+    "- screen_scroll(x, y, clicks) — scroll at position (+up / -down)\n"
+    "- screen_hotkey(keys) — press keyboard shortcut (e.g. 'ctrl+s', 'alt+tab')\n"
+    "- screen_move(x, y) — move mouse without clicking (hover)\n"
+    "- screen_drag(start_x, start_y, end_x, end_y) — drag from A to B\n"
+    "- find_window(title) — search for open windows by title\n"
+    "- focus_window(title) — bring a window to the foreground\n\n"
+    "WORKFLOW for clicking UI elements:\n"
+    "1. Look at the most recent screenshot\n"
+    "2. Identify the target element's position in the screenshot\n"
+    "3. Use screen_click(x, y) with coordinates from the screenshot\n"
+    "4. After any action, wait for the next screenshot to verify the result\n"
+    "IMPORTANT: Always use screenshot coordinates, never guess raw screen coords.\n\n"
+    "AUTONOMOUS TASK EXECUTION (COMPUTER-USE AGENT):\n"
+    "When the user gives you a task that involves interacting with their computer, "
+    "you MUST execute it autonomously to completion. Do NOT stop after one action "
+    "and ask the user what to do next. Complete the ENTIRE task yourself.\n\n"
+    "THE LOOP — follow this for EVERY computer task:\n"
+    "1. PLAN: Silently break the task into steps.\n"
+    "2. CAPTURE: If you don't have a recent screenshot, call capture_screen first.\n"
+    "3. ANALYZE: Look at the screenshot. Identify what needs to be clicked/typed/scrolled.\n"
+    "4. ACT: Call the appropriate screen action tool (screen_click, screen_type, etc.)\n"
+    "5. VERIFY: After each action, an auto-captured screenshot is sent to your vision "
+    "context (when autonomous mode is on). Look at it to confirm the action worked.\n"
+    "6. CONTINUE: If the task isn't complete, go back to step 3. Keep going until done.\n"
+    "7. REPORT: When the task is fully complete, tell the user what you accomplished.\n\n"
+    "CRITICAL RULES for autonomous execution:\n"
+    "- ONE REQUEST = FULL COMPLETION. Never stop mid-task to ask for confirmation.\n"
+    "- After each screen action, you receive an auto-captured screenshot. USE IT to "
+    "verify your action and plan the next one.\n"
+    "- If an action fails (element not found, wrong location), TRY AGAIN with adjusted "
+    "coordinates or an alternative approach.\n"
+    "- Wait for UI transitions: if the UI hasn't loaded yet after an action, call "
+    "capture_screen again after a moment.\n"
+    "- For typing: use screen_type for text input, screen_hotkey for keyboard shortcuts.\n"
+    "- Give brief voice status updates for long tasks: 'Opening Chrome...', "
+    "'Typing the search query...', 'Almost done...' — but don't narrate every micro-step.\n"
+    "- Maximum 25 actions per task. If you can't finish in 25 actions, tell the user "
+    "what you've done so far and what's remaining.\n\n"
+    "RESPONSE VARIATION:\n"
+    "Keep your responses natural and varied. You're a coworker, not a script:\n"
+    "- Use different sentence structures\n"
+    "- Match the user's energy (casual vs focused)\n"
+    "- Don't start every response with 'Sure' or 'Alright'\n"
+    "- When you see the user's screen, describe what you observe briefly, then help\n"
+    "- If you notice errors or issues proactively, mention them\n"
 )
 
 
@@ -396,6 +449,190 @@ RIO_TOOL_DECLARATIONS = [
                     "required": ["concept"],
                 },
             ),
+            # --- Screen Navigation Tools ---
+            types.FunctionDeclaration(
+                name="screen_click",
+                description=(
+                    "Click at a position on the user's screen. Coordinates are in "
+                    "screenshot space (the resized image you see). The system "
+                    "automatically maps them to real screen coordinates."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "x": {
+                            "type": "INTEGER",
+                            "description": "X coordinate in the screenshot image",
+                        },
+                        "y": {
+                            "type": "INTEGER",
+                            "description": "Y coordinate in the screenshot image",
+                        },
+                        "button": {
+                            "type": "STRING",
+                            "description": "Mouse button: left, right, or middle (default: left)",
+                        },
+                        "clicks": {
+                            "type": "INTEGER",
+                            "description": "Number of clicks: 1=single, 2=double (default: 1)",
+                        },
+                    },
+                    "required": ["x", "y"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="screen_type",
+                description=(
+                    "Type text at the current cursor position on the user's screen. "
+                    "Use this after clicking on a text field. For keyboard shortcuts "
+                    "like Ctrl+S, use screen_hotkey instead."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "text": {
+                            "type": "STRING",
+                            "description": "The text to type",
+                        },
+                        "interval": {
+                            "type": "NUMBER",
+                            "description": "Delay between keystrokes in seconds (default: 0.02)",
+                        },
+                    },
+                    "required": ["text"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="screen_scroll",
+                description=(
+                    "Scroll at a position on the user's screen. Positive clicks "
+                    "scroll up, negative scroll down. Position the cursor first."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "x": {
+                            "type": "INTEGER",
+                            "description": "X coordinate in the screenshot image",
+                        },
+                        "y": {
+                            "type": "INTEGER",
+                            "description": "Y coordinate in the screenshot image",
+                        },
+                        "clicks": {
+                            "type": "INTEGER",
+                            "description": "Scroll amount: positive=up, negative=down (e.g. 3 or -5)",
+                        },
+                    },
+                    "required": ["x", "y", "clicks"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="screen_hotkey",
+                description=(
+                    "Press a keyboard shortcut on the user's machine. "
+                    "Keys are specified as a '+'-separated string. "
+                    "Examples: 'ctrl+s', 'alt+tab', 'ctrl+shift+t', 'enter', 'escape'."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "keys": {
+                            "type": "STRING",
+                            "description": "Key combination, e.g. 'ctrl+s', 'alt+f4', 'enter'",
+                        },
+                    },
+                    "required": ["keys"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="screen_move",
+                description=(
+                    "Move the mouse cursor to a position on the screen without "
+                    "clicking. Useful for hovering over elements to reveal tooltips."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "x": {
+                            "type": "INTEGER",
+                            "description": "X coordinate in the screenshot image",
+                        },
+                        "y": {
+                            "type": "INTEGER",
+                            "description": "Y coordinate in the screenshot image",
+                        },
+                    },
+                    "required": ["x", "y"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="screen_drag",
+                description=(
+                    "Click-and-drag from one position to another on the screen. "
+                    "Useful for selecting text, moving elements, or drawing."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "start_x": {
+                            "type": "INTEGER",
+                            "description": "Start X coordinate in the screenshot image",
+                        },
+                        "start_y": {
+                            "type": "INTEGER",
+                            "description": "Start Y coordinate in the screenshot image",
+                        },
+                        "end_x": {
+                            "type": "INTEGER",
+                            "description": "End X coordinate in the screenshot image",
+                        },
+                        "end_y": {
+                            "type": "INTEGER",
+                            "description": "End Y coordinate in the screenshot image",
+                        },
+                        "duration": {
+                            "type": "NUMBER",
+                            "description": "Duration of drag in seconds (default: 0.5)",
+                        },
+                    },
+                    "required": ["start_x", "start_y", "end_x", "end_y"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="find_window",
+                description=(
+                    "Search for open windows by title. Returns a list of matching "
+                    "windows with their position and size."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "title_contains": {
+                            "type": "STRING",
+                            "description": "Substring to search for in window titles",
+                        },
+                    },
+                    "required": ["title_contains"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="focus_window",
+                description=(
+                    "Bring a window to the foreground by its title. "
+                    "Restores minimized windows automatically."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "title_contains": {
+                            "type": "STRING",
+                            "description": "Substring to search for in window titles",
+                        },
+                    },
+                    "required": ["title_contains"],
+                },
+            ),
         ]
     ),
 ]
@@ -439,6 +676,8 @@ class GeminiSession:
         self._live_connect_error: str | None = None  # Error detail when Live API fails
         # System instruction — rebuilt fresh per session from profiles
         self._system_instruction: str = ""
+        # Lock to prevent concurrent reconnect calls from sender+receiver racing
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -681,6 +920,7 @@ class GeminiSession:
                             "type": "tool_call",
                             "name": fc.name,
                             "args": dict(fc.args) if fc.args else {},
+                            "id": getattr(fc, "id", None),
                         }
                 else:
                     # Regular text response
@@ -776,6 +1016,49 @@ class GeminiSession:
             tools_enabled=self._tools_enabled,
         )
 
+    async def _reconnect_live(self) -> None:
+        """Tear down the dead Live session and open a fresh one.
+
+        Called when a send or receive detects ConnectionClosed.  Uses a
+        lock so that concurrent callers (sender task + receiver task)
+        don't double-reconnect: the second caller returns immediately
+        when it sees a live session was already restored.
+
+        Nulling _live_session BEFORE acquiring the lock is deliberate:
+        asyncio is single-threaded so there is no await between the
+        assignment and the lock acquisition.  This way the guard inside
+        the lock correctly distinguishes "dead on entry" from "already
+        reconnected by a concurrent caller".
+        """
+        # Mark the dead session as gone before anyone else can observe it
+        self._live_session = None
+
+        async with self._reconnect_lock:
+            # Another concurrent caller beat us here and already reconnected
+            if self._live_session is not None:
+                self._log.debug("gemini.live.reconnect_skipped_already_alive")
+                return
+
+            self._log.warning("gemini.live.reconnecting")
+
+            # Clean up the stale context if present
+            old_ctx = self._live_ctx
+            self._live_ctx = None
+            if old_ctx is not None:
+                try:
+                    await old_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+            # Attempt to open a new session
+            try:
+                await self._connect_live()
+                self._log.info("gemini.live.reconnected")
+            except Exception:
+                self._log.exception("gemini.live.reconnect_failed")
+                self._live_session = None
+                self._live_ctx = None
+
     async def send_audio(self, data: bytes) -> None:
         """Send PCM audio bytes to Gemini Live API.
 
@@ -795,6 +1078,9 @@ class GeminiSession:
                     ]
                 )
             )
+        except ConnectionClosed as exc:
+            self._log.warning("gemini.send_audio.session_closed", code=exc.code, reason=str(exc.reason)[:100])
+            await self._reconnect_live()
         except Exception:
             self._log.exception("gemini.send_audio.error", bytes_len=len(data))
 
@@ -809,6 +1095,9 @@ class GeminiSession:
         try:
             await self._live_session.send(input=".", end_of_turn=True)
             self._log.debug("gemini.send_end_of_turn.ok")
+        except ConnectionClosed as exc:
+            self._log.warning("gemini.send_end_of_turn.session_closed", code=exc.code)
+            await self._reconnect_live()
         except Exception:
             self._log.exception("gemini.send_end_of_turn.error")
 
@@ -881,6 +1170,7 @@ class GeminiSession:
                                             "type": "tool_call",
                                             "name": fc.name,
                                             "args": dict(fc.args) if fc.args else {},
+                                            "id": getattr(fc, "id", None),
                                         }
                                         _yielded = True
 
@@ -909,6 +1199,7 @@ class GeminiSession:
                                     "type": "tool_call",
                                     "name": fc.name,
                                     "args": dict(fc.args) if fc.args else {},
+                                    "id": getattr(fc, "id", None),
                                 }
 
                         # -- Setup complete --------------------------------
@@ -917,6 +1208,16 @@ class GeminiSession:
 
                 except asyncio.CancelledError:
                     raise
+                except ConnectionClosed as exc:
+                    self._log.warning(
+                        "gemini.receive_live.session_closed",
+                        code=exc.code,
+                        reason=str(exc.reason)[:100],
+                    )
+                    await self._reconnect_live()
+                    if self._live_session is not None:
+                        continue  # Retry with new session
+                    break
                 except Exception:
                     consecutive_errors += 1
                     self._log.exception(
@@ -981,6 +1282,9 @@ class GeminiSession:
                         ]
                     )
                 )
+            except ConnectionClosed as exc:
+                self._log.warning("gemini.send_image.session_closed", code=exc.code)
+                await self._reconnect_live()
             except Exception:
                 self._log.exception("gemini.send_image.live_error")
             return
@@ -1007,6 +1311,7 @@ class GeminiSession:
         self,
         name: str,
         result: dict,
+        call_id: str | None = None,
     ) -> None:
         """Feed a tool execution result back into Gemini.
 
@@ -1037,12 +1342,16 @@ class GeminiSession:
                     input=types.LiveClientToolResponse(
                         function_responses=[
                             types.FunctionResponse(
+                                id=call_id,
                                 name=name,
                                 response=result,
                             )
                         ]
                     )
                 )
+            except ConnectionClosed as exc:
+                self._log.warning("gemini.send_tool_result.session_closed", code=exc.code)
+                await self._reconnect_live()
             except Exception:
                 self._log.exception("gemini.send_tool_result.live_error")
             return

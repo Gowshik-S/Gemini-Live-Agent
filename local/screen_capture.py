@@ -23,6 +23,7 @@ import hashlib
 import io
 import subprocess
 import shutil
+from dataclasses import dataclass
 from typing import Optional
 
 import structlog
@@ -35,6 +36,19 @@ IMAGE_PREFIX = b"\x02"
 # Circuit breaker: after this many consecutive failures, pause captures
 _MAX_CONSECUTIVE_FAILURES = 3
 _CIRCUIT_BREAKER_COOLDOWN = 30.0  # seconds to wait before retrying
+
+
+@dataclass
+class CaptureResult:
+    """Screenshot result with monitor metadata for coordinate mapping."""
+    jpeg: bytes
+    original_width: int    # monitor resolution before resize
+    original_height: int   # monitor resolution before resize
+    resized_width: int     # dimensions after resize
+    resized_height: int    # dimensions after resize
+    monitor_left: int      # monitor X offset (for multi-monitor)
+    monitor_top: int       # monitor Y offset (for multi-monitor)
+    resize_factor: float   # the factor used
 
 # ---------------------------------------------------------------------------
 # Lazy-import helpers (avoid hard crash if deps missing)
@@ -102,6 +116,10 @@ class ScreenCapture:
         self._consecutive_failures = 0
         self._circuit_open_until: float = 0.0
 
+        # Monitor metadata from last capture (for coordinate mapping)
+        self._last_monitor_info: dict = {"left": 0, "top": 0, "width": 0, "height": 0}
+        self._last_capture_result: CaptureResult | None = None
+
         # Backend selection: prefer mss (X11), fallback to CLI tools (Wayland)
         self._use_wayland_fallback = False
         self._wayland_tool: Optional[str] = None
@@ -149,6 +167,14 @@ class ScreenCapture:
         """Seconds between periodic captures."""
         return self._interval
 
+    @property
+    def resize_factor(self) -> float:
+        return self._resize_factor
+
+    def get_last_capture_result(self) -> CaptureResult | None:
+        """Return the full CaptureResult from the most recent capture, or None."""
+        return self._last_capture_result
+
     # ------------------------------------------------------------------
     # Core capture
     # ------------------------------------------------------------------
@@ -179,11 +205,12 @@ class ScreenCapture:
 
         try:
             img = None
+            monitor_info: dict | None = None
 
             # Try mss first (fast, no subprocess), unless we know it fails
             if not self._use_wayland_fallback and _mss_mod is not None:
                 try:
-                    img = self._capture_mss()
+                    img, monitor_info = self._capture_mss()
                 except Exception as exc:
                     # mss failed — if we have a Wayland fallback, switch to it
                     if self._wayland_tool:
@@ -203,6 +230,16 @@ class ScreenCapture:
             if img is None:
                 self._record_failure()
                 return None
+
+            # Store latest monitor metadata for coordinate mapping
+            orig_w, orig_h = img.width, img.height
+            if monitor_info is not None:
+                self._last_monitor_info = monitor_info
+            else:
+                self._last_monitor_info = {
+                    "left": 0, "top": 0,
+                    "width": orig_w, "height": orig_h,
+                }
 
             # Resize to reduce size before compression
             if self._resize_factor < 1.0:
@@ -232,6 +269,20 @@ class ScreenCapture:
                 resolution=f"{img.width}x{img.height}",
                 backend="wayland" if self._use_wayland_fallback else "mss",
             )
+
+            # Store metadata for get_last_capture_result()
+            mi = self._last_monitor_info
+            self._last_capture_result = CaptureResult(
+                jpeg=jpeg_bytes,
+                original_width=orig_w,
+                original_height=orig_h,
+                resized_width=img.width,
+                resized_height=img.height,
+                monitor_left=mi.get("left", 0),
+                monitor_top=mi.get("top", 0),
+                resize_factor=self._resize_factor,
+            )
+
             return jpeg_bytes
 
         except Exception:
@@ -239,7 +290,7 @@ class ScreenCapture:
             return None
 
     def _capture_mss(self):
-        """Capture using mss (X11). Returns a PIL Image or raises."""
+        """Capture using mss (X11). Returns (PIL Image, monitor_dict) or raises."""
         with _mss_mod.mss() as sct:
             try:
                 monitor = sct.monitors[1]  # Primary monitor
@@ -247,7 +298,8 @@ class ScreenCapture:
                 monitor = sct.monitors[0]  # Fallback to full virtual screen
                 log.warning("screen_capture.no_primary_monitor", note="using monitors[0]")
             raw = sct.grab(monitor)
-        return _pil_image.frombytes("RGB", (raw.width, raw.height), raw.rgb)
+            monitor_info = dict(monitor)  # copy while sct is open
+        return _pil_image.frombytes("RGB", (raw.width, raw.height), raw.rgb), monitor_info
 
     def _capture_wayland(self):
         """Capture using a Wayland-compatible CLI tool. Returns a PIL Image or None."""

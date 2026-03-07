@@ -162,3 +162,13 @@ class SileroVAD:
             probability=prob,
             is_speech=prob >= self._threshold,
         )
+
+    async def process_async(self, pcm_bytes: bytes) -> VadResult:
+        """Async version of process() — runs inference in executor.
+
+        Use this from the event loop to avoid blocking audio I/O.
+        Falls back to synchronous process() if unavailable.
+        """
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.process, pcm_bytes)

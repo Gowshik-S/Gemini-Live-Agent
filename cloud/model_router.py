@@ -98,6 +98,9 @@ class ModelRouter:
         pro_keywords = {
             "architecture", "design review", "refactor", "explain in depth",
             "why does", "root cause", "analyze", "analyse", "deep dive",
+            # Vision-heavy deep analysis keywords
+            "review my code", "find bugs", "security audit",
+            "optimize", "detailed analysis", "explain everything",
         }
         text_lower = text.lower()
         return any(kw in text_lower for kw in pro_keywords)

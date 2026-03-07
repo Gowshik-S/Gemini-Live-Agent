@@ -87,13 +87,115 @@ class ToolExecutor:
         # result = {"success": True, "content": "...", "path": "..."}
     """
 
+    # Screen action tools that trigger auto-capture when autonomous mode is on
+    SCREEN_ACTION_TOOLS = frozenset({
+        "screen_click", "screen_type", "screen_scroll",
+        "screen_hotkey", "screen_move", "screen_drag",
+    })
+
+    # Stuck detection: max identical consecutive actions before warning
+    MAX_REPEATED_ACTIONS = 3
+
     def __init__(self, working_dir: str | None = None) -> None:
         self._cwd = working_dir or os.getcwd()
+        self._screen_navigator = None  # Set via set_screen_navigator()
+        self._screen_capture = None    # Set via set_screen_capture()
+        self._ws_send_binary = None    # Set via set_ws_sender()
+        self._last_actions: list[tuple[str, str]] = []  # (name, args_key) ring buffer
         log.info("tools.init", working_dir=self._cwd)
 
     @property
     def working_dir(self) -> str:
         return self._cwd
+
+    def set_screen_navigator(self, navigator) -> None:
+        """Attach a ScreenNavigator instance for screen interaction tools."""
+        self._screen_navigator = navigator
+        log.info("tools.screen_navigator_attached")
+
+    def set_screen_capture(self, screen_capture) -> None:
+        """Attach a ScreenCapture instance for auto-capture after screen actions."""
+        self._screen_capture = screen_capture
+        log.info("tools.screen_capture_attached")
+
+    def set_ws_sender(self, send_binary_fn) -> None:
+        """Attach an async callable to send binary frames to the cloud.
+
+        Used by auto-capture to send screenshots after screen actions.
+        Signature: ``async def send_binary(data: bytes) -> None``
+        """
+        self._ws_send_binary = send_binary_fn
+        log.info("tools.ws_sender_attached")
+
+    async def execute_with_auto_capture(
+        self, name: str, args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a screen action tool, then auto-capture a screenshot.
+
+        This closes the autonomous agent feedback loop:
+        1. Execute the screen action (click, type, scroll, etc.)
+        2. Wait briefly for the UI to update (300ms)
+        3. Capture a new screenshot
+        4. Send the screenshot to the cloud as a binary image frame
+
+        Gemini sees: tool result + fresh screenshot of the result
+        → can decide the next action without another user request.
+        """
+        # Stuck detection: track repeated identical actions
+        action_key = (name, json.dumps(args, sort_keys=True))
+        self._last_actions.append(action_key)
+        if len(self._last_actions) > self.MAX_REPEATED_ACTIONS:
+            self._last_actions = self._last_actions[-self.MAX_REPEATED_ACTIONS:]
+
+        # Step 1: Execute the actual screen action
+        result = await self.execute(name, args)
+
+        if not result.get("success", False):
+            return result  # Action failed — skip auto-capture
+
+        # Check if stuck (same action repeated MAX_REPEATED_ACTIONS times)
+        if (
+            len(self._last_actions) >= self.MAX_REPEATED_ACTIONS
+            and len(set(self._last_actions[-self.MAX_REPEATED_ACTIONS:])) == 1
+        ):
+            result["warning"] = (
+                f"You've repeated the same action ({name}) {self.MAX_REPEATED_ACTIONS} "
+                "times with identical arguments. The UI may not be responding "
+                "as expected. Try a different approach or ask the user for help."
+            )
+            log.warning("tool.stuck_detected", action=name, repeats=self.MAX_REPEATED_ACTIONS)
+
+        # Step 2: Brief pause for UI to settle
+        await asyncio.sleep(0.3)
+
+        # Step 3 + 4: Auto-capture and send
+        if self._screen_capture is not None and self._ws_send_binary is not None:
+            try:
+                jpeg = await self._screen_capture.capture_async(force=True)
+                if jpeg is not None:
+                    # Send as image frame (0x02 prefix) to cloud
+                    await self._ws_send_binary(b"\x02" + jpeg)
+                    result["auto_capture"] = True
+                    result["auto_capture_note"] = (
+                        "A screenshot was automatically taken after this action "
+                        "and sent to your vision context. Analyze it to verify "
+                        "the action succeeded and decide your next step."
+                    )
+                    log.info(
+                        "tool.auto_capture.sent",
+                        action=name,
+                        size_kb=round(len(jpeg) / 1024, 1),
+                    )
+                else:
+                    result["auto_capture"] = False
+            except Exception as exc:
+                log.warning("tool.auto_capture.failed", action=name, error=str(exc))
+                result["auto_capture"] = False
+                result["auto_capture_error"] = str(exc)
+        else:
+            result["auto_capture"] = False
+
+        return result
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -111,6 +213,15 @@ class ToolExecutor:
             "generate_quiz": self._generate_quiz,
             "track_progress": self._track_progress,
             "explain_concept": self._explain_concept,
+            # Screen navigation
+            "screen_click": self._screen_click,
+            "screen_type": self._screen_type,
+            "screen_scroll": self._screen_scroll,
+            "screen_hotkey": self._screen_hotkey,
+            "screen_move": self._screen_move,
+            "screen_drag": self._screen_drag,
+            "find_window": self._find_window,
+            "focus_window": self._focus_window,
         }
 
         handler = handlers.get(name)
@@ -692,3 +803,75 @@ class ToolExecutor:
                 "Don't use 'it's easy' or 'obviously' — these shame learners",
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Screen Navigation tools
+    # ------------------------------------------------------------------
+
+    def _nav_or_error(self) -> dict[str, Any] | None:
+        """Return error dict if screen navigator is not attached."""
+        if self._screen_navigator is None or not self._screen_navigator.available:
+            return {
+                "success": False,
+                "error": "Screen navigator not available. Install pyautogui.",
+            }
+        return None
+
+    async def _screen_click(
+        self, x: int, y: int, button: str = "left", clicks: int = 1,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.click(
+            int(x), int(y), button=button, clicks=int(clicks),
+        )
+
+    async def _screen_type(
+        self, text: str, interval: float = 0.02,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.type_text(text, interval=float(interval))
+
+    async def _screen_scroll(
+        self, x: int, y: int, clicks: int,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.scroll(int(x), int(y), int(clicks))
+
+    async def _screen_hotkey(self, keys: str) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.hotkey(keys)
+
+    async def _screen_move(self, x: int, y: int) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.move(int(x), int(y))
+
+    async def _screen_drag(
+        self,
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        duration: float = 0.5,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.drag(
+            int(start_x), int(start_y),
+            int(end_x), int(end_y),
+            duration=float(duration),
+        )
+
+    async def _find_window(self, title_contains: str) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.find_window(title_contains)
+
+    async def _focus_window(self, title_contains: str) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.focus_window(title_contains)

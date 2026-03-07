@@ -12,6 +12,7 @@ build/
 # Local data
 rio_memory/
 *.bak
+*.db
 
 # IDE
 .vscode/

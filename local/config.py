@@ -38,6 +38,7 @@ class HotkeyConfig:
     screenshot: str = "f3"
     toggle_proactive: str = "f4"
     screen_mode: str = "f5"
+    live_mode: str = "f6"
 
 
 @dataclass

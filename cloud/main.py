@@ -462,7 +462,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
         Loops up to MAX_TOOL_ROUNDS times to prevent infinite tool chains.
         """
-        MAX_TOOL_ROUNDS = 5
+        MAX_TOOL_ROUNDS = 25
 
         try:
             for _round in range(MAX_TOOL_ROUNDS):
@@ -531,6 +531,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         # Feed result back to Gemini session
                         await gemini.send_tool_result(
                             call["name"], result_data,
+                            call_id=call.get("id"),
                         )
 
                         # Broadcast result to dashboard
@@ -551,6 +552,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         await gemini.send_tool_result(
                             call["name"],
                             {"success": False, "error": "Tool execution timed out (60s)"},
+                            call_id=call.get("id"),
                         )
                         break
 
@@ -581,9 +583,93 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         Continuously streams audio/text/tool_call events from the
         Gemini Live session to the local WebSocket client.  Runs for
         the entire lifetime of the connection (not per-request).
+
+        Improvements over the original:
+          - Text messages are buffered until turn_complete.  This prevents
+            the "preamble text before task" UX issue where Gemini says
+            "Sure, I'll do that" and the user sees it before any work
+            starts.  Preamble text is discarded when a tool_call follows
+            it; only conversational turns (no tools) flush text on
+            turn_complete.
+          - After every tool result is sent to Gemini, a 12-second
+            watchdog timer starts.  If Gemini goes silent (no turn_complete,
+            no text, no further tool_calls) we synthesise a turn_complete
+            so the local client isn't left hanging forever.
         """
+        consecutive_tool_calls = 0
+        # Text buffered since the last turn_complete / start (not yet sent)
+        pending_text: list[str] = []
+        # Whether we should apply a timeout on the next receive_live() item
+        awaiting_gemini_reply = False
+        # Seconds to wait for Gemini's reply after the last tool result
+        GEMINI_REPLY_TIMEOUT = 12.0
+
+        live_gen = gemini.receive_live()
+
+        async def _send_pending_text() -> None:
+            """Flush buffered text to the client and dashboard."""
+            for txt in pending_text:
+                await websocket.send_text(json.dumps({
+                    "type": "transcript",
+                    "speaker": "rio",
+                    "text": txt,
+                }))
+                _buffer_transcript({
+                    "speaker": "rio",
+                    "text": txt,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                await _broadcast_dashboard({
+                    "type": "transcript",
+                    "speaker": "rio",
+                    "text": txt,
+                    "client_id": client_id,
+                })
+            pending_text.clear()
+
+        async def _end_task_mode() -> None:
+            nonlocal consecutive_tool_calls
+            if consecutive_tool_calls > 0:
+                consecutive_tool_calls = 0
+                await websocket.send_text(json.dumps({
+                    "type": "control",
+                    "action": "task_mode",
+                    "active": False,
+                }))
+
         try:
-            async for item in gemini.receive_live():
+            while True:
+                # Fetch next item from the Live stream.
+                # Apply a timeout only after we sent a tool result and are
+                # waiting for Gemini's follow-up, so silent sessions don't
+                # leave the client in a permanent "task active" limbo.
+                try:
+                    if awaiting_gemini_reply:
+                        item = await asyncio.wait_for(
+                            live_gen.__anext__(), timeout=GEMINI_REPLY_TIMEOUT,
+                        )
+                    else:
+                        item = await live_gen.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "relay.live.gemini_reply_timeout",
+                        seconds=GEMINI_REPLY_TIMEOUT,
+                        consecutive_tool_calls=consecutive_tool_calls,
+                    )
+                    # Gemini went silent after a tool result — clean up state
+                    # and unblock the local client.
+                    pending_text.clear()
+                    await _end_task_mode()
+                    await websocket.send_text(json.dumps({
+                        "type": "control",
+                        "action": "turn_complete",
+                    }))
+                    awaiting_gemini_reply = False
+                    continue
+
+                awaiting_gemini_reply = False
                 item_type = item.get("type")
 
                 if item_type == "audio":
@@ -592,29 +678,45 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 elif item_type == "text":
                     text = item["text"]
-                    await websocket.send_text(json.dumps({
-                        "type": "transcript",
-                        "speaker": "rio",
-                        "text": text,
-                    }))
-                    _buffer_transcript({
-                        "speaker": "rio",
-                        "text": text,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    await _broadcast_dashboard({
-                        "type": "transcript",
-                        "speaker": "rio",
-                        "text": text,
-                        "client_id": client_id,
-                    })
+                    if consecutive_tool_calls > 0:
+                        # Text that arrives mid-task (e.g. "Done!") comes
+                        # after all tool calls; treat it as a post-task
+                        # comment — flush it immediately after resetting
+                        # task mode so the client sees it in the right order.
+                        await _end_task_mode()
+                        await websocket.send_text(json.dumps({
+                            "type": "transcript",
+                            "speaker": "rio",
+                            "text": text,
+                        }))
+                        _buffer_transcript({
+                            "speaker": "rio",
+                            "text": text,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        await _broadcast_dashboard({
+                            "type": "transcript",
+                            "speaker": "rio",
+                            "text": text,
+                            "client_id": client_id,
+                        })
+                    else:
+                        # Pre-task or conversational text — buffer it.
+                        # If a tool_call follows, this preamble is discarded.
+                        # If turn_complete follows (pure conversation), it's flushed.
+                        pending_text.append(text)
 
                 elif item_type == "tool_call":
+                    consecutive_tool_calls += 1
                     log.info(
                         "relay.live.tool_call",
                         name=item.get("name"),
                         args_keys=list(item.get("args", {}).keys()),
+                        step=consecutive_tool_calls,
                     )
+                    # Discard any preamble text — the task action speaks for itself
+                    pending_text.clear()
+
                     await websocket.send_text(json.dumps(item))
                     await _broadcast_dashboard({
                         "type": "dashboard",
@@ -623,6 +725,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         "name": item.get("name"),
                         "args": item.get("args", {}),
                     })
+
+                    # Signal task mode to local client when 2+ consecutive tool calls
+                    if consecutive_tool_calls >= 2:
+                        await websocket.send_text(json.dumps({
+                            "type": "control",
+                            "action": "task_mode",
+                            "active": True,
+                            "step": consecutive_tool_calls,
+                        }))
 
                     # Wait for tool result from local client
                     try:
@@ -637,6 +748,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         )
                         await gemini.send_tool_result(
                             item["name"], result_data,
+                            call_id=item.get("id"),
                         )
                         await _broadcast_dashboard({
                             "type": "dashboard",
@@ -645,6 +757,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             "name": item["name"],
                             "success": result_data.get("success"),
                         })
+                        # Arm the watchdog: Gemini should reply within timeout
+                        awaiting_gemini_reply = True
                     except asyncio.TimeoutError:
                         log.error(
                             "relay.live.tool_result.timeout",
@@ -653,9 +767,14 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         await gemini.send_tool_result(
                             item["name"],
                             {"success": False, "error": "Tool execution timed out (60s)"},
+                            call_id=item.get("id"),
                         )
+                        awaiting_gemini_reply = True
 
                 elif item_type == "turn_complete":
+                    # Turn is done — flush any buffered text then notify client
+                    await _send_pending_text()
+                    await _end_task_mode()
                     await websocket.send_text(json.dumps({
                         "type": "control",
                         "action": "turn_complete",
@@ -946,6 +1065,27 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         "confidence": confidence,
                         "signals": signals,
                     })
+
+                elif subtype in ("task_abort", "mode_change") and content:
+                    # Task abort or live mode change — inject into Gemini context
+                    log.info("client.context.injecting", subtype=subtype)
+                    try:
+                        await gemini.send_context(content)
+                    except Exception:
+                        log.exception("client.context.send_failed")
+
+                    if gemini.mode == "text":
+                        if relay_task is not None and not relay_task.done():
+                            relay_task.cancel()
+                            try:
+                                await relay_task
+                            except asyncio.CancelledError:
+                                pass
+                        relay_task = asyncio.create_task(
+                            _relay_gemini_to_client(),
+                            name=f"relay-context-{client_id}",
+                        )
+
                 else:
                     log.debug("client.context.unhandled", subtype=subtype)
 

@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import structlog
@@ -66,6 +67,11 @@ try:
     from tools import ToolExecutor
 except ImportError:
     ToolExecutor = None
+
+try:
+    from screen_navigator import ScreenNavigator
+except ImportError:
+    ScreenNavigator = None
 
 try:
     from struggle_detector import StruggleDetector
@@ -146,7 +152,7 @@ BANNER = r"""
  Voice + screen vision + tools + struggle detection + ML ensemble + Pro routing
  WASAPI low-latency audio, 20ms capture chunks, 40ms jitter buffer
  Wake word: say "Rio" or "Hey Rio" to activate
- F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode
+ F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode  F6=Live-Mode
  Text input via stdin.  Ctrl-C to quit.
 """
 
@@ -232,9 +238,14 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                        struggle_detector=None, screen=None, memory_store=None,
                        session_ready: asyncio.Event | None = None,
                        chat_store=None, session_id: str = "",
-                       pattern_model=None, ml_manager=None) -> None:
+                       pattern_model=None, ml_manager=None,
+                       screen_navigator=None,
+                       autonomous_mode: asyncio.Event | None = None,
+                       task_active: asyncio.Event | None = None,
+                       wake_word=None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     audio_frames_received = 0
+    task_in_progress = False  # Track autonomous task execution
     async for msg in client.receive():
         if isinstance(msg, dict):
             msg_type = msg.get("type", "")
@@ -244,6 +255,9 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 speaker = msg.get("speaker", "rio")
                 text = msg.get("text", "")
                 if speaker == "rio" and text:
+                    # Keep wake word alive while Rio is responding
+                    if wake_word is not None and wake_word.is_listening:
+                        wake_word.keep_alive()
                     print(f"\n  Rio: {text}")
                     print("  You: ", end="", flush=True)
                     # Save to chat store
@@ -268,8 +282,12 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                         except Exception:
                             pass
                 elif speaker == "user":
-                    # Echo of our own message — ignore
-                    pass
+                    # Check if user said an exit phrase to deactivate listening
+                    if wake_word is not None and wake_word.is_listening and text:
+                        if wake_word.check_exit_phrase(text):
+                            print("\n  [Rio deactivated — say 'Rio' to wake]")
+                            print("  You: ", end="", flush=True)
+                    # Otherwise: Echo of our own message — ignore
 
             elif msg_type == "text":
                 # Direct text response (fallback / future use)
@@ -305,6 +323,24 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     print("  You: ", end="", flush=True)
                 elif action == "turn_complete":
                     log.debug("cloud.turn_complete")
+                    if task_in_progress:
+                        task_in_progress = False
+                        if task_active is not None:
+                            task_active.clear()
+                        log.info("task_mode.ended")
+                elif action == "task_mode":
+                    active = msg.get("active", False)
+                    step = msg.get("step", 0)
+                    task_in_progress = active
+                    if task_active is not None:
+                        if active:
+                            task_active.set()
+                        else:
+                            task_active.clear()
+                    if active:
+                        log.info("task_mode.active", step=step)
+                    else:
+                        log.info("task_mode.ended")
                 elif action == "session_mode":
                     actual = msg.get("actual_mode", "???")
                     requested = msg.get("requested_mode", "???")
@@ -329,9 +365,19 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
 
                 # Special handling: capture_screen tool
                 if tool_name == "capture_screen" and screen is not None:
+                    # Text mode status — let user know Rio is analyzing their screen
+                    if not playback or not hasattr(playback, 'is_playing') or not playback.is_playing:
+                        print("\n  [Rio is looking at your screen...]")
                     try:
                         jpeg = await screen.capture_async(force=True)
                         if jpeg is not None:
+                            # Sync monitor offset to screen navigator
+                            if screen_navigator is not None:
+                                cr = screen.get_last_capture_result()
+                                if cr is not None:
+                                    screen_navigator.update_monitor_offset(
+                                        cr.monitor_left, cr.monitor_top,
+                                    )
                             await client.send_binary(IMAGE_PREFIX + jpeg)
                             result = {
                                 "success": True,
@@ -384,7 +430,29 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                             print("  You: ", end="", flush=True)
                             continue
 
-                    result = await tool_executor.execute(tool_name, tool_args)
+                    # Use auto-capture for screen actions when autonomous mode is active
+                    is_screen_action = (
+                        hasattr(tool_executor, 'SCREEN_ACTION_TOOLS')
+                        and tool_name in tool_executor.SCREEN_ACTION_TOOLS
+                    )
+                    use_auto_capture = (
+                        is_screen_action
+                        and autonomous_mode is not None
+                        and autonomous_mode.is_set()
+                    )
+
+                    if use_auto_capture:
+                        task_in_progress = True
+                        if task_active is not None:
+                            task_active.set()
+                        print(f"\n  🔄 Auto: {tool_name}({_format_tool_args(tool_args)})")
+                        result = await tool_executor.execute_with_auto_capture(
+                            tool_name, tool_args,
+                        )
+                        if result.get("auto_capture"):
+                            print(f"  [auto-capture sent — verifying action]")
+                    else:
+                        result = await tool_executor.execute(tool_name, tool_args)
                     success = result.get("success", False)
                     log.info("tool_call.executed", name=tool_name, success=success)
 
@@ -452,6 +520,9 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     audio_frames_received += 1
                     if audio_frames_received == 1:
                         log.info("audio.first_frame_received", bytes=len(payload))
+                    # Keep wake word alive while Rio is speaking
+                    if wake_word is not None and wake_word.is_listening:
+                        wake_word.keep_alive()
                     if playback is not None:
                         playback.enqueue(payload)
                     elif audio_frames_received == 1:
@@ -538,6 +609,7 @@ async def audio_capture_loop(
     vad=None,
     playback=None,
     wake_word=None,
+    task_active: asyncio.Event | None = None,
 ) -> None:
     """Read audio chunks from the microphone and send as binary frames.
 
@@ -546,10 +618,15 @@ async def audio_capture_loop(
       ptt-only  — F2 gates capture, all audio sent while held
       vad-only  — always captures, VAD filters silence
       always-on — streams everything (Day 3 behaviour)
-    
+
     Chunks are 20ms (320 samples @ 16kHz) for low-latency capture.
-    When wake_word is provided, audio is only sent when the wake word
-    has been detected (Alexa-style activation).
+
+    Wake word priority: When wake word is active (LISTENING state), audio
+    flows to the cloud regardless of PTT state. This lets "Hey Rio"
+    override the need to hold F2.
+
+    Task abort: If the user presses F2 during an autonomous task
+    (task_active is set), the task is aborted and Rio stops executing.
     """
     has_ptt = ptt is not None
     has_vad = vad is not None and vad.available
@@ -560,27 +637,66 @@ async def audio_capture_loop(
 
     async for chunk in capture.chunks():
         if not client.is_connected:
-            log.debug("audio_loop.skipping", reason="not connected")
-            await asyncio.sleep(0.5)
+            log.debug("audio_loop.waiting_for_reconnect")
+            while not client.is_connected:
+                await asyncio.sleep(1.0)
+            log.debug("audio_loop.reconnected")
             continue
 
-        # -- Wake word gate (Alexa-style) -----------------------------------
+        # -- Wake word processing (ALWAYS runs, even with PTT) -----------------
+        ww_active = False
+        ww_just_activated = False
+        ww_just_deactivated = False
         if wake_word is not None and wake_word.available:
             ww_result = wake_word.process(chunk)
-            if not ww_result.should_send_audio:
-                continue  # Still sleeping — don't send audio
-            # If just activated, clear playback so Rio stops mid-sentence
-            if ww_result.activated and playback is not None:
-                playback.clear()
+            ww_active = ww_result.should_send_audio
+            ww_just_activated = ww_result.activated
+            ww_just_deactivated = ww_result.deactivated
 
-        # -- PTT edge detection ------------------------------------------------
-        if has_ptt:
+            if ww_just_activated and playback is not None:
+                playback.clear()  # Interrupt Rio mid-sentence
+
+            if ww_just_deactivated:
+                # Wake word session ended — signal end of speech
+                try:
+                    await client.send_json({
+                        "type": "control", "action": "end_of_speech",
+                    })
+                except ConnectionError:
+                    pass
+                continue
+
+        # -- Determine audio gate -----------------------------------------------
+        # Wake word LISTENING state overrides PTT entirely.
+        if ww_active:
+            # Wake word mode: audio flows without needing F2
+            pass  # Fall through to VAD gate and send
+        elif has_ptt:
+            # Normal PTT mode (wake word sleeping or unavailable)
             ptt_now = ptt.is_active
             ptt_just_pressed = ptt_now and not ptt_was_active
             ptt_just_released = not ptt_now and ptt_was_active
             ptt_was_active = ptt_now
 
             if ptt_just_pressed:
+                # Task abort: F2 during autonomous task cancels it
+                if task_active is not None and task_active.is_set():
+                    task_active.clear()
+                    log.info("task_abort.ptt", note="User pressed F2 during task")
+                    print("\n  ⛔ Task interrupted by user")
+                    try:
+                        await client.send_json({
+                            "type": "context",
+                            "subtype": "task_abort",
+                            "content": (
+                                "[SYSTEM: User pressed the interrupt key. STOP all "
+                                "autonomous actions immediately. Tell the user what "
+                                "you've accomplished so far.]"
+                            ),
+                        })
+                    except ConnectionError:
+                        pass
+
                 if has_vad:
                     vad.reset()
                 # Interrupt: clear playback buffer so Rio stops mid-sentence
@@ -605,10 +721,14 @@ async def audio_capture_loop(
             # Gate: skip audio if PTT key is not held
             if not ptt_now:
                 continue
+        else:
+            # No PTT and no wake word active — check if wake word is sleeping
+            if wake_word is not None and wake_word.available and not ww_active:
+                continue  # Wake word is sleeping, don't send audio
 
-        # -- VAD gate ----------------------------------------------------------
+        # -- VAD gate (async to avoid blocking audio I/O) --------------------
         if has_vad:
-            result = vad.process(chunk)
+            result = await vad.process_async(chunk)
             if not result.is_speech:
                 vad_was_speaking = False
                 continue
@@ -628,7 +748,10 @@ async def audio_capture_loop(
                 log.debug("audio_loop.progress", chunks_sent=chunks_sent)
         except ConnectionError:
             log.warning("audio_loop.send_failed", reason="disconnected")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
+            # Wait for reconnection before resuming
+            while not client.is_connected:
+                await asyncio.sleep(0.5)
         except Exception:
             log.exception("audio_loop.error")
             await asyncio.sleep(0.1)
@@ -642,6 +765,8 @@ async def screen_capture_loop(
     client: WSClient,
     screen: "ScreenCapture",
     autonomous_mode: asyncio.Event,
+    screen_navigator=None,
+    task_active: asyncio.Event | None = None,
 ) -> None:
     """Periodically capture the screen and send as binary vision frames.
 
@@ -649,18 +774,55 @@ async def screen_capture_loop(
     sleeps until the mode is toggled (via F5 or voice command), saving
     Gemini API credits.
 
+    When task_active is set (autonomous task in progress), periodic captures
+    are suppressed — auto-capture after each screen action handles it instead.
+
     Uses delta detection to skip unchanged frames. The interval is
     derived from ``vision.fps`` in config.yaml (default: 1 frame / 3s).
+
+    Backpressure: Uses a bounded queue (maxsize=2) so that if Gemini is
+    slow processing frames, old frames are dropped instead of queuing
+    unboundedly and leaking memory.
     """
     interval = screen.interval
     frames_sent = 0
+    # Bounded queue prevents memory leak when processing is slower than capture
+    pending_frames: asyncio.Queue = asyncio.Queue(maxsize=2)
+
+    async def _sender():
+        """Drain the bounded queue and send frames to cloud."""
+        nonlocal frames_sent
+        while True:
+            jpeg = await pending_frames.get()
+            try:
+                await client.send_binary(IMAGE_PREFIX + jpeg)
+                frames_sent += 1
+                if frames_sent % 10 == 0:
+                    log.debug(
+                        "screen_loop.progress",
+                        frames_sent=frames_sent,
+                        frame_kb=round(len(jpeg) / 1024, 1),
+                    )
+            except ConnectionError:
+                log.debug("screen_loop.send_failed", reason="disconnected")
+            except Exception:
+                log.exception("screen_loop.send_error")
+
+    # Start sender task
+    asyncio.create_task(_sender())
 
     while True:
         # Block here until autonomous mode is activated
         await autonomous_mode.wait()
         await asyncio.sleep(interval)
 
+        # Skip periodic capture during autonomous task — auto-capture handles it
+        if task_active is not None and task_active.is_set():
+            continue
+
         if not client.is_connected:
+            log.debug("screen_loop.waiting_reconnect")
+            await asyncio.sleep(2)
             continue
 
         try:
@@ -668,16 +830,21 @@ async def screen_capture_loop(
             if jpeg is None:
                 continue  # unchanged frame — delta detected
 
-            await client.send_binary(IMAGE_PREFIX + jpeg)
-            frames_sent += 1
-            if frames_sent % 10 == 0:
-                log.debug(
-                    "screen_loop.progress",
-                    frames_sent=frames_sent,
-                    frame_kb=round(len(jpeg) / 1024, 1),
-                )
+            # Sync monitor offset to screen navigator for coordinate mapping
+            if screen_navigator is not None:
+                cr = screen.get_last_capture_result()
+                if cr is not None:
+                    screen_navigator.update_monitor_offset(cr.monitor_left, cr.monitor_top)
+
+            # Backpressure: drop frame if queue is full (processing too slow)
+            try:
+                pending_frames.put_nowait(jpeg)
+            except asyncio.QueueFull:
+                log.debug("screen_loop.frame_dropped", reason="backpressure")
+
         except ConnectionError:
             log.debug("screen_loop.send_failed", reason="disconnected")
+            await asyncio.sleep(2)
         except Exception:
             log.exception("screen_loop.error")
             await asyncio.sleep(1)
@@ -755,6 +922,85 @@ async def screen_mode_toggle_loop(
             log.info("screen_mode.toggled", mode="autonomous")
 
         print(f"\n  [screen mode: {mode_label}]")
+        print("  You: ", end="", flush=True)
+        await trigger.wait_for_release()
+
+
+# ---------------------------------------------------------------------------
+# Live Mode toggle loop — F6 toggles full autonomous agentic mode
+# ---------------------------------------------------------------------------
+
+async def live_mode_toggle_loop(
+    trigger: "PushToTalk",
+    autonomous_mode: asyncio.Event,
+    wake_word=None,
+    client: WSClient | None = None,
+) -> None:
+    """F6: Toggle Live Mode (full autonomous agentic behavior).
+
+    When ON:
+      - autonomous_mode.set() (continuous screen capture)
+      - Wake word forced to LISTENING (always accepts audio)
+      - Sends notification to cloud about mode change
+
+    When OFF:
+      - autonomous_mode.clear() (on-demand screen only)
+      - Wake word returns to normal SLEEPING cycle
+      - Sends notification to cloud
+    """
+    live_active = False
+
+    while True:
+        await trigger.wait_for_press()
+        live_active = not live_active
+
+        if live_active:
+            autonomous_mode.set()
+            if wake_word is not None and wake_word.available:
+                wake_word.force_activate()
+
+            print("\n  ⚡ LIVE MODE ON — autonomous screen + voice + navigation")
+            print("  [Press F6 to exit Live Mode]")
+            log.info("live_mode.activated")
+
+            # Notify cloud so Gemini knows to be proactive
+            if client is not None:
+                try:
+                    await client.send_json({
+                        "type": "context",
+                        "subtype": "mode_change",
+                        "content": (
+                            "[SYSTEM: Live Mode activated. You now receive continuous "
+                            "screen frames every 3 seconds. Be proactive — describe what "
+                            "you see, point out errors, suggest improvements. The user "
+                            "wants you actively watching and helping. Don't wait to be "
+                            "asked. If you see something wrong, say it.]"
+                        ),
+                    })
+                except ConnectionError:
+                    pass
+        else:
+            autonomous_mode.clear()
+            if wake_word is not None and wake_word.available:
+                wake_word.force_deactivate()
+
+            print("\n  💤 LIVE MODE OFF — on-demand mode, say 'Rio' to activate")
+            log.info("live_mode.deactivated")
+
+            if client is not None:
+                try:
+                    await client.send_json({
+                        "type": "context",
+                        "subtype": "mode_change",
+                        "content": (
+                            "[SYSTEM: Live Mode deactivated. Screen capture is now "
+                            "on-demand only. Wait for the user to ask before analyzing "
+                            "their screen. Respond only when spoken to.]"
+                        ),
+                    })
+                except ConnectionError:
+                    pass
+
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
 
@@ -1134,6 +1380,7 @@ async def main() -> None:
 
     # -- Initialize screen mode (on-demand vs autonomous) ----------------------
     autonomous_mode = asyncio.Event()
+    task_active = asyncio.Event()  # Set during autonomous task execution
     if config.vision.default_mode == "autonomous":
         autonomous_mode.set()
         screen_mode_label = "autonomous"
@@ -1163,6 +1410,33 @@ async def main() -> None:
         print(f"  Tools: read_file, write_file, patch_file, run_command")
     else:
         print("  Tools: disabled (tools module not found)")
+
+    # -- Initialize screen navigator ------------------------------------------
+    screen_navigator = None
+    if ScreenNavigator is not None:
+        try:
+            screen_navigator = ScreenNavigator(
+                resize_factor=config.vision.resize_factor,
+            )
+            if screen_navigator.available:
+                log.info("screen_nav.ready", resize_factor=config.vision.resize_factor)
+                print("  Screen Nav: click, type, scroll, hotkey, drag, windows")
+                # Attach to tool executor so tool calls get routed
+                if tool_executor is not None:
+                    tool_executor.set_screen_navigator(screen_navigator)
+                    # Attach screen capture for auto-capture after screen actions
+                    if screen is not None:
+                        tool_executor.set_screen_capture(screen)
+            else:
+                log.warning("screen_nav.unavailable")
+                print("  Screen Nav: unavailable (install pyautogui)")
+                screen_navigator = None
+        except Exception:
+            log.exception("screen_nav.init_failed")
+            print("  Screen Nav: init failed")
+            screen_navigator = None
+    else:
+        print("  Screen Nav: disabled (screen_navigator module not found)")
 
     # -- Initialize struggle detector (L4) ------------------------------------
     struggle_detector = None
@@ -1320,6 +1594,10 @@ async def main() -> None:
         on_disconnect=lambda: log.warning("event.disconnected"),
     )
 
+    # -- Attach WebSocket sender to tool executor for auto-capture ---------
+    if tool_executor is not None:
+        tool_executor.set_ws_sender(client.send_binary)
+
     # -- Initialise OCR engine (L4 enhancement) ----------------------------
     ocr_engine = None
     if OCREngine is not None and struggle_detector is not None:
@@ -1373,7 +1651,11 @@ async def main() -> None:
         receive_loop(client, playback, tool_executor, struggle_detector,
                      screen, memory_store, session_ready=session_ready,
                      chat_store=chat_store, session_id=session_id,
-                     pattern_model=pattern_model, ml_manager=ml_manager),
+                     pattern_model=pattern_model, ml_manager=ml_manager,
+                     screen_navigator=screen_navigator,
+                     autonomous_mode=autonomous_mode,
+                     task_active=task_active,
+                     wake_word=wake_word),
         name="recv",
     ))
     tasks.add(asyncio.create_task(
@@ -1387,7 +1669,7 @@ async def main() -> None:
     if capture is not None:
         tasks.add(asyncio.create_task(
             audio_capture_loop(client, capture, ptt, vad_instance, playback,
-                               wake_word=wake_word),
+                               wake_word=wake_word, task_active=task_active),
             name="audio",
         ))
 
@@ -1400,7 +1682,10 @@ async def main() -> None:
 
     if screen is not None:
         tasks.add(asyncio.create_task(
-            screen_capture_loop(client, screen, autonomous_mode), name="screen"
+            screen_capture_loop(client, screen, autonomous_mode,
+                                screen_navigator=screen_navigator,
+                                task_active=task_active),
+            name="screen",
         ))
 
     if screenshot_trigger is not None and screen is not None:
@@ -1433,6 +1718,21 @@ async def main() -> None:
             screen_mode_toggle_loop(screen_mode_trigger, autonomous_mode),
             name="screen_mode",
         ))
+
+    # Live Mode toggle loop (F6)
+    live_mode_trigger = None
+    if PushToTalk is not None and screen is not None:
+        live_mode_trigger = PushToTalk.create(key_name=config.hotkeys.live_mode)
+        if live_mode_trigger is not None:
+            live_mode_trigger.start(asyncio.get_running_loop())
+            print(f"  [press {config.hotkeys.live_mode.upper()} for Live Mode (autonomous agentic)]")
+            tasks.add(asyncio.create_task(
+                live_mode_toggle_loop(
+                    live_mode_trigger, autonomous_mode,
+                    wake_word=wake_word, client=client,
+                ),
+                name="live_mode",
+            ))
 
     # -- Send startup greeting -------------------------------------------------
     try:

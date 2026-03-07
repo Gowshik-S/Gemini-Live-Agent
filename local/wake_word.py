@@ -38,6 +38,13 @@ log = structlog.get_logger(__name__)
 # Wake word phrases to detect (lowercase)
 WAKE_PHRASES = {"rio", "hey rio", "hi rio", "ok rio", "yo rio"}
 
+# Phrases that deactivate listening (lowercase substrings)
+EXIT_PHRASES = {
+    "exit live mode", "stop listening", "goodbye rio", "bye rio",
+    "go to sleep", "goodnight rio", "exit listening",
+    "stop live mode", "deactivate",
+}
+
 # Try to import lightweight speech recognition for local wake word
 _vosk_available = False
 _vosk_model = None
@@ -83,11 +90,11 @@ class WakeWordDetector:
     """
     
     # Configuration
-    ENERGY_THRESHOLD = 500          # RMS energy threshold for voice activity
+    ENERGY_THRESHOLD = 800          # RMS energy threshold for voice activity
     ACTIVATION_WINDOW = 1.5         # seconds of audio to buffer for wake word
-    SILENCE_TIMEOUT = 8.0           # seconds of silence before deactivating
+    SILENCE_TIMEOUT = 30.0          # seconds of silence before deactivating (fallback)
     COOLDOWN_DURATION = 1.0         # seconds before listening for wake word again
-    WAKE_ENERGY_MULTIPLIER = 2.0    # Energy must be 2x ambient to trigger
+    WAKE_ENERGY_MULTIPLIER = 3.0    # Energy must be 3x ambient to trigger
     
     def __init__(
         self,
@@ -236,7 +243,7 @@ class WakeWordDetector:
                     self._audio_buffer.append(pcm_bytes)
                     # After accumulating enough speech frames, assume wake word
                     # (Gemini will do the actual recognition)
-                    if len(self._audio_buffer) >= 3:  # ~300ms of speech
+                    if len(self._audio_buffer) >= 5:  # ~500ms of sustained speech
                         detected = True
                         self._audio_buffer.clear()
                 else:
@@ -247,7 +254,7 @@ class WakeWordDetector:
                 self._activation_time = now
                 self._last_speech_time = now
                 log.info("wake_word.activated", energy=round(energy, 1))
-                print("\n  [Rio activated — listening...]")
+                print("\n  [Rio activated — listening continuously. Say 'stop listening' or 'goodbye Rio' to deactivate]")
                 print("  You: ", end="", flush=True)
                 return WakeWordResult(
                     state=WakeWordState.LISTENING,
@@ -335,8 +342,17 @@ class WakeWordDetector:
         self._cooldown_until = time.monotonic() + self.COOLDOWN_DURATION
     
     def keep_alive(self) -> None:
-        """Reset the silence timer (call when user sends text input)."""
+        """Reset the silence timer (call when audio activity occurs — user speech, Gemini playback, etc.)."""
         self._last_speech_time = time.monotonic()
+
+    def check_exit_phrase(self, text: str) -> bool:
+        """Check if text contains an exit phrase. If so, deactivate and return True."""
+        lower = text.lower().strip()
+        if any(phrase in lower for phrase in EXIT_PHRASES):
+            log.info("wake_word.exit_phrase_detected", text=lower[:80])
+            self.force_deactivate()
+            return True
+        return False
 
 
 class WakeWordResult:

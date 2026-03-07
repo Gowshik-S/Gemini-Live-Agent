@@ -25,6 +25,7 @@ rio:
     screenshot: "f3"
     toggle_proactive: "f4"
     screen_mode: "f5"
+    live_mode: "f6"
 
   # Voice Activity Detection (Day 5)
   vad:
@@ -36,7 +37,7 @@ rio:
     fps: 0.33                 # ~1 frame every 3 seconds
     quality: 60               # JPEG quality (0-100)
     resize_factor: 0.5        # downscale factor before sending
-    default_mode: "autonomous" # on_demand | autonomous (autonomous = always watching screen)
+    default_mode: "on_demand" # on_demand | autonomous (autonomous = always watching screen + auto-capture after actions)
 
   # Struggle detection settings (Layer 4+)
   struggle:
