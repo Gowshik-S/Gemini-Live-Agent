@@ -25,7 +25,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "rio_tasks.db")
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rio_tasks.db")
 MAX_STEP_RETRIES = 3
 
 

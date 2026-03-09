@@ -1,27 +1,48 @@
-# Secrets
+# Virtual environments
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and local secrets
 .env
 *.env
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Local data
-rio_memory/
-*.bak
+# Runtime data
+data/*
+!data/.gitkeep
+data/memory/*
+!data/memory/.gitkeep
+logs/*.log
+!logs/.gitkeep
+output/creative/*
+!output/creative/.gitkeep
 *.db
 
-# IDE
+# Local backup and temp files
+*.rio.bak
+*.bak
+
+# IDE / OS artifacts
 .vscode/
 .idea/
-tests/*
-tests/**/*
-
-# Virtual environments
-venv/
-*/venv/
-cloud/venv/
-local/venv/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

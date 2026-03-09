@@ -20,7 +20,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "rio_chats.db")
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rio_chats.db")
 
 
 @dataclass

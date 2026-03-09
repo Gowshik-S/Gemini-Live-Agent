@@ -49,7 +49,7 @@ rio:
 
   # Local memory / RAG settings (Layer 5+)
   memory:
-    db_path: "./rio_memory"
+    db_path: "./data/memory"
     max_recall: 5             # max memory entries to inject into context
 
   # Model selection & fallback

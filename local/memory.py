@@ -37,7 +37,7 @@ except ImportError:
 
 
 # ── Constants ─────────────────────────────────────────────────────────
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "rio_memory")
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "memory")
 DEFAULT_COLLECTION = "rio_interactions"
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 MAX_RECALL = 5

@@ -1,0 +1,2 @@
+# Runtime data directory — gitignored.
+# Created at runtime by Rio. Do not commit any .db or vector-store files here.

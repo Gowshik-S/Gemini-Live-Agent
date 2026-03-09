@@ -27,7 +27,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "rio_patterns.db")
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "rio_patterns.db")
 
 # Time-of-day buckets (4-hour windows)
 TIME_BUCKETS = {

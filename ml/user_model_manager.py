@@ -56,7 +56,7 @@ log = structlog.get_logger(__name__)
 
 # Paths
 _BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # rio/
-DEFAULT_DB_PATH = os.path.join(_BASE_DIR, "rio_patterns.db")
+DEFAULT_DB_PATH = os.path.join(_BASE_DIR, "data", "rio_patterns.db")
 DEFAULT_MODELS_DIR = os.path.join(_BASE_DIR, "ml", "models")
 DEFAULT_MODEL_PATH = os.path.join(DEFAULT_MODELS_DIR, "user_default.pkl")
 
