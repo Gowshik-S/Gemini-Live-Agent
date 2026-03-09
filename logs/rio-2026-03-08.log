@@ -1,0 +1,203 @@
+{"ts": "2026-03-08T14:10:34.291992Z", "level": "info", "sub": "rio", "event": "vad.loading", "source": "torch.hub"}
+{"ts": "2026-03-08T14:10:34.497677Z", "level": "warning", "sub": "rio", "event": "vad.torch_not_installed", "note": "Install torch for VAD. Falling back to no-VAD mode."}
+{"ts": "2026-03-08T14:10:34.514686Z", "level": "info", "sub": "rio", "event": "screen_capture.init", "fps": 0.33, "quality": 85, "resize_factor": 0.75, "interval_s": 3.03}
+{"ts": "2026-03-08T14:10:34.516688Z", "level": "info", "sub": "rio", "event": "tools.init", "working_dir": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local"}
+{"ts": "2026-03-08T14:10:34.517684Z", "level": "info", "sub": "rio", "event": "screen_nav.dpi_aware"}
+{"ts": "2026-03-08T14:10:34.518684Z", "level": "info", "sub": "rio", "event": "screen_nav.init", "resize_factor": 0.75, "dpi_aware": true, "failsafe": true}
+{"ts": "2026-03-08T14:10:34.519681Z", "level": "info", "sub": "rio", "event": "tools.screen_navigator_attached"}
+{"ts": "2026-03-08T14:10:34.519681Z", "level": "info", "sub": "rio", "event": "tools.screen_capture_attached"}
+{"ts": "2026-03-08T14:10:34.519681Z", "level": "info", "sub": "rio", "event": "struggle.init", "enabled": true, "demo_mode": false, "threshold": 0.85, "cooldown": 300, "min_signals": 2}
+{"ts": "2026-03-08T14:10:34.520683Z", "level": "info", "sub": "rio", "event": "memory.loading_model", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T14:10:38.928362Z", "level": "info", "sub": "rio", "event": "memory.model_loaded", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T14:10:40.361537Z", "level": "info", "sub": "rio", "event": "memory.ready", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local\\rio_memory", "entries": 58}
+{"ts": "2026-03-08T14:10:40.364534Z", "level": "info", "sub": "rio", "event": "wake_word.vosk_no_model", "note": "Download a model: vosk.org/models. Place in ~/.rio/vosk-model-small-en-us"}
+{"ts": "2026-03-08T14:10:40.365537Z", "level": "info", "sub": "rio", "event": "wake_word.init", "enabled": true, "mode": "energy", "energy_threshold": 800, "silence_timeout": 30.0}
+{"ts": "2026-03-08T14:10:40.381529Z", "level": "info", "sub": "rio", "event": "chat_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_chats.db"}
+{"ts": "2026-03-08T14:10:40.387531Z", "level": "info", "sub": "rio", "event": "chat_store.session_started", "session_id": "b4953266"}
+{"ts": "2026-03-08T14:10:40.391532Z", "level": "info", "sub": "rio", "event": "user_pattern.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_patterns.db", "total_events": 51}
+{"ts": "2026-03-08T14:10:40.431562Z", "level": "info", "sub": "rio", "event": "ml.model.loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "samples": 500, "version": "1.0.0"}
+{"ts": "2026-03-08T14:10:40.433074Z", "level": "info", "sub": "rio", "event": "ml.manager.model_loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl"}
+{"ts": "2026-03-08T14:10:40.446085Z", "level": "info", "sub": "rio", "event": "ml.manager.init", "user_id": "default", "model_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "model_loaded": true, "db_connected": true}
+{"ts": "2026-03-08T14:10:40.447084Z", "level": "warning", "sub": "rio", "event": "ml.train_history.no_activity_table"}
+{"ts": "2026-03-08T14:10:40.453085Z", "level": "info", "sub": "rio", "event": "task_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_tasks.db"}
+{"ts": "2026-03-08T14:10:40.453085Z", "level": "info", "sub": "rio", "event": "tools.ws_sender_attached"}
+{"ts": "2026-03-08T14:10:42.063734Z", "level": "info", "sub": "rio", "event": "ocr.init", "engine": "rapidocr-onnxruntime"}
+{"ts": "2026-03-08T14:10:42.065736Z", "level": "info", "sub": "rio", "event": "ws.connecting", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T14:10:45.169643Z", "level": "info", "sub": "rio", "event": "ws.connected", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T14:10:45.170642Z", "level": "info", "sub": "rio", "event": "audio.wasapi_enabled", "exclusive": false}
+{"ts": "2026-03-08T14:10:45.170642Z", "level": "info", "sub": "rio", "event": "audio.starting", "sample_rate": 16000, "block_size": 320, "device": null, "latency": "low", "wasapi": true}
+{"ts": "2026-03-08T14:10:45.172646Z", "level": "warning", "sub": "rio", "event": "audio.wasapi_failed_retrying", "error": "Error opening InputStream: Incompatible host API specific stream info [PaErrorCode -9984]", "device": null}
+{"ts": "2026-03-08T14:10:45.744032Z", "level": "info", "sub": "rio", "event": "audio.started", "latency": 0.02}
+{"ts": "2026-03-08T14:10:45.756042Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f2"}
+{"ts": "2026-03-08T14:10:45.952516Z", "level": "info", "sub": "rio", "event": "playback.starting", "device": "Speakers (Realtek(R) Audio)", "input_rate": 24000, "output_rate": 44100, "resample_ratio": 1.8375, "engine": "pyaudio_blocking_write"}
+{"ts": "2026-03-08T14:10:46.020174Z", "level": "info", "sub": "rio", "event": "playback.started", "engine": "pyaudio_blocking_write", "device": "Speakers (Realtek(R) Audio)", "rate": 44100}
+{"ts": "2026-03-08T14:10:46.029177Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f3"}
+{"ts": "2026-03-08T14:10:46.042242Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f5"}
+{"ts": "2026-03-08T14:10:46.055476Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f6"}
+{"ts": "2026-03-08T14:10:46.056475Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.started"}
+{"ts": "2026-03-08T14:11:37.669293Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "find_window", "screenshot_coords": null, "real_coords": null, "details": {"query": "Chrome", "found": 0}}
+{"ts": "2026-03-08T14:11:37.669293Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "find_window", "success": true}
+{"ts": "2026-03-08T14:11:41.430510Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [200, 790], "real_coords": [266, 1053], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T14:11:41.431524Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T14:11:41.864249Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 178.8}
+{"ts": "2026-03-08T14:11:43.462161Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_e83b4740eeeb5e1a_1772979101", "type": "tool_use", "length": 44}
+{"ts": "2026-03-08T14:12:01.270888Z", "level": "info", "sub": "rio", "event": "tool.run_command", "command": "start chrome"}
+{"ts": "2026-03-08T14:12:01.693246Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "run_command", "success": true}
+{"ts": "2026-03-08T14:12:01.781594Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_1760c54e19f5d910_1772979121", "type": "tool_use", "length": 51}
+{"ts": "2026-03-08T14:12:06.170163Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}
+{"ts": "2026-03-08T14:12:06.989356Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [650, 50], "real_coords": [866, 66], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T14:12:06.996932Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T14:12:07.470920Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 129.7}
+{"ts": "2026-03-08T14:12:11.442441Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_f15dddfb1fdec597_1772979127", "type": "tool_use", "length": 43}
+{"ts": "2026-03-08T14:12:15.064268Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "type_text", "screenshot_coords": null, "real_coords": null, "details": {"length": 12}}
+{"ts": "2026-03-08T14:12:15.078347Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_type", "success": true}
+{"ts": "2026-03-08T14:12:15.545882Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_type", "size_kb": 72.7}
+{"ts": "2026-03-08T14:12:19.718215Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "hotkey", "screenshot_coords": null, "real_coords": null, "details": {"keys": ["enter"]}}
+{"ts": "2026-03-08T14:12:19.718215Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_hotkey", "success": true}
+{"ts": "2026-03-08T14:12:20.115590Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_hotkey", "size_kb": 69.7}
+{"ts": "2026-03-08T14:12:22.701669Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [300, 25], "real_coords": [400, 33], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T14:12:22.703191Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T14:12:23.174662Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 54.5}
+{"ts": "2026-03-08T14:12:25.794824Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_e28f6e2c3f354e33_1772979143", "type": "tool_use", "length": 43}
+{"ts": "2026-03-08T14:12:31.130181Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}
+{"ts": "2026-03-08T14:12:31.308505Z", "level": "warning", "sub": "rio", "event": "ml.incremental_train.failed", "error": "classes should have valid labels that are in y"}
+{"ts": "2026-03-08T14:12:32.339859Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "type_text", "screenshot_coords": null, "real_coords": null, "details": {"length": 11}}
+{"ts": "2026-03-08T14:12:32.353431Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_type", "success": true}
+{"ts": "2026-03-08T14:12:32.898369Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_type", "size_kb": 143.7}
+{"ts": "2026-03-08T14:12:36.512605Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_905cbda970d7ad3d_1772979152", "type": "tool_use", "length": 45}
+{"ts": "2026-03-08T14:12:40.912983Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "hotkey", "screenshot_coords": null, "real_coords": null, "details": {"keys": ["enter"]}}
+{"ts": "2026-03-08T14:12:40.912983Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_hotkey", "success": true}
+{"ts": "2026-03-08T14:12:41.305383Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_hotkey", "size_kb": 143.3}
+{"ts": "2026-03-08T14:15:43.349961Z", "level": "info", "sub": "rio", "event": "wake_word.deactivated", "reason": "silence_timeout", "listened_for": 272.6}
+{"ts": "2026-03-08T14:15:48.585446Z", "level": "warning", "sub": "rio", "event": "ml.incremental_train.failed", "error": "classes should have valid labels that are in y"}
+{"ts": "2026-03-08T14:19:58.333313Z", "level": "warning", "sub": "rio", "event": "ml.incremental_train.failed", "error": "classes should have valid labels that are in y"}
+{"ts": "2026-03-08T14:20:00.132833Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.ended"}
+{"ts": "2026-03-08T14:20:21.680846Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}
+{"ts": "2026-03-08T14:59:23.316505Z", "level": "info", "sub": "rio", "event": "vad.loading", "source": "torch.hub"}
+{"ts": "2026-03-08T14:59:23.861494Z", "level": "warning", "sub": "rio", "event": "vad.torch_not_installed", "note": "Install torch for VAD. Falling back to no-VAD mode."}
+{"ts": "2026-03-08T14:59:23.875501Z", "level": "info", "sub": "rio", "event": "screen_capture.init", "fps": 0.33, "quality": 85, "resize_factor": 0.75, "interval_s": 3.03}
+{"ts": "2026-03-08T14:59:23.877506Z", "level": "info", "sub": "rio", "event": "tools.init", "working_dir": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local"}
+{"ts": "2026-03-08T14:59:23.878494Z", "level": "info", "sub": "rio", "event": "screen_nav.dpi_aware"}
+{"ts": "2026-03-08T14:59:23.878494Z", "level": "info", "sub": "rio", "event": "screen_nav.init", "resize_factor": 0.75, "dpi_aware": true, "failsafe": true}
+{"ts": "2026-03-08T14:59:23.879494Z", "level": "info", "sub": "rio", "event": "tools.screen_navigator_attached"}
+{"ts": "2026-03-08T14:59:23.879494Z", "level": "info", "sub": "rio", "event": "tools.screen_capture_attached"}
+{"ts": "2026-03-08T14:59:23.880490Z", "level": "info", "sub": "rio", "event": "struggle.init", "enabled": true, "demo_mode": false, "threshold": 0.85, "cooldown": 300, "min_signals": 2}
+{"ts": "2026-03-08T14:59:23.880490Z", "level": "info", "sub": "rio", "event": "memory.loading_model", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T14:59:28.443091Z", "level": "info", "sub": "rio", "event": "memory.model_loaded", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T14:59:28.823750Z", "level": "info", "sub": "rio", "event": "memory.ready", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local\\rio_memory", "entries": 63}
+{"ts": "2026-03-08T14:59:28.825750Z", "level": "info", "sub": "rio", "event": "wake_word.vosk_no_model", "note": "Download a model: vosk.org/models. Place in ~/.rio/vosk-model-small-en-us"}
+{"ts": "2026-03-08T14:59:28.825750Z", "level": "info", "sub": "rio", "event": "wake_word.init", "enabled": true, "mode": "energy", "energy_threshold": 800, "silence_timeout": 30.0}
+{"ts": "2026-03-08T14:59:28.839750Z", "level": "info", "sub": "rio", "event": "chat_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_chats.db"}
+{"ts": "2026-03-08T14:59:28.845754Z", "level": "info", "sub": "rio", "event": "chat_store.session_started", "session_id": "f6a682b9"}
+{"ts": "2026-03-08T14:59:28.851754Z", "level": "info", "sub": "rio", "event": "user_pattern.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_patterns.db", "total_events": 52}
+{"ts": "2026-03-08T14:59:28.870743Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "struggle_risk", "estimator": "sgd"}
+{"ts": "2026-03-08T14:59:28.870743Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "struggle_risk", "estimator": "pac"}
+{"ts": "2026-03-08T14:59:28.870743Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "chat_style", "estimator": "sgd"}
+{"ts": "2026-03-08T14:59:28.870743Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "chat_style", "estimator": "pac"}
+{"ts": "2026-03-08T14:59:28.870743Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "engagement", "estimator": "sgd"}
+{"ts": "2026-03-08T14:59:28.871751Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "engagement", "estimator": "pac"}
+{"ts": "2026-03-08T14:59:28.871751Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "mood", "estimator": "sgd"}
+{"ts": "2026-03-08T14:59:28.871751Z", "level": "info", "sub": "rio", "event": "ml.ensemble.class_weight_normalized", "target": "mood", "estimator": "pac"}
+{"ts": "2026-03-08T14:59:28.871751Z", "level": "info", "sub": "rio", "event": "ml.model.loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "samples": 500, "version": "1.0.0", "normalized_targets": ["struggle_risk", "chat_style", "engagement", "mood"]}
+{"ts": "2026-03-08T14:59:28.871751Z", "level": "info", "sub": "rio", "event": "ml.manager.model_loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl"}
+{"ts": "2026-03-08T14:59:28.887748Z", "level": "info", "sub": "rio", "event": "ml.manager.init", "user_id": "default", "model_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "model_loaded": true, "db_connected": true}
+{"ts": "2026-03-08T14:59:28.888746Z", "level": "warning", "sub": "rio", "event": "ml.train_history.no_activity_table"}
+{"ts": "2026-03-08T14:59:28.890749Z", "level": "info", "sub": "rio", "event": "task_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_tasks.db"}
+{"ts": "2026-03-08T14:59:28.890749Z", "level": "info", "sub": "rio", "event": "tools.ws_sender_attached"}
+{"ts": "2026-03-08T14:59:29.697826Z", "level": "info", "sub": "rio", "event": "ocr.init", "engine": "rapidocr-onnxruntime"}
+{"ts": "2026-03-08T14:59:29.698826Z", "level": "info", "sub": "rio", "event": "ws.connecting", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T14:59:32.479725Z", "level": "info", "sub": "rio", "event": "ws.connected", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T14:59:32.480727Z", "level": "info", "sub": "rio", "event": "audio.wasapi_enabled", "exclusive": false}
+{"ts": "2026-03-08T14:59:32.481734Z", "level": "info", "sub": "rio", "event": "audio.starting", "sample_rate": 16000, "block_size": 320, "device": null, "latency": "low", "wasapi": true}
+{"ts": "2026-03-08T14:59:32.481734Z", "level": "warning", "sub": "rio", "event": "audio.wasapi_failed_retrying", "error": "Error opening InputStream: Incompatible host API specific stream info [PaErrorCode -9984]", "device": null}
+{"ts": "2026-03-08T14:59:33.017578Z", "level": "info", "sub": "rio", "event": "audio.started", "latency": 0.02}
+{"ts": "2026-03-08T14:59:33.025780Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f2"}
+{"ts": "2026-03-08T14:59:33.102719Z", "level": "info", "sub": "rio", "event": "playback.starting", "device": "Speakers (Realtek(R) Audio)", "input_rate": 24000, "output_rate": 44100, "resample_ratio": 1.8375, "engine": "pyaudio_blocking_write"}
+{"ts": "2026-03-08T14:59:33.159153Z", "level": "info", "sub": "rio", "event": "playback.started", "engine": "pyaudio_blocking_write", "device": "Speakers (Realtek(R) Audio)", "rate": 44100}
+{"ts": "2026-03-08T14:59:33.166671Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f3"}
+{"ts": "2026-03-08T14:59:33.178200Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f5"}
+{"ts": "2026-03-08T14:59:33.191192Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f6"}
+{"ts": "2026-03-08T14:59:33.192200Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.started"}
+{"ts": "2026-03-08T14:59:45.365694Z", "level": "info", "sub": "rio", "event": "wake_word.activated", "energy": "2663.2"}
+{"ts": "2026-03-08T15:00:09.857979Z", "level": "info", "sub": "rio", "event": "chat_store.session_ended", "session_id": "f6a682b9"}
+{"ts": "2026-03-08T15:00:09.859479Z", "level": "info", "sub": "rio", "event": "ml.train_on_session.skipped", "reason": "too_few_messages", "count": 0}
+{"ts": "2026-03-08T15:00:09.863479Z", "level": "info", "sub": "rio", "event": "ml.model.saved", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "samples": 500}
+{"ts": "2026-03-08T15:00:09.873008Z", "level": "info", "sub": "rio", "event": "ml.manager.closed", "user_id": "default"}
+{"ts": "2026-03-08T15:00:09.874008Z", "level": "info", "sub": "rio", "event": "ptt.stopped"}
+{"ts": "2026-03-08T15:00:09.875009Z", "level": "info", "sub": "rio", "event": "ptt.stopped"}
+{"ts": "2026-03-08T15:00:09.875009Z", "level": "info", "sub": "rio", "event": "ptt.stopped"}
+{"ts": "2026-03-08T15:00:09.875009Z", "level": "info", "sub": "rio", "event": "ptt.stopped"}
+{"ts": "2026-03-08T15:00:10.245160Z", "level": "info", "sub": "rio", "event": "audio.stopped"}
+{"ts": "2026-03-08T15:00:10.637526Z", "level": "info", "sub": "rio", "event": "playback.stopped"}
+{"ts": "2026-03-08T15:00:10.642007Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.ended"}
+{"ts": "2026-03-08T15:00:10.645599Z", "level": "info", "sub": "rio", "event": "ws.closed"}
+{"ts": "2026-03-08T15:00:10.649596Z", "level": "info", "sub": "rio", "event": "orchestrator.closed", "component": "orchestrator"}
+{"ts": "2026-03-08T16:15:47.879243Z", "level": "info", "sub": "rio", "event": "vad.loading", "source": "torch.hub"}
+{"ts": "2026-03-08T16:15:48.061321Z", "level": "warning", "sub": "rio", "event": "vad.torch_not_installed", "note": "Install torch for VAD. Falling back to no-VAD mode."}
+{"ts": "2026-03-08T16:15:48.074321Z", "level": "info", "sub": "rio", "event": "screen_capture.init", "fps": 0.33, "quality": 85, "resize_factor": 0.75, "interval_s": 3.03}
+{"ts": "2026-03-08T16:15:48.075323Z", "level": "info", "sub": "rio", "event": "tools.init", "working_dir": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local"}
+{"ts": "2026-03-08T16:15:48.075323Z", "level": "info", "sub": "rio", "event": "screen_nav.dpi_aware"}
+{"ts": "2026-03-08T16:15:48.076319Z", "level": "info", "sub": "rio", "event": "screen_nav.init", "resize_factor": 0.75, "dpi_aware": true, "failsafe": true}
+{"ts": "2026-03-08T16:15:48.076319Z", "level": "info", "sub": "rio", "event": "tools.screen_navigator_attached"}
+{"ts": "2026-03-08T16:15:48.076319Z", "level": "info", "sub": "rio", "event": "tools.screen_capture_attached"}
+{"ts": "2026-03-08T16:15:48.076319Z", "level": "info", "sub": "rio", "event": "struggle.init", "enabled": true, "demo_mode": false, "threshold": 0.85, "cooldown": 300, "min_signals": 2}
+{"ts": "2026-03-08T16:15:48.077322Z", "level": "info", "sub": "rio", "event": "memory.loading_model", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T16:15:52.658860Z", "level": "info", "sub": "rio", "event": "memory.model_loaded", "model": "BAAI/bge-small-en-v1.5"}
+{"ts": "2026-03-08T16:15:53.078516Z", "level": "info", "sub": "rio", "event": "memory.ready", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\local\\rio_memory", "entries": 63}
+{"ts": "2026-03-08T16:15:53.081509Z", "level": "info", "sub": "rio", "event": "wake_word.vosk_no_model", "note": "Download a model: vosk.org/models. Place in ~/.rio/vosk-model-small-en-us"}
+{"ts": "2026-03-08T16:15:53.081509Z", "level": "info", "sub": "rio", "event": "wake_word.init", "enabled": true, "mode": "energy", "energy_threshold": 800, "silence_timeout": 30.0}
+{"ts": "2026-03-08T16:15:53.098023Z", "level": "info", "sub": "rio", "event": "chat_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_chats.db"}
+{"ts": "2026-03-08T16:15:53.103533Z", "level": "info", "sub": "rio", "event": "chat_store.session_started", "session_id": "f04f3b6c"}
+{"ts": "2026-03-08T16:15:53.109542Z", "level": "info", "sub": "rio", "event": "user_pattern.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_patterns.db", "total_events": 54}
+{"ts": "2026-03-08T16:15:53.165543Z", "level": "info", "sub": "rio", "event": "ml.model.loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "samples": 500, "version": "1.0.1", "normalized_targets": []}
+{"ts": "2026-03-08T16:15:53.166535Z", "level": "info", "sub": "rio", "event": "ml.manager.model_loaded", "path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl"}
+{"ts": "2026-03-08T16:15:53.189544Z", "level": "info", "sub": "rio", "event": "ml.manager.init", "user_id": "default", "model_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\ml\\models\\user_default.pkl", "model_loaded": true, "db_connected": true}
+{"ts": "2026-03-08T16:15:53.189544Z", "level": "warning", "sub": "rio", "event": "ml.train_history.no_activity_table"}
+{"ts": "2026-03-08T16:15:53.192545Z", "level": "info", "sub": "rio", "event": "task_store.init", "db_path": "E:\\Drive - F\\Project\\Gemini-Live\\Rio-Agent\\rio\\rio_tasks.db"}
+{"ts": "2026-03-08T16:15:53.193544Z", "level": "info", "sub": "rio", "event": "tools.ws_sender_attached"}
+{"ts": "2026-03-08T16:15:54.111060Z", "level": "info", "sub": "rio", "event": "ocr.init", "engine": "rapidocr-onnxruntime"}
+{"ts": "2026-03-08T16:15:54.111060Z", "level": "info", "sub": "rio", "event": "ws.connecting", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T16:15:56.855210Z", "level": "info", "sub": "rio", "event": "ws.connected", "url": "ws://localhost:8080/ws/rio/live"}
+{"ts": "2026-03-08T16:15:56.856213Z", "level": "info", "sub": "rio", "event": "audio.wasapi_enabled", "exclusive": false}
+{"ts": "2026-03-08T16:15:56.856213Z", "level": "info", "sub": "rio", "event": "audio.starting", "sample_rate": 16000, "block_size": 320, "device": null, "latency": "low", "wasapi": true}
+{"ts": "2026-03-08T16:15:56.857210Z", "level": "warning", "sub": "rio", "event": "audio.wasapi_failed_retrying", "error": "Error opening InputStream: Incompatible host API specific stream info [PaErrorCode -9984]", "device": null}
+{"ts": "2026-03-08T16:15:57.433908Z", "level": "info", "sub": "rio", "event": "audio.started", "latency": 0.02}
+{"ts": "2026-03-08T16:15:57.441201Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f2"}
+{"ts": "2026-03-08T16:15:57.532799Z", "level": "info", "sub": "rio", "event": "playback.starting", "device": "Speakers (Realtek(R) Audio)", "input_rate": 24000, "output_rate": 44100, "resample_ratio": 1.8375, "engine": "pyaudio_blocking_write"}
+{"ts": "2026-03-08T16:15:57.585357Z", "level": "info", "sub": "rio", "event": "playback.started", "engine": "pyaudio_blocking_write", "device": "Speakers (Realtek(R) Audio)", "rate": 44100}
+{"ts": "2026-03-08T16:15:57.594871Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f3"}
+{"ts": "2026-03-08T16:15:57.607912Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f5"}
+{"ts": "2026-03-08T16:15:57.616911Z", "level": "info", "sub": "rio", "event": "ptt.started", "key": "f6"}
+{"ts": "2026-03-08T16:15:57.616911Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.started"}
+{"ts": "2026-03-08T16:16:31.453483Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "find_window", "screenshot_coords": null, "real_coords": null, "details": {"query": "WhatsApp", "found": 0}}
+{"ts": "2026-03-08T16:16:31.454691Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "find_window", "success": true}
+{"ts": "2026-03-08T16:16:32.327610Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_a7d87ef3fb501439_1772986591", "type": "tool_use", "length": 52}
+{"ts": "2026-03-08T16:16:34.941668Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [45, 788], "real_coords": [60, 1050], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T16:16:34.942669Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T16:16:35.374099Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 177.1}
+{"ts": "2026-03-08T16:16:35.919369Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_0f0c62e4068bc28e_1772986595", "type": "tool_use", "length": 43}
+{"ts": "2026-03-08T16:16:38.461414Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "type_text", "screenshot_coords": null, "real_coords": null, "details": {"length": 8}}
+{"ts": "2026-03-08T16:16:38.461414Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_type", "success": true}
+{"ts": "2026-03-08T16:16:38.698074Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_type", "size_kb": 179.3}
+{"ts": "2026-03-08T16:16:38.767190Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_9cfcfab376774226_1772986598", "type": "tool_use", "length": 42}
+{"ts": "2026-03-08T16:16:40.698312Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "hotkey", "screenshot_coords": null, "real_coords": null, "details": {"keys": ["enter"]}}
+{"ts": "2026-03-08T16:16:40.698312Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_hotkey", "success": true}
+{"ts": "2026-03-08T16:16:41.074815Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_hotkey", "size_kb": 179.2}
+{"ts": "2026-03-08T16:17:40.217684Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [45, 788], "real_coords": [60, 1050], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T16:17:40.218719Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T16:17:40.601830Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 181.3}
+{"ts": "2026-03-08T16:17:41.927906Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "type_text", "screenshot_coords": null, "real_coords": null, "details": {"length": 8}}
+{"ts": "2026-03-08T16:17:41.927906Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_type", "success": true}
+{"ts": "2026-03-08T16:17:42.312384Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_type", "size_kb": 180.8}
+{"ts": "2026-03-08T16:17:43.299631Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "hotkey", "screenshot_coords": null, "real_coords": null, "details": {"keys": ["enter"]}}
+{"ts": "2026-03-08T16:17:43.301159Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_hotkey", "success": true}
+{"ts": "2026-03-08T16:17:43.707031Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_hotkey", "size_kb": 181.7}
+{"ts": "2026-03-08T16:18:53.567025Z", "level": "info", "sub": "rio", "event": "screen_nav.action", "action": "click", "screenshot_coords": [230, 260], "real_coords": [306, 346], "button": "left", "clicks": 1}
+{"ts": "2026-03-08T16:18:53.571018Z", "level": "info", "sub": "rio", "event": "tool.executed", "name": "screen_click", "success": true}
+{"ts": "2026-03-08T16:18:53.817627Z", "level": "info", "sub": "rio", "event": "tool.auto_capture.sent", "action": "screen_click", "size_kb": 77.2}
+{"ts": "2026-03-08T16:18:54.778468Z", "level": "info", "sub": "rio", "event": "memory.stored", "id": "tool_use_05865a8d87a73cc0_1772986733", "type": "tool_use", "length": 44}
+{"ts": "2026-03-08T16:18:54.800001Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}
+{"ts": "2026-03-08T16:19:50.612916Z", "level": "info", "sub": "rio", "event": "wake_word.deactivated", "reason": "silence_timeout", "listened_for": 216.3}
+{"ts": "2026-03-08T16:21:55.540752Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}
+{"ts": "2026-03-08T16:22:13.534150Z", "level": "info", "sub": "rio", "event": "playback.drain_loop.ended"}
+{"ts": "2026-03-08T16:22:26.662147Z", "level": "warning", "sub": "rio", "event": "audio.callback_status", "status": "input overflow"}

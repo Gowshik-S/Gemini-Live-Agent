@@ -355,7 +355,11 @@ class UserModelManager:
             self._last_train_time = time.time()
             log.debug("ml.incremental_train", messages=len(self._session_messages))
         except Exception as e:
-            log.warning("ml.incremental_train.failed", error=str(e))
+            log.warning(
+                "ml.incremental_train.failed",
+                error=str(e),
+                labels={k: str(v[0]) for k, v in labels.items()},
+            )
 
     def train_on_session(self) -> Optional[dict]:
         """Train on the complete current session (called at session end).

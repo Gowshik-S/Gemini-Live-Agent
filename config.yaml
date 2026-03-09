@@ -35,8 +35,8 @@ rio:
   # Screen/vision capture settings (Layer 2+)
   vision:
     fps: 0.33                 # ~1 frame every 3 seconds
-    quality: 60               # JPEG quality (0-100)
-    resize_factor: 0.5        # downscale factor before sending
+    quality: 85               # JPEG quality (0-100)
+    resize_factor: 0.75       # downscale factor before sending
     default_mode: "on_demand" # on_demand | autonomous (autonomous = always watching screen + auto-capture after actions)
 
   # Struggle detection settings (Layer 4+)
@@ -52,11 +52,21 @@ rio:
     db_path: "./rio_memory"
     max_recall: 5             # max memory entries to inject into context
 
-  # Model selection
+  # Model selection & fallback
   models:
     primary: "gemini-2.5-flash"
     secondary: "gemini-2.5-pro-preview-03-25"
-    pro_rpm_budget: 5         # max requests-per-minute to the pro model
+    pro_rpm_budget: 5
+    fallback_chain:                   # models tried after primary fails
+      - "gemini-2.5-flash"
+    cooldown_seconds: 60.0            # seconds before retrying a failed model
+    timeout_seconds: 30.0             # per-request timeout
+
+  # Logging configuration
+  logging:
+    log_dir: "./logs"                 # directory for structured log files
+    verbose: false                    # show DEBUG-level output in console
+    max_files: 7                      # log rotation — keep last N days         # max requests-per-minute to the pro model
   # Skills configuration (Customer Care + Tutor)
   skills:
     customer_care:

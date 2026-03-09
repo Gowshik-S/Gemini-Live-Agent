@@ -247,6 +247,109 @@ def _get_profiles_mod():
 # Resolve profiles directory: same level as rio/ project root
 _profiles_base = str(Path(__file__).resolve().parent.parent / "rio_profiles")
 
+# Resolve config file path for config API
+_config_yaml_path = Path(__file__).resolve().parent.parent / "config.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Config API — read/write config.yaml from dashboard
+# ---------------------------------------------------------------------------
+@app.get("/api/config")
+async def get_config() -> dict:
+    """Return the full Rio configuration as JSON."""
+    import yaml
+    if not _config_yaml_path.exists():
+        return {"error": "Config file not found", "path": str(_config_yaml_path)}
+    try:
+        raw = yaml.safe_load(_config_yaml_path.read_text(encoding="utf-8")) or {}
+        return {"config": raw.get("rio", raw)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/config")
+async def save_config(request: Request) -> dict:
+    """Save partial config updates. Merges with existing config."""
+    import yaml
+    body = await request.json()
+    if not isinstance(body, dict):
+        return {"error": "Expected JSON object"}
+
+    try:
+        existing = {}
+        if _config_yaml_path.exists():
+            existing = yaml.safe_load(_config_yaml_path.read_text(encoding="utf-8")) or {}
+
+        rio_block = existing.get("rio", existing)
+
+        # Deep merge the updates
+        _deep_merge(rio_block, body)
+
+        with open(_config_yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump({"rio": rio_block}, f, default_flow_style=False, allow_unicode=True)
+
+        return {"status": "saved", "path": str(_config_yaml_path)}
+    except Exception as exc:
+        logger.error("config.save_error", error=str(exc))
+        return {"error": str(exc)}
+
+
+@app.get("/api/doctor")
+async def doctor_check() -> dict:
+    """Run system diagnostics and return status."""
+    import sys as _sys
+    checks = {}
+
+    # Config check
+    checks["config"] = {"status": "ok" if _config_yaml_path.exists() else "missing"}
+
+    # API key check
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    env_file = Path(__file__).resolve().parent / ".env"
+    if not api_key and env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("GEMINI_API_KEY="):
+                api_key = line.split("=", 1)[1].strip()
+                break
+    checks["api_key"] = {
+        "status": "ok" if api_key else "missing",
+        "hint": "Set GEMINI_API_KEY in rio/cloud/.env" if not api_key else None,
+    }
+
+    # Python version
+    checks["python"] = {
+        "version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+        "status": "ok" if _sys.version_info >= (3, 10) else "warning",
+    }
+
+    # Platform
+    checks["platform"] = {"os": _sys.platform}
+
+    return {"checks": checks}
+
+
+@app.get("/api/models/status")
+async def models_status() -> dict:
+    """Return current model routing and fallback status."""
+    stats = model_router.get_routing_stats() if model_router else {}
+    return {
+        "routing": stats,
+        "models": {
+            "flash": "gemini-2.5-flash",
+            "pro": "gemini-2.5-pro-preview-03-25",
+            "computer_use": "gemini-2.5-computer-use-preview",
+        },
+    }
+
+
+def _deep_merge(base: dict, updates: dict) -> None:
+    """Recursively merge updates into base dict."""
+    for key, value in updates.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+
 
 @app.get("/api/profiles/{skill_name}")
 async def get_profile(skill_name: str) -> dict:
@@ -1066,8 +1169,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         "signals": signals,
                     })
 
-                elif subtype in ("task_abort", "mode_change") and content:
-                    # Task abort or live mode change — inject into Gemini context
+                elif subtype in (
+                    "task_abort", "mode_change",
+                    "task_plan", "task_complete", "task_error",
+                ) and content:
+                    # Task lifecycle or mode change — inject into Gemini context
                     log.info("client.context.injecting", subtype=subtype)
                     try:
                         await gemini.send_context(content)

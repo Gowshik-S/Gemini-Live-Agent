@@ -1,0 +1,5 @@
+# Rio root — combined dependency set for the local client, cloud relay, CLI, and tests.
+# Optional vector memory packages remain commented out in local/requirements.txt.
+
+-r local/requirements.txt
+-r cloud/requirements.txt

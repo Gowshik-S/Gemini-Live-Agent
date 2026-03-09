@@ -107,7 +107,6 @@ class SingleTargetEnsemble:
             eta0=0.01,
             max_iter=1,           # single pass for partial_fit
             warm_start=True,
-            class_weight="balanced",
             random_state=42,
         )
 
@@ -121,13 +120,29 @@ class SingleTargetEnsemble:
             loss="hinge",
             max_iter=1,
             warm_start=True,
-            class_weight="balanced",
             random_state=42,
         )
 
         # Scaler for ensuring non-negative features (needed for MultinomialNB)
         self.scaler = MinMaxScaler(feature_range=(0.01, 1.0))
         self._scaler_fitted = False
+
+    def ensure_online_learning_compatible(self) -> bool:
+        """Normalize older pickled estimators for single-sample partial_fit()."""
+        changed = False
+        for estimator_name in ("sgd", "pac"):
+            estimator = getattr(self, estimator_name, None)
+            if estimator is None:
+                continue
+            if getattr(estimator, "class_weight", None) == "balanced":
+                estimator.class_weight = None
+                changed = True
+                log.info(
+                    "ml.ensemble.class_weight_normalized",
+                    target=self.target_name,
+                    estimator=estimator_name,
+                )
+        return changed
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Full batch fit (for initial training on datasets)."""
@@ -152,6 +167,14 @@ class SingleTargetEnsemble:
         """Online/incremental learning — update models with new samples."""
         if len(X) == 0:
             return
+        self.ensure_online_learning_compatible()
+        y = np.asarray(y)
+        invalid_labels = np.setdiff1d(np.unique(y), self.classes)
+        if invalid_labels.size:
+            raise ValueError(
+                f"Invalid labels for target '{self.target_name}': "
+                f"{invalid_labels.tolist()} not in {self.classes.tolist()}"
+            )
 
         # Fit or transform scaler
         if not self._scaler_fitted:
@@ -265,7 +288,7 @@ class RioEnsembleModel:
         model = RioEnsembleModel.load("models/user_123.pkl")
     """
 
-    VERSION = "1.0.0"
+    VERSION = "1.0.1"
 
     def __init__(self) -> None:
         if not SKLEARN_AVAILABLE:
@@ -396,10 +419,21 @@ class RioEnsembleModel:
 
         model = cls.__new__(cls)
         model.ensembles = state["ensembles"]
+        normalized_targets = []
+        for target_name, ensemble in model.ensembles.items():
+            if hasattr(ensemble, "ensure_online_learning_compatible"):
+                if ensemble.ensure_online_learning_compatible():
+                    normalized_targets.append(target_name)
         model._created_at = state.get("created_at", time.time())
         model._last_trained_at = state.get("last_trained_at")
         model._total_samples = state.get("total_samples", 0)
-        log.info("ml.model.loaded", path=path, samples=model._total_samples, version=state.get("version"))
+        log.info(
+            "ml.model.loaded",
+            path=path,
+            samples=model._total_samples,
+            version=state.get("version"),
+            normalized_targets=normalized_targets,
+        )
         return model
 
     # ------------------------------------------------------------------

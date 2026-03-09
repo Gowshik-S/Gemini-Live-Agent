@@ -100,6 +100,32 @@ except ImportError:
     ChatStore = None
 
 try:
+    from task_state import TaskStore, SessionMemory
+except ImportError:
+    TaskStore = None
+    SessionMemory = None
+
+try:
+    from browser_agent import BrowserAgent
+except ImportError:
+    BrowserAgent = None
+
+try:
+    from windows_agent import WindowsAgent
+except ImportError:
+    WindowsAgent = None
+
+try:
+    from orchestrator import Orchestrator
+except ImportError:
+    Orchestrator = None
+
+try:
+    from creative_agent import CreativeAgent
+except ImportError:
+    CreativeAgent = None
+
+try:
     from user_pattern_model import UserPatternModel
 except ImportError:
     UserPatternModel = None
@@ -115,6 +141,19 @@ try:
 except ImportError:
     UserModelManager = None
     _ML_READY = False
+
+# Rio structured logging + platform detection
+try:
+    from rio_logging import setup_logging, get_logger as rio_get_logger
+    _RIO_LOGGING = True
+except ImportError:
+    _RIO_LOGGING = False
+
+try:
+    from platform_utils import get_platform, print_platform_summary, get_missing_dependencies
+    _PLATFORM_UTILS = True
+except ImportError:
+    _PLATFORM_UTILS = False
 
 # ---------------------------------------------------------------------------
 # Structlog configuration
@@ -181,6 +220,185 @@ def _is_decline(text: str) -> bool:
         if phrase in text_lower:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Task detection — determines if user input needs autonomous execution
+# ---------------------------------------------------------------------------
+
+_TASK_ACTION_VERBS = (
+    "open", "go to", "goto", "navigate", "search", "create", "download",
+    "install", "click", "close", "launch", "start", "browse", "find",
+    "visit", "play", "stop", "delete", "move", "copy", "paste", "save",
+    "upload", "send", "book", "order", "sign in", "sign out", "log in",
+    "log out", "register", "fill", "submit", "scroll", "type", "write",
+    "run", "execute", "build", "deploy", "setup", "configure", "update",
+    "uninstall", "rename", "drag",
+)
+
+_TASK_PHRASES = (
+    "for me", "please do", "can you do", "i need you to", "i want you to",
+    "go ahead and", "take over", "handle this", "do this task",
+    "complete this", "finish this",
+)
+
+_NON_TASK_STARTS = (
+    "what", "why", "how", "when", "where", "who", "which", "is ", "are ",
+    "was ", "were ", "do you", "does ", "did ", "can you explain",
+    "tell me about", "explain", "describe", "hey rio", "hello", "hi ",
+    "thanks", "thank you", "good", "great", "nice", "cool",
+)
+
+
+def _is_task_request(text: str) -> bool:
+    """Detect if user input is a task that needs autonomous plan+execute.
+
+    Returns True for actionable tasks like 'open Chrome and search for X'.
+    Returns False for questions like 'what is Python?' or casual chat.
+    """
+    text_lower = text.strip().lower()
+
+    # Explicit task prefixes (user explicitly flags a task)
+    if text_lower.startswith(("task:", "do:", "execute:", "automate:")):
+        return True
+
+    # Resume/continue existing task
+    if text_lower in ("resume", "continue", "go on", "keep going"):
+        return True
+
+    # Skip greetings and questions
+    for start in _NON_TASK_STARTS:
+        if text_lower.startswith(start):
+            return False
+
+    # Very short messages are unlikely tasks
+    if len(text_lower.split()) < 3:
+        return False
+
+    # Check for action verbs at start of message
+    for verb in _TASK_ACTION_VERBS:
+        if text_lower.startswith(verb + " ") or text_lower.startswith(verb + ":"):
+            return True
+
+    # Check for task-indicating phrases anywhere
+    for phrase in _TASK_PHRASES:
+        if phrase in text_lower:
+            return True
+
+    # URL detection with action context
+    if ("http://" in text_lower or "https://" in text_lower or "www." in text_lower):
+        return True
+
+    return False
+
+
+async def _run_autonomous_task(
+    goal: str,
+    orchestrator,
+    client: WSClient,
+    autonomous_mode: asyncio.Event,
+    task_active: asyncio.Event,
+) -> None:
+    """Run a task through the local orchestrator autonomously.
+
+    The orchestrator plans steps via Gemini Pro, then executes each step
+    using BrowserAgent / ScreenNavigator / ToolExecutor — all locally.
+    Progress updates are sent through the WebSocket to the cloud so the
+    user gets voice/text feedback via Gemini.
+    """
+    # Activate autonomous screen mode for visual feedback
+    was_autonomous = autonomous_mode.is_set()
+    autonomous_mode.set()
+    task_active.set()
+
+    try:
+        # Handle resume of paused/active task
+        if goal == "resume":
+            print("\n  [Orchestrator] Resuming previous task...")
+            task = await orchestrator.resume()
+            if task is None:
+                print("  [Orchestrator] No task to resume.")
+                await client.send_json({
+                    "type": "text",
+                    "content": "There's no paused task to resume. Give me a new task!",
+                })
+                return
+        else:
+            print(f"\n  [Orchestrator] Planning: {goal[:100]}...")
+            task = await orchestrator.plan_task(goal)
+
+        if not task.steps:
+            print("  [Orchestrator] Could not create a plan.")
+            await client.send_json({
+                "type": "text",
+                "content": (
+                    f"I tried to plan this task but couldn't break it into steps: "
+                    f"{goal}. Can you rephrase or give me more specific instructions?"
+                ),
+            })
+            return
+
+        # Notify user of the plan
+        step_list = ", ".join(s.action for s in task.steps[:5])
+        plan_msg = (
+            f"[SYSTEM: Autonomous task started. Goal: {goal}. "
+            f"Plan ({len(task.steps)} steps): {step_list}. "
+            f"I am executing this now — you'll get updates as I go. "
+            f"Briefly acknowledge the plan to the user.]"
+        )
+        try:
+            await client.send_json({
+                "type": "context",
+                "subtype": "task_plan",
+                "content": plan_msg,
+            })
+        except ConnectionError:
+            pass
+
+        print(f"  [Orchestrator] Executing {len(task.steps)} steps...")
+        task = await orchestrator.execute_task(task)
+
+        # Report completion
+        report = orchestrator.get_progress_report()
+        status = task.status.value
+        completion_msg = (
+            f"[SYSTEM: Autonomous task {status}. Goal: {goal}. "
+            f"Progress: {task.progress}. Report:\n{report}\n"
+            f"Summarize what was accomplished to the user. "
+            f"If anything failed, explain what went wrong.]"
+        )
+        try:
+            await client.send_json({
+                "type": "context",
+                "subtype": "task_complete",
+                "content": completion_msg,
+            })
+        except ConnectionError:
+            pass
+
+        print(f"  [Orchestrator] Task {status}: {task.goal}")
+        print(f"  {report}")
+
+    except Exception as exc:
+        log.exception("autonomous_task.error")
+        print(f"\n  [Orchestrator] Task failed: {exc}")
+        try:
+            await client.send_json({
+                "type": "context",
+                "subtype": "task_error",
+                "content": (
+                    f"[SYSTEM: Autonomous task failed with error: {exc}. "
+                    f"Goal was: {goal}. Explain the error to the user and "
+                    f"suggest how they might accomplish it manually.]"
+                ),
+            })
+        except ConnectionError:
+            pass
+    finally:
+        task_active.clear()
+        if not was_autonomous:
+            autonomous_mode.clear()
+        print("  You: ", end="", flush=True)
 
 
 # Tool names that modify the filesystem / execute commands and need approval
@@ -430,22 +648,20 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                             print("  You: ", end="", flush=True)
                             continue
 
-                    # Use auto-capture for screen actions when autonomous mode is active
+                    # Auto-capture after ALL screen actions (not just autonomous mode)
+                    # so the model always gets visual feedback after clicks/scrolls/etc.
                     is_screen_action = (
                         hasattr(tool_executor, 'SCREEN_ACTION_TOOLS')
                         and tool_name in tool_executor.SCREEN_ACTION_TOOLS
                     )
-                    use_auto_capture = (
-                        is_screen_action
-                        and autonomous_mode is not None
-                        and autonomous_mode.is_set()
-                    )
 
-                    if use_auto_capture:
-                        task_in_progress = True
-                        if task_active is not None:
-                            task_active.set()
-                        print(f"\n  🔄 Auto: {tool_name}({_format_tool_args(tool_args)})")
+                    if is_screen_action:
+                        # Mark task active if in autonomous mode
+                        if autonomous_mode is not None and autonomous_mode.is_set():
+                            task_in_progress = True
+                            if task_active is not None:
+                                task_active.set()
+                        print(f"\n  🔄 Screen: {tool_name}({_format_tool_args(tool_args)})")
                         result = await tool_executor.execute_with_auto_capture(
                             tool_name, tool_args,
                         )
@@ -610,6 +826,7 @@ async def audio_capture_loop(
     playback=None,
     wake_word=None,
     task_active: asyncio.Event | None = None,
+    orchestrator=None,
 ) -> None:
     """Read audio chunks from the microphone and send as binary frames.
 
@@ -625,8 +842,9 @@ async def audio_capture_loop(
     flows to the cloud regardless of PTT state. This lets "Hey Rio"
     override the need to hold F2.
 
-    Task abort: If the user presses F2 during an autonomous task
-    (task_active is set), the task is aborted and Rio stops executing.
+    Task interrupt: If the user presses F2 during an autonomous task
+    (task_active is set), the task is paused cleanly with a progress
+    report. Can be resumed later with "continue" or "resume".
     """
     has_ptt = ptt is not None
     has_vad = vad is not None and vad.available
@@ -679,20 +897,29 @@ async def audio_capture_loop(
             ptt_was_active = ptt_now
 
             if ptt_just_pressed:
-                # Task abort: F2 during autonomous task cancels it
+                # Task interrupt: F2 during autonomous task pauses cleanly
                 if task_active is not None and task_active.is_set():
                     task_active.clear()
-                    log.info("task_abort.ptt", note="User pressed F2 during task")
-                    print("\n  ⛔ Task interrupted by user")
+                    # Get progress report from orchestrator if available
+                    progress_report = ""
+                    if orchestrator is not None:
+                        progress_report = orchestrator.pause()
+                    log.info("task_pause.ptt", note="User pressed F2 during task")
+                    print("\n  ⏸ Task paused by user")
+                    if progress_report:
+                        print(f"  {progress_report[:200]}")
                     try:
+                        abort_content = (
+                            "[SYSTEM: User pressed the interrupt key. PAUSE the current "
+                            "task gracefully. Here is the progress so far:\n"
+                            f"{progress_report}\n"
+                            "Tell the user what you've accomplished and what remains. "
+                            "They can say 'resume' or 'continue' to pick up where we left off.]"
+                        )
                         await client.send_json({
                             "type": "context",
-                            "subtype": "task_abort",
-                            "content": (
-                                "[SYSTEM: User pressed the interrupt key. STOP all "
-                                "autonomous actions immediately. Tell the user what "
-                                "you've accomplished so far.]"
-                            ),
+                            "subtype": "task_pause",
+                            "content": abort_content,
                         })
                     except ConnectionError:
                         pass
@@ -752,6 +979,9 @@ async def audio_capture_loop(
             # Wait for reconnection before resuming
             while not client.is_connected:
                 await asyncio.sleep(0.5)
+        except KeyboardInterrupt:
+            log.info("audio_loop.interrupted")
+            return
         except Exception:
             log.exception("audio_loop.error")
             await asyncio.sleep(0.1)
@@ -1011,13 +1241,20 @@ async def live_mode_toggle_loop(
 
 async def input_loop(client: WSClient, struggle_detector=None,
                      wake_word=None, chat_store=None, session_id: str = "",
-                     pattern_model=None, ml_manager=None) -> None:
+                     pattern_model=None, ml_manager=None,
+                     orchestrator=None,
+                     autonomous_mode: asyncio.Event | None = None,
+                     task_active: asyncio.Event | None = None) -> None:
     """Read user text from stdin and send to the cloud.
+
+    Task requests are detected and routed through the local orchestrator
+    for autonomous plan+execute. Questions and chat go to Gemini via cloud.
 
     Because ``input()`` is blocking, we run it in the default executor
     so it doesn't block the event loop.
     """
     loop = asyncio.get_running_loop()
+    _active_task: asyncio.Task | None = None
 
     while True:
         try:
@@ -1035,6 +1272,28 @@ async def input_loop(client: WSClient, struggle_detector=None,
 
         if text.lower() in {"exit", "quit", "/quit", "/exit"}:
             break
+
+        # Cancel running autonomous task
+        if text.lower() in {"stop", "cancel", "abort"} and _active_task is not None:
+            if orchestrator is not None and orchestrator.is_busy:
+                orchestrator.cancel()
+                print("\n  [Task cancelled]")
+                print("  You: ", end="", flush=True)
+                continue
+
+        # Resume existing task
+        if text.lower() in {"resume", "continue", "go on", "keep going"}:
+            if orchestrator is not None:
+                print("\n  [Resuming task...]")
+                _active_task = asyncio.create_task(
+                    _run_autonomous_task(
+                        "resume", orchestrator, client,
+                        autonomous_mode or asyncio.Event(),
+                        task_active or asyncio.Event(),
+                    ),
+                    name="autonomous_task",
+                )
+                continue
 
         # Wake word: text input always activates listening
         if wake_word is not None and wake_word.available:
@@ -1072,6 +1331,35 @@ async def input_loop(client: WSClient, struggle_detector=None,
                 except Exception:
                     pass
 
+        # --- Task detection: route tasks through orchestrator ---
+        if (orchestrator is not None
+                and autonomous_mode is not None
+                and task_active is not None
+                and _is_task_request(text)):
+            # Don't start a new task if one is already running
+            if orchestrator.is_busy:
+                print("\n  [A task is already running. Say 'stop' to cancel or wait for it to finish.]")
+                print("  You: ", end="", flush=True)
+                continue
+
+            goal = text
+            # Strip explicit prefix if present
+            for prefix in ("task:", "do:", "execute:", "automate:"):
+                if goal.lower().startswith(prefix):
+                    goal = goal[len(prefix):].strip()
+                    break
+
+            log.info("input.task_detected", goal=goal[:100])
+            _active_task = asyncio.create_task(
+                _run_autonomous_task(
+                    goal, orchestrator, client,
+                    autonomous_mode, task_active,
+                ),
+                name="autonomous_task",
+            )
+            continue  # Don't also send to cloud — orchestrator handles it
+
+        # --- Normal message: send to Gemini via cloud ---
         payload = {"type": "text", "content": text}
         try:
             await client.send_json(payload)
@@ -1094,12 +1382,17 @@ async def struggle_detection_loop(
     detector: "StruggleDetector",
     ocr_engine=None,
     memory_store=None,
+    orchestrator=None,
 ) -> None:
     """Periodically evaluate struggle signals and trigger proactive help.
 
     Runs every 2 seconds.  Captures a screen frame (reusing the existing
     ScreenCapture), feeds it to the detector, and sends a context frame
     to the cloud if the detector fires.
+
+    Priority 11: Auto-takeover — if the user doesn't respond within 15s
+    after being offered help, automatically start a diagnostic task via
+    the orchestrator.
 
     When ``ocr_engine`` is provided, OCR text is extracted from each
     frame and fed to the detector so Signal 1 hashes text content
@@ -1112,6 +1405,23 @@ async def struggle_detection_loop(
 
         if not client.is_connected:
             continue
+
+        # -- Priority 11: Check auto-takeover timeout --
+        if (orchestrator is not None
+                and detector.should_auto_takeover()
+                and not orchestrator.is_busy):
+            log.info("struggle_loop.auto_takeover")
+            print("\n  [Rio is taking over — auto-diagnosing the issue...]")
+            try:
+                # Build a diagnostic goal from the last trigger context
+                diagnostic_goal = (
+                    "The developer appears to be stuck. Analyze the current screen, "
+                    "identify the error or problem visible, and suggest or implement a fix. "
+                    "If you can see a specific error message, address it directly."
+                )
+                asyncio.create_task(orchestrator.run(diagnostic_goal))
+            except Exception:
+                log.exception("struggle_loop.auto_takeover_failed")
 
         # Feed a fresh screen frame (+ OCR text) into the detector
         if screen is not None:
@@ -1173,6 +1483,8 @@ async def struggle_detection_loop(
         try:
             await client.send_json(context_payload)
             detector.record_trigger()
+            # Priority 11: start auto-takeover timer
+            detector.mark_offer_sent()
             # L5: Store struggle event in memory
             if memory_store is not None:
                 try:
@@ -1242,6 +1554,153 @@ async def proactive_trigger_loop(
 
 
 # ---------------------------------------------------------------------------
+# Shutdown helpers
+# ---------------------------------------------------------------------------
+
+def _task_allows_goodbye(task: asyncio.Task) -> bool:
+    """Return True when a completed task ended cleanly."""
+    if task.cancelled():
+        return False
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return False
+
+    if exc is None:
+        return True
+    if isinstance(exc, KeyboardInterrupt):
+        log.info("task.interrupted", task=task.get_name())
+        return False
+
+    log.warning("task.failed", task=task.get_name(), error=str(exc))
+    return False
+
+
+async def _shutdown_runtime(
+    *,
+    client: WSClient,
+    tasks: set[asyncio.Task],
+    session_id: str,
+    send_goodbye: bool,
+    ptt=None,
+    screenshot_trigger=None,
+    screen_mode_trigger=None,
+    proactive_trigger=None,
+    live_mode_trigger=None,
+    capture=None,
+    playback=None,
+    chat_store=None,
+    pattern_model=None,
+    ml_manager=None,
+    orchestrator=None,
+    browser_agent=None,
+    session_memory=None,
+) -> None:
+    """Stop background work and persist session state."""
+    log.info("rio.shutting_down", goodbye=send_goodbye)
+
+    if send_goodbye:
+        try:
+            if client.is_connected:
+                print("\n  [sending goodbye to Rio...]")
+                await client.send_json({
+                    "type": "text",
+                    "content": "The user is closing the app. Say a brief, warm goodbye!",
+                })
+                await asyncio.sleep(3.0)
+        except Exception:
+            log.debug("shutdown.goodbye_failed")
+
+    if chat_store is not None:
+        try:
+            chat_store.add_message(session_id, "system", "Session ended")
+            chat_store.end_session(session_id)
+        except Exception:
+            log.debug("chat_store.end_session_failed")
+
+    if pattern_model is not None:
+        try:
+            pattern_model.record_activity("session_end", {"session_id": session_id})
+            pattern_model.close()
+        except Exception:
+            log.debug("user_pattern.close_failed")
+
+    if ml_manager is not None:
+        try:
+            ml_manager.close()
+            log.info("ml_pipeline.saved")
+        except Exception:
+            log.debug("ml_pipeline.close_failed")
+
+    for trigger in (
+        ptt,
+        screenshot_trigger,
+        screen_mode_trigger,
+        proactive_trigger,
+        live_mode_trigger,
+    ):
+        if trigger is not None:
+            try:
+                trigger.stop()
+            except Exception:
+                log.debug("trigger.stop_failed")
+
+    if capture is not None:
+        capture.stop()
+    if playback is not None:
+        playback.stop()
+
+    task_list = [task for task in tasks if task is not asyncio.current_task()]
+
+    try:
+        await client.close()
+    except Exception:
+        log.debug("ws.close_failed_during_shutdown")
+
+    for task in task_list:
+        if not task.done():
+            task.cancel()
+
+    if task_list:
+        results = await asyncio.gather(*task_list, return_exceptions=True)
+        for task, result in zip(task_list, results):
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, KeyboardInterrupt):
+                log.info("task.interrupted", task=task.get_name())
+                continue
+            if isinstance(result, Exception):
+                log.warning("task.failed", task=task.get_name(), error=str(result))
+
+    if orchestrator is not None:
+        try:
+            orchestrator.close()
+        except Exception:
+            pass
+
+    if browser_agent is not None and browser_agent.is_running:
+        try:
+            await browser_agent.stop()
+        except Exception:
+            pass
+
+    if chat_store is not None:
+        try:
+            chat_store.close()
+        except Exception:
+            pass
+
+    if session_memory is not None:
+        try:
+            session_memory.close()
+        except Exception:
+            pass
+
+    print("  [Rio session saved. Goodbye!]")
+    log.info("rio.stopped")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1257,6 +1716,27 @@ async def main() -> None:
 
     # -- Print banner ------------------------------------------------------
     print(BANNER)
+
+    # -- Initialize Rio structured logging ---------------------------------
+    if _RIO_LOGGING:
+        rio_log_dir = Path(__file__).resolve().parent.parent / config.logging.log_dir
+        setup_logging(
+            log_dir=str(rio_log_dir),
+            verbose=config.logging.verbose,
+            max_files=config.logging.max_files,
+        )
+        log.info("rio_logging.initialized", log_dir=str(rio_log_dir))
+
+    # -- Platform detection ------------------------------------------------
+    if _PLATFORM_UTILS:
+        print_platform_summary()
+        missing = get_missing_dependencies()
+        if missing:
+            print(f"\n  [!] {len(missing)} missing optional dep(s):")
+            for dep in missing:
+                print(f"      - {dep['name']}: {dep['purpose']}")
+                print(f"        Install: {dep['install_cmd']}")
+            print()
 
     # -- Initialize audio capture ------------------------------------------
     capture: AudioCapture | None = None
@@ -1594,9 +2074,90 @@ async def main() -> None:
         on_disconnect=lambda: log.warning("event.disconnected"),
     )
 
+    # -- Initialize sub-agents & orchestrator (L4+) ----------------------------
+    browser_agent = None
+    if BrowserAgent is not None:
+        browser_agent = BrowserAgent(api_key=os.environ.get("GEMINI_API_KEY", ""))
+        if browser_agent.available:
+            print("  Browser Agent: ready (Playwright + Gemini)")
+        else:
+            print("  Browser Agent: unavailable (install playwright)")
+            browser_agent = None
+    else:
+        print("  Browser Agent: disabled (module not found)")
+
+    windows_agent = None
+    if WindowsAgent is not None:
+        windows_agent = WindowsAgent()
+        if windows_agent.available:
+            print("  Windows Agent: ready (pywinauto)")
+        else:
+            print("  Windows Agent: unavailable (install pywinauto)")
+            windows_agent = None
+    else:
+        print("  Windows Agent: disabled (module not found)")
+
+    orchestrator = None
+    if Orchestrator is not None:
+        try:
+            orchestrator = Orchestrator(
+                api_key=os.environ.get("GEMINI_API_KEY", ""),
+                tool_executor=tool_executor,
+                screen_navigator=screen_navigator,
+                screen_capture=screen,
+                browser_agent=browser_agent,
+                windows_agent=windows_agent,
+            )
+            print("  Orchestrator: ready (autonomous task execution)")
+        except Exception:
+            log.exception("orchestrator.init_failed")
+            print("  Orchestrator: init failed")
+            orchestrator = None
+    else:
+        print("  Orchestrator: disabled (module not found)")
+
     # -- Attach WebSocket sender to tool executor for auto-capture ---------
     if tool_executor is not None:
         tool_executor.set_ws_sender(client.send_binary)
+
+    # -- Attach WebSocket client to orchestrator --------------------------------
+    if orchestrator is not None:
+        orchestrator.set_ws_client(client)
+
+    # -- Initialize Creative Agent (Priority 9) --------------------------------
+    creative_agent = None
+    if CreativeAgent is not None:
+        try:
+            creative_agent = CreativeAgent(api_key=os.environ.get("GEMINI_API_KEY", ""))
+            print("  Creative Agent: ready (Imagen 3 + Gemini)")
+            # Attach to orchestrator for creative step dispatch
+            if orchestrator is not None:
+                orchestrator.set_creative_agent(creative_agent)
+        except Exception:
+            log.exception("creative_agent.init_failed")
+            print("  Creative Agent: init failed")
+    else:
+        print("  Creative Agent: disabled (module not found)")
+
+    # -- Initialize Session Memory (persistent notes) --------------------------
+    session_memory = None
+    if SessionMemory is not None:
+        try:
+            session_memory = SessionMemory()
+            log.info("session_memory.ready")
+            print(f"  Session Memory: ready ({session_memory.db_path})")
+        except Exception:
+            log.exception("session_memory.init_failed")
+            print("  Session Memory: init failed")
+    else:
+        print("  Session Memory: disabled (module not found)")
+
+    # -- Attach task store + session memory to tool executor --------------------
+    if tool_executor is not None:
+        if orchestrator is not None:
+            tool_executor.set_task_store(orchestrator._task_store)
+        if session_memory is not None:
+            tool_executor.set_session_memory(session_memory)
 
     # -- Initialise OCR engine (L4 enhancement) ----------------------------
     ocr_engine = None
@@ -1661,7 +2222,10 @@ async def main() -> None:
     tasks.add(asyncio.create_task(
         input_loop(client, struggle_detector, wake_word=wake_word,
                    chat_store=chat_store, session_id=session_id,
-                   pattern_model=pattern_model, ml_manager=ml_manager),
+                   pattern_model=pattern_model, ml_manager=ml_manager,
+                   orchestrator=orchestrator,
+                   autonomous_mode=autonomous_mode,
+                   task_active=task_active),
         name="input",
     ))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
@@ -1669,7 +2233,8 @@ async def main() -> None:
     if capture is not None:
         tasks.add(asyncio.create_task(
             audio_capture_loop(client, capture, ptt, vad_instance, playback,
-                               wake_word=wake_word, task_active=task_active),
+                               wake_word=wake_word, task_active=task_active,
+                               orchestrator=orchestrator),
             name="audio",
         ))
 
@@ -1697,7 +2262,8 @@ async def main() -> None:
     # L4: Struggle detection loop
     if struggle_detector is not None and screen is not None:
         tasks.add(asyncio.create_task(
-            struggle_detection_loop(client, screen, struggle_detector, ocr_engine, memory_store),
+            struggle_detection_loop(client, screen, struggle_detector, ocr_engine,
+                                    memory_store, orchestrator=orchestrator),
             name="struggle",
         ))
 
@@ -1734,100 +2300,50 @@ async def main() -> None:
                 name="live_mode",
             ))
 
-    # -- Send startup greeting -------------------------------------------------
+    send_goodbye = False
     try:
-        await asyncio.wait_for(session_ready.wait(), timeout=30.0)
-        log.info("startup.session_ready")
-        # Brief pause to let the Live session fully stabilise
-        await asyncio.sleep(2.0)
-        await client.send_json({
-            "type": "text",
-            "content": "Hey Rio, say hello and introduce yourself briefly!",
-        })
-        log.info("startup.greeting_sent")
-    except asyncio.TimeoutError:
-        log.warning("startup.session_not_ready", note="Gemini session did not connect within 30s")
-    except ConnectionError:
-        log.warning("startup.greeting_failed", reason="not connected")
-
-    # Wait until any task exits (user typed /quit, Ctrl-C, or fatal error)
-    done, pending = await asyncio.wait(
-        tasks,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    # -- Shutdown ----------------------------------------------------------
-    log.info("rio.shutting_down")
-
-    # Send goodbye message to Rio before closing
-    try:
-        if client.is_connected:
-            print("\n  [sending goodbye to Rio...]")
+        # -- Send startup greeting ---------------------------------------------
+        try:
+            await asyncio.wait_for(session_ready.wait(), timeout=30.0)
+            log.info("startup.session_ready")
+            # Brief pause to let the Live session fully stabilise
+            await asyncio.sleep(2.0)
             await client.send_json({
                 "type": "text",
-                "content": "The user is closing the app. Say a brief, warm goodbye!",
+                "content": "Hey Rio, say hello and introduce yourself briefly!",
             })
-            # Wait briefly to receive goodbye response
-            await asyncio.sleep(3.0)
-    except Exception:
-        log.debug("shutdown.goodbye_failed")
+            log.info("startup.greeting_sent")
+        except asyncio.TimeoutError:
+            log.warning("startup.session_not_ready", note="Gemini session did not connect within 30s")
+        except ConnectionError:
+            log.warning("startup.greeting_failed", reason="not connected")
 
-    # Save session end to chat store
-    if chat_store is not None:
-        try:
-            chat_store.add_message(session_id, "system", "Session ended")
-            chat_store.end_session(session_id)
-        except Exception:
-            log.debug("chat_store.end_session_failed")
-
-    # Save session end to pattern model
-    if pattern_model is not None:
-        try:
-            pattern_model.record_activity("session_end", {"session_id": session_id})
-            pattern_model.close()
-        except Exception:
-            log.debug("user_pattern.close_failed")
-
-    # Train & save ML ensemble model on session data
-    if ml_manager is not None:
-        try:
-            ml_manager.close()  # trains on session + saves pkl
-            log.info("ml_pipeline.saved")
-        except Exception:
-            log.debug("ml_pipeline.close_failed")
-
-    # Stop PTT + screenshot + audio to avoid sending on a closing connection
-    if ptt is not None:
-        ptt.stop()
-    if screenshot_trigger is not None:
-        screenshot_trigger.stop()
-    if screen_mode_trigger is not None:
-        screen_mode_trigger.stop()
-    if proactive_trigger is not None:
-        proactive_trigger.stop()
-    if capture is not None:
-        capture.stop()
-    if playback is not None:
-        playback.stop()
-
-    await client.close()
-
-    # Close stores
-    if chat_store is not None:
-        try:
-            chat_store.close()
-        except Exception:
-            pass
-
-    for task in pending:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    print("  [Rio session saved. Goodbye!]")
-    log.info("rio.stopped")
+        # Wait until any task exits (user typed /quit, Ctrl-C, or fatal error)
+        done, _ = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        send_goodbye = bool(done) and all(_task_allows_goodbye(task) for task in done)
+    finally:
+        await asyncio.shield(_shutdown_runtime(
+            client=client,
+            tasks=tasks,
+            session_id=session_id,
+            send_goodbye=send_goodbye,
+            ptt=ptt,
+            screenshot_trigger=screenshot_trigger,
+            screen_mode_trigger=screen_mode_trigger,
+            proactive_trigger=proactive_trigger,
+            live_mode_trigger=live_mode_trigger,
+            capture=capture,
+            playback=playback,
+            chat_store=chat_store,
+            pattern_model=pattern_model,
+            ml_manager=ml_manager,
+            orchestrator=orchestrator,
+            browser_agent=browser_agent,
+            session_memory=session_memory,
+        ))
 
 
 # ---------------------------------------------------------------------------

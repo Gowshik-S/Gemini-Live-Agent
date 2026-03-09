@@ -171,6 +171,25 @@ class ChatStore:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def get_context_window(
+        self,
+        session_id: str,
+        max_messages: int = 20,
+    ) -> list[ChatMessage]:
+        """Return the last *max_messages* for a session (sliding window).
+
+        This is the method used to build Gemini context — capping the
+        history prevents token bloat and 400 errors on long sessions.
+        """
+        rows = self._conn.execute(
+            "SELECT id, session_id, speaker, content, timestamp, metadata "
+            "FROM messages WHERE session_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (session_id, max_messages),
+        ).fetchall()
+        # Reverse so they're in chronological order
+        return [self._row_to_message(r) for r in reversed(rows)]
+
     def get_history_for_dashboard(self, limit: int = 100) -> list[dict]:
         """Get recent messages formatted for dashboard consumption."""
         rows = self._conn.execute(

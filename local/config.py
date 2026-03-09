@@ -50,8 +50,8 @@ class VadConfig:
 @dataclass
 class VisionConfig:
     fps: float = 0.33
-    quality: int = 60
-    resize_factor: float = 0.5
+    quality: int = 85
+    resize_factor: float = 0.75
     default_mode: str = "on_demand"  # on_demand | autonomous
 
 
@@ -71,10 +71,20 @@ class MemoryConfig:
 
 
 @dataclass
+class LoggingConfig:
+    log_dir: str = "./logs"
+    verbose: bool = False
+    max_files: int = 7
+
+
+@dataclass
 class ModelConfig:
     primary: str = "gemini-2.5-flash"
     secondary: str = "gemini-2.5-pro-preview-03-25"
     pro_rpm_budget: int = 5
+    fallback_chain: list = field(default_factory=lambda: ["gemini-2.5-flash"])
+    cooldown_seconds: float = 60.0
+    timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -117,6 +127,7 @@ class RioConfig:
     struggle: StruggleConfig = field(default_factory=StruggleConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
 
     # ------------------------------------------------------------------
@@ -170,6 +181,7 @@ class RioConfig:
             struggle=_build(StruggleConfig, d.get("struggle")),
             memory=_build(MemoryConfig, d.get("memory")),
             models=_build(ModelConfig, d.get("models")),
+            logging=_build(LoggingConfig, d.get("logging")),
             skills=_build_skills(d.get("skills")),
         )
 

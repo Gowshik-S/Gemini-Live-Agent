@@ -8,15 +8,24 @@ structlog>=24.0.0
 # Audio I/O (L1) — capture at 16kHz, playback at 24kHz
 sounddevice>=0.5.0
 numpy>=1.24.0
+scipy>=1.11.0
 
 # VAD — Silero (Day 5)
 # For CPU-only (lighter): significantly smaller download, sufficient for VAD inference
-torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+
+# Audio playback backend for Gemini Live output
+# Note: Linux may require PortAudio development headers for PyAudio wheels/builds
+PyAudio>=0.2.14
 
 # Push-to-Talk hotkeys (Day 5) + Screenshot hotkey (Day 6)
-# TODO: Re-enable after kernel headers available. For now, use manual keyboard input.
-# evdev-binary>=1.3
-# pynput>=1.7.0
+pynput>=1.7.0
+
+# Screen navigation — mouse/keyboard automation
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+pyperclip>=1.8.2
 
 # Screen capture (Day 6 / L2 — Vision)
 mss>=9.0.0
@@ -36,3 +45,12 @@ vosk>=0.3.45
 
 # ML ensemble pipeline — user pattern learning (v0.8.0)
 scikit-learn>=1.3.0
+
+# Browser automation — Playwright for browser_agent.py
+playwright>=1.40.0
+
+# Windows application control — native UI introspection
+pywinauto>=0.6.8
+
+# Gemini API (needed locally for browser_agent + orchestrator planning)
+google-genai>=1.0.0

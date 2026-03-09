@@ -9,7 +9,7 @@ Dependencies: mss, Pillow (PIL)
 
 Usage::
 
-    sc = ScreenCapture(fps=0.33, quality=60, resize_factor=0.5)
+    sc = ScreenCapture(fps=0.33, quality=85, resize_factor=0.75)
     if sc.available:
         jpeg = await sc.capture_async()
         if jpeg is not None:
@@ -102,8 +102,8 @@ class ScreenCapture:
     def __init__(
         self,
         fps: float = 0.33,
-        quality: int = 60,
-        resize_factor: float = 0.5,
+        quality: int = 85,
+        resize_factor: float = 0.75,
     ) -> None:
         self._fps = fps
         self._quality = quality

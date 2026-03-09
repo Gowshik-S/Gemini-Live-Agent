@@ -169,9 +169,15 @@ class StruggleDetector:
         self._last_trigger_time: float = 0.0
         self._last_decline_time: float = 0.0
 
+        # Auto-takeover: if user doesn't respond within this time, auto-help
+        self._auto_takeover_timeout = 15.0  # seconds after offering help
+        self._offer_time: float = 0.0  # when the last offer was sent
+        self._waiting_for_response: bool = False  # True after trigger, waiting for user
+
         # Stats
         self._total_evaluations: int = 0
         self._total_triggers: int = 0
+        self._total_auto_takeovers: int = 0
 
         log.info(
             "struggle.init",
@@ -205,6 +211,7 @@ class StruggleDetector:
         return {
             "total_evaluations": self._total_evaluations,
             "total_triggers": self._total_triggers,
+            "total_auto_takeovers": self._total_auto_takeovers,
             "frame_history_size": len(self._frame_history),
             "error_detected": self._error_detected,
             "current_hash": self._current_hash[:8] if self._current_hash else None,
@@ -225,6 +232,10 @@ class StruggleDetector:
         ScreenCapture.  Stores the MD5 hash + timestamp for signal
         analysis.
 
+        Optimization (B-15): If the JPEG bytes are identical to the last
+        frame (same id), skip hashing entirely — just update the timestamp
+        on the existing entry.
+
         When ``ocr_text`` is provided (from the OCR engine), its hash
         is stored alongside the JPEG hash.  Signal 1 prefers the text
         hash because it is immune to pixel-level noise (cursor blink,
@@ -239,7 +250,33 @@ class StruggleDetector:
             return
 
         now = time.monotonic()
+
+        # B-15 fix: skip hashing if frame bytes are identical (same object or same length+prefix)
+        # Use id() for same-object check (zero cost), then length as secondary gate
+        frame_id = id(jpeg_bytes)
+        frame_len = len(jpeg_bytes)
+        if (hasattr(self, '_last_frame_id')
+                and self._last_frame_id == frame_id
+                and self._last_frame_len == frame_len):
+            # Identical frame object — just update timestamp, reuse last hash
+            if self._current_hash is not None:
+                self._frame_history.append(
+                    _FrameRecord(hash=self._current_hash, timestamp=now)
+                )
+                self._prune_old(now)
+            return
+
         frame_hash = hashlib.md5(jpeg_bytes).hexdigest()
+        self._last_frame_id = frame_id
+        self._last_frame_len = frame_len
+
+        # Fast-path: identical hash as last frame (same visual, different bytes object)
+        if frame_hash == self._current_hash:
+            self._frame_history.append(
+                _FrameRecord(hash=frame_hash, timestamp=now)
+            )
+            self._prune_old(now)
+            return
 
         # Compute text hash if OCR text available
         text_hash: Optional[str] = None
@@ -250,16 +287,18 @@ class StruggleDetector:
             text_hash = hashlib.md5(normalised.encode("utf-8", errors="replace")).hexdigest()
 
         # Track screen changes
-        if frame_hash != self._current_hash:
-            self._last_change_time = now
-            self._current_hash = frame_hash
+        self._last_change_time = now
+        self._current_hash = frame_hash
 
         # Add to rolling history
         self._frame_history.append(
             _FrameRecord(hash=frame_hash, timestamp=now, text_hash=text_hash)
         )
 
-        # Prune old entries beyond the max window (2 minutes)
+        self._prune_old(now)
+
+    def _prune_old(self, now: float) -> None:
+        """Remove entries older than the max analysis window."""
         cutoff = now - self.REPEATED_ERROR_WINDOW
         while self._frame_history and self._frame_history[0].timestamp < cutoff:
             self._frame_history.popleft()
@@ -410,8 +449,10 @@ class StruggleDetector:
         """Record that the user declined proactive help.
 
         Starts the longer decline cooldown timer.
+        Also cancels any pending auto-takeover.
         """
         self._last_decline_time = time.monotonic()
+        self._waiting_for_response = False
         log.info("struggle.decline_recorded")
 
     def _cooldown_expired(self, now: float) -> bool:
@@ -441,6 +482,59 @@ class StruggleDetector:
             should_trigger=True,
             reason="Manual trigger via F4 hotkey (demo mode)",
         )
+
+    # ------------------------------------------------------------------
+    # Auto-takeover (Priority 11)
+    # ------------------------------------------------------------------
+
+    def mark_offer_sent(self) -> None:
+        """Record that a proactive help offer was sent to the user.
+
+        Starts the auto-takeover timer. If the user doesn't respond
+        (via note_user_activity or record_decline) within the timeout,
+        should_auto_takeover() returns True.
+        """
+        self._offer_time = time.monotonic()
+        self._waiting_for_response = True
+        log.info("struggle.offer_sent")
+
+    def should_auto_takeover(self) -> bool:
+        """Check if we should auto-start help because the user didn't respond.
+
+        Returns True when:
+        - We sent an offer and are waiting for a response
+        - The timeout has elapsed since the offer
+        - The user hasn't shown activity (typing/speaking) since the offer
+        """
+        if not self._waiting_for_response:
+            return False
+        if self._offer_time <= 0:
+            return False
+
+        now = time.monotonic()
+        elapsed = now - self._offer_time
+
+        # User responded (activity after offer) — cancel auto-takeover
+        if self._last_activity_time > self._offer_time:
+            self._waiting_for_response = False
+            return False
+
+        # Timeout reached
+        if elapsed >= self._auto_takeover_timeout:
+            self._waiting_for_response = False
+            self._total_auto_takeovers += 1
+            log.info(
+                "struggle.auto_takeover",
+                elapsed=round(elapsed, 1),
+                total=self._total_auto_takeovers,
+            )
+            return True
+
+        return False
+
+    def cancel_auto_takeover(self) -> None:
+        """Cancel any pending auto-takeover (e.g., user responded)."""
+        self._waiting_for_response = False
 
     # ------------------------------------------------------------------
     # Reset

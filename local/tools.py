@@ -165,8 +165,8 @@ class ToolExecutor:
             )
             log.warning("tool.stuck_detected", action=name, repeats=self.MAX_REPEATED_ACTIONS)
 
-        # Step 2: Brief pause for UI to settle
-        await asyncio.sleep(0.3)
+        # Step 2: Brief pause for UI to settle (reduced from 300ms for B-13)
+        await asyncio.sleep(0.15)
 
         # Step 3 + 4: Auto-capture and send
         if self._screen_capture is not None and self._ws_send_binary is not None:
@@ -222,6 +222,10 @@ class ToolExecutor:
             "screen_drag": self._screen_drag,
             "find_window": self._find_window,
             "focus_window": self._focus_window,
+            # Persistent memory
+            "get_task_status": self._get_task_status,
+            "save_note": self._save_note,
+            "get_notes": self._get_notes,
         }
 
         handler = handlers.get(name)
@@ -875,3 +879,41 @@ class ToolExecutor:
         if err := self._nav_or_error():
             return err
         return await self._screen_navigator.focus_window(title_contains)
+
+    # ------------------------------------------------------------------
+    # Persistent Memory Tools
+    # ------------------------------------------------------------------
+
+    def set_task_store(self, task_store) -> None:
+        """Attach a TaskStore for task status queries."""
+        self._task_store = task_store
+
+    def set_session_memory(self, session_memory) -> None:
+        """Attach a SessionMemory for persistent notes."""
+        self._session_memory = session_memory
+
+    async def _get_task_status(self) -> dict[str, Any]:
+        """Return a summary of all tasks — pending, active, completed, failed."""
+        if not hasattr(self, '_task_store') or self._task_store is None:
+            return {"success": False, "error": "Task store not available"}
+        summary = self._task_store.get_status_summary()
+        return {"success": True, "summary": summary}
+
+    async def _save_note(self, key: str, value: str) -> dict[str, Any]:
+        """Save a persistent session note that survives across sessions."""
+        if not hasattr(self, '_session_memory') or self._session_memory is None:
+            return {"success": False, "error": "Session memory not available"}
+        self._session_memory.set(key, value)
+        return {"success": True, "key": key, "message": f"Note '{key}' saved."}
+
+    async def _get_notes(self, key: str = "") -> dict[str, Any]:
+        """Retrieve session notes. If key is empty, returns all notes."""
+        if not hasattr(self, '_session_memory') or self._session_memory is None:
+            return {"success": False, "error": "Session memory not available"}
+        if key:
+            value = self._session_memory.get(key)
+            if value:
+                return {"success": True, "key": key, "value": value}
+            return {"success": False, "error": f"Note '{key}' not found"}
+        summary = self._session_memory.get_summary()
+        return {"success": True, "notes": summary}

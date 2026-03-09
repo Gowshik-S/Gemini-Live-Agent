@@ -2,18 +2,24 @@
 Model router for Rio cloud service.
 
 Routes requests between Gemini Flash (Live API) and Gemini Pro.
-Pro escalation is stubbed for L0-L3; wired up in L4.
+Pro handles deep-analysis tasks (architecture, refactoring, root-cause).
+Flash handles everything else via the Live API.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Coroutine, Dict, List, Optional
 
 import structlog
+from google import genai
+from google.genai import types
 
 logger = structlog.get_logger(__name__)
+
+PRO_MODEL = "gemini-2.5-pro-preview-03-25"
 
 
 @dataclass
@@ -112,23 +118,70 @@ class ModelRouter:
     ) -> Optional[str]:
         """Call Gemini Pro for deep analysis.
 
-        L0-L3: Returns None (stub).
-        L4: Will call the Pro model and return the analysis string.
+        Uses the Pro model for planning, architecture, and deep-analysis
+        tasks.  Falls back to None if budget exhausted or API errors.
         """
-        self._log.debug(
-            "router.call_pro.stub",
-            prompt_len=len(prompt),
-            note="Pro escalation not implemented until L4",
-        )
-        # Track RPM usage even for stub so budget logic is exercised
+        # Check RPM budget
+        now = time.time()
+        if now - self._pro_rpm_window_start >= 60:
+            self._pro_rpm_used = 0
+            self._pro_rpm_window_start = now
+
+        if self._pro_rpm_used >= self._pro_rpm_budget:
+            self._log.warning("router.call_pro.budget_exhausted",
+                              used=self._pro_rpm_used, budget=self._pro_rpm_budget)
+            return None
+
         self._pro_rpm_used += 1
-        record = RoutingRecord(
-            timestamp=time.time(),
-            model="gemini-2.5-pro",
-            route_reason="pro_escalation_stub",
-        )
-        self._history.append(record)
-        return None
+        start = time.time()
+
+        # Build contents
+        parts = []
+        if context:
+            parts.append(f"Context:\n{context}\n\n")
+        parts.append(prompt)
+        full_prompt = "".join(parts)
+
+        try:
+            client = genai.Client(api_key=self._api_key)
+            response = await client.aio.models.generate_content(
+                model=PRO_MODEL,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.4,
+                    max_output_tokens=4096,
+                ),
+            )
+
+            latency_ms = (time.time() - start) * 1000
+            if not response.candidates:
+                self._log.warning("router.call_pro.no_candidates")
+                record = RoutingRecord(
+                    timestamp=time.time(), model="gemini-2.5-pro",
+                    route_reason="pro_escalation_empty", latency_ms=latency_ms,
+                )
+                self._history.append(record)
+                return None
+
+            analysis = response.text or ""
+            record = RoutingRecord(
+                timestamp=time.time(), model="gemini-2.5-pro",
+                route_reason="pro_escalation", latency_ms=latency_ms,
+            )
+            self._history.append(record)
+            self._log.info("router.call_pro.ok",
+                           chars=len(analysis), latency_ms=round(latency_ms))
+            return analysis
+
+        except Exception:
+            latency_ms = (time.time() - start) * 1000
+            self._log.exception("router.call_pro.error", latency_ms=round(latency_ms))
+            record = RoutingRecord(
+                timestamp=time.time(), model="gemini-2.5-pro",
+                route_reason="pro_escalation_error", latency_ms=latency_ms,
+            )
+            self._history.append(record)
+            return None
 
     async def inject_pro_result(self, analysis: str) -> None:
         """Inject a Pro analysis result into the active Live session.
