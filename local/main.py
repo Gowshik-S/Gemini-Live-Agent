@@ -569,6 +569,13 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     print("  [Rio is running in text-only mode — no voice]")
                 elif action == "live_ready":
                     print("  [Live API session fully initialized — voice active]")
+                elif action == "interrupted":
+                    # ADK: user spoke while agent was responding — stop playback
+                    log.info("cloud.interrupted")
+                    if playback is not None and hasattr(playback, 'stop'):
+                        playback.stop()
+                    print("\n  [interrupted — listening...]")
+                    print("  You: ", end="", flush=True)
 
             elif msg_type == "dashboard":
                 # Dashboard-only messages — ignore in CLI
@@ -578,7 +585,8 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 # L3: Gemini wants us to execute a tool
                 tool_name = msg.get("name", "unknown")
                 tool_args = msg.get("args", {})
-                log.info("tool_call.received", name=tool_name, args=tool_args)
+                tool_call_id = msg.get("id", "")  # ADK ToolBridge correlation ID
+                log.info("tool_call.received", name=tool_name, args=tool_args, id=tool_call_id)
                 print(f"\n  [tool] {tool_name}({_format_tool_args(tool_args)})")
 
                 # Special handling: capture_screen tool
@@ -615,11 +623,14 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                         result = {"success": False, "error": str(exc)}
                         print(f"  [screenshot error: {exc}]")
                     try:
-                        await client.send_json({
+                        result_frame = {
                             "type": "tool_result",
                             "name": "capture_screen",
                             "result": result,
-                        })
+                        }
+                        if tool_call_id:
+                            result_frame["id"] = tool_call_id
+                        await client.send_json(result_frame)
                     except ConnectionError:
                         log.warning("capture_screen.send_failed")
                     print("  You: ", end="", flush=True)
@@ -638,11 +649,14 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                             log.info("tool_call.declined", name=tool_name)
                             print(f"  [tool] {tool_name} — declined by user")
                             try:
-                                await client.send_json({
+                                result_frame = {
                                     "type": "tool_result",
                                     "name": tool_name,
                                     "result": result,
-                                })
+                                }
+                                if tool_call_id:
+                                    result_frame["id"] = tool_call_id
+                                await client.send_json(result_frame)
                             except ConnectionError:
                                 pass
                             print("  You: ", end="", flush=True)
@@ -678,13 +692,16 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     else:
                         print(f"  [tool] FAILED: {result.get('error', 'unknown error')}")
 
-                    # Send result back to cloud
+                    # Send result back to cloud (include id for ADK ToolBridge)
                     try:
-                        await client.send_json({
+                        result_frame = {
                             "type": "tool_result",
                             "name": tool_name,
                             "result": result,
-                        })
+                        }
+                        if tool_call_id:
+                            result_frame["id"] = tool_call_id
+                        await client.send_json(result_frame)
                     except ConnectionError:
                         log.warning("tool_call.send_failed", name=tool_name)
 
@@ -706,14 +723,17 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     # No tool executor — send error result
                     print("  [tool] tools not available")
                     try:
-                        await client.send_json({
+                        result_frame = {
                             "type": "tool_result",
                             "name": tool_name,
                             "result": {
                                 "success": False,
                                 "error": "Tool execution not available on this client",
                             },
-                        })
+                        }
+                        if tool_call_id:
+                            result_frame["id"] = tool_call_id
+                        await client.send_json(result_frame)
                     except ConnectionError:
                         pass
 

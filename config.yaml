@@ -7,8 +7,25 @@ rio:
   # Change to your Cloud Run URL after deployment
   cloud_url: "ws://localhost:8080/ws/rio/live"
 
+  # Backend mode: "adk" for ADK bidi-streaming (recommended), "legacy" for custom relay
+  backend: "adk"
+
   # Session mode: "live" for Live API bidirectional audio, "text" for text-only fallback
   session_mode: "live"
+
+  # Google Cloud Platform — $300 free credits
+  # Set use_vertex_ai: true to route through Vertex AI (production, billing, quotas)
+  # Set use_vertex_ai: false to use Gemini API directly (development, simpler)
+  gcp:
+    use_vertex_ai: false
+    project_id: ""                  # Your GCP project ID (e.g., "my-project-123")
+    location: "us-central1"         # Vertex AI region
+    # To enable Vertex AI:
+    #   1. Go to console.cloud.google.com → create/select project
+    #   2. Enable Vertex AI API + Generative Language API
+    #   3. Set project_id above (or GOOGLE_CLOUD_PROJECT env var)
+    #   4. Set use_vertex_ai: true (or GOOGLE_GENAI_USE_VERTEXAI=True env var)
+    #   5. Run: gcloud auth application-default login
 
   # Audio capture / playback settings (Layer 1+)
   audio:
@@ -55,7 +72,10 @@ rio:
   # Model selection & fallback
   models:
     primary: "gemini-2.5-flash"
+    live: "gemini-2.5-flash-native-audio-latest"
     secondary: "gemini-2.5-pro-preview-03-25"
+    computer_use: "gemini-2.5-computer-use-preview"
+    imagen: "imagen-3"
     pro_rpm_budget: 5
     fallback_chain:                   # models tried after primary fails
       - "gemini-2.5-flash"

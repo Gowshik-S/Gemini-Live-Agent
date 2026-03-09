@@ -229,6 +229,79 @@ class CreativeAgent:
     # Step execution (for orchestrator integration)
     # ------------------------------------------------------------------
 
+    async def generate_video(
+        self,
+        prompt: str,
+        duration_seconds: int = 5,
+        aspect_ratio: str = "16:9",
+    ) -> dict:
+        """Generate a short video using Veo 2.
+
+        Args:
+            prompt: Description of the video to generate.
+            duration_seconds: Target duration (5-10 seconds).
+            aspect_ratio: "16:9" or "9:16".
+
+        Returns:
+            {"success": bool, "video_path": str, ...}
+        """
+        if not self.available:
+            return {"success": False, "error": "Creative agent not available"}
+
+        self._log.info(
+            "creative.generate_video",
+            prompt=prompt[:100],
+            duration=duration_seconds,
+        )
+
+        try:
+            # Veo 2 video generation via google-genai
+            response = await self._client.aio.models.generate_videos(
+                model="veo-2.0-generate-001",
+                prompt=prompt,
+                config=types.GenerateVideosConfig(
+                    aspect_ratio=aspect_ratio,
+                    duration_seconds=duration_seconds,
+                    number_of_videos=1,
+                ),
+            )
+
+            # Poll for completion (video gen is async)
+            import time as _time
+            max_wait = 120  # 2 minutes max
+            poll_interval = 5
+            elapsed = 0
+            while not response.done and elapsed < max_wait:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                response = await response.refresh()
+
+            if not response.done:
+                return {"success": False, "error": "Video generation timed out (2 min)"}
+
+            if not response.generated_videos:
+                return {"success": False, "error": "No video generated"}
+
+            video = response.generated_videos[0]
+            video_bytes = video.video.video_bytes
+
+            filename = f"rio_video_{int(time.time())}.mp4"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            with open(filepath, "wb") as f:
+                f.write(video_bytes)
+
+            self._log.info("creative.video_saved", path=filepath)
+            return {
+                "success": True,
+                "video_path": filepath,
+                "size_kb": round(len(video_bytes) / 1024, 1),
+                "prompt": prompt,
+            }
+
+        except Exception as exc:
+            self._log.exception("creative.generate_video_failed")
+            return {"success": False, "error": str(exc)}
+
     async def execute_step(
         self,
         goal: str,
@@ -254,12 +327,23 @@ class CreativeAgent:
             "illustration", "photo", "design", "graphic", "visual",
             "diagram", "sketch", "generate an image",
         ))
+        is_video = any(kw in goal_lower for kw in (
+            "video", "clip", "animation", "motion", "animate",
+            "generate a video", "short film",
+        ))
         is_text = any(kw in goal_lower for kw in (
             "write", "compose", "poem", "story", "haiku", "essay",
             "explain", "summarize", "describe", "create a", "draft",
         ))
 
         results = []
+
+        if is_video:
+            vid_result = await self.generate_video(goal)
+            if vid_result.get("success"):
+                results.append(f"Video generated: {vid_result.get('video_path', 'in memory')}")
+            else:
+                results.append(f"Video generation failed: {vid_result.get('error', '')}")
 
         if is_image:
             img_result = await self.generate_image(goal)
@@ -268,7 +352,7 @@ class CreativeAgent:
             else:
                 results.append(f"Image generation failed: {img_result.get('error', '')}")
 
-        if is_text or not is_image:
+        if is_text or (not is_image and not is_video):
             # Default to text generation
             system = "You are a creative assistant. Be creative, engaging, and concise."
             txt_result = await self.generate_text(goal, system_instruction=system)

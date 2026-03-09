@@ -98,6 +98,7 @@ class ToolExecutor:
 
     def __init__(self, working_dir: str | None = None) -> None:
         self._cwd = working_dir or os.getcwd()
+        self._creative_agent = None  # Lazy-loaded for GenMedia tools
         self._screen_navigator = None  # Set via set_screen_navigator()
         self._screen_capture = None    # Set via set_screen_capture()
         self._ws_send_binary = None    # Set via set_ws_sender()
@@ -226,6 +227,9 @@ class ToolExecutor:
             "get_task_status": self._get_task_status,
             "save_note": self._save_note,
             "get_notes": self._get_notes,
+            # GenMedia (Imagen 3 + Veo 2)
+            "generate_image": self._generate_image,
+            "generate_video": self._generate_video,
         }
 
         handler = handlers.get(name)
@@ -917,3 +921,42 @@ class ToolExecutor:
             return {"success": False, "error": f"Note '{key}' not found"}
         summary = self._session_memory.get_summary()
         return {"success": True, "notes": summary}
+
+    # ------------------------------------------------------------------
+    # GenMedia — Imagen 3 + Veo 2 (proxied through CreativeAgent)
+    # ------------------------------------------------------------------
+
+    def _get_creative(self):
+        """Lazy-load CreativeAgent for GenMedia tools."""
+        if self._creative_agent is None:
+            try:
+                from creative_agent import CreativeAgent
+                self._creative_agent = CreativeAgent()
+            except ImportError:
+                return None
+        return self._creative_agent
+
+    async def _generate_image(
+        self, prompt: str, aspect_ratio: str = "1:1",
+        style: str = "", negative_prompt: str = "",
+    ) -> dict[str, Any]:
+        """Generate an image using Imagen 3."""
+        agent = self._get_creative()
+        if agent is None or not agent.available:
+            return {"success": False, "error": "CreativeAgent not available"}
+        full_prompt = prompt
+        if negative_prompt:
+            full_prompt += f". Avoid: {negative_prompt}"
+        return await agent.generate_image(full_prompt, style=style)
+
+    async def _generate_video(
+        self, prompt: str, duration_seconds: int = 5,
+        aspect_ratio: str = "16:9",
+    ) -> dict[str, Any]:
+        """Generate a short video using Veo 2."""
+        agent = self._get_creative()
+        if agent is None or not agent.available:
+            return {"success": False, "error": "CreativeAgent not available"}
+        return await agent.generate_video(
+            prompt, duration_seconds=duration_seconds, aspect_ratio=aspect_ratio,
+        )
