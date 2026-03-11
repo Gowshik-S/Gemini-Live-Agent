@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rio — Chat</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/chat.css">
+</head>
+<body>
+
+  <!-- ================================================================== -->
+  <!-- TOP BAR                                                            -->
+  <!-- ================================================================== -->
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__logo" viewBox="0 0 32 32" width="28" height="28" fill="none">
+        <rect x="2" y="2" width="28" height="28" rx="6" stroke="currentColor" stroke-width="2"/>
+        <path d="M10 22V10h5a4 4 0 010 8h-5m5-8l5 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="topbar__title">Rio</span>
+      <span class="topbar__subtitle">Chat</span>
+    </div>
+
+    <div class="topbar__status">
+      <a href="index.html" class="status-pill status-pill--muted" style="text-decoration:none">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M6 3l-4 5 4 5M10 3l4 5-4 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Dashboard</span>
+      </a>
+      <a href="setup.html" class="status-pill status-pill--muted" style="text-decoration:none">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M8 10a2 2 0 100-4 2 2 0 000 4z" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M13.5 8c0-.3-.2-.6-.4-.8l1-1.2-.8-1.4-1.5.4c-.4-.3-.8-.5-1.3-.6L10 3H8.5l-.5 1.4c-.5.1-.9.3-1.3.6l-1.5-.4-.8 1.4 1 1.2c-.2.2-.4.5-.4.8s.2.6.4.8l-1 1.2.8 1.4 1.5-.4c.4.3.8.5 1.3.6L8.5 13H10l.5-1.4c.5-.1.9-.3 1.3-.6l1.5.4.8-1.4-1-1.2c.2-.2.4-.5.4-.8z" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+        <span>Setup</span>
+      </a>
+      <div class="status-pill" id="ws-status">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="5" fill="currentColor"/>
+        </svg>
+        <span id="ws-status-label">Connecting</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================================================================== -->
+  <!-- CHAT LAYOUT                                                        -->
+  <!-- ================================================================== -->
+  <main class="chat-layout">
+
+    <!-- ---- Sidebar: Conversations ---- -->
+    <aside class="chat-sidebar" id="chat-sidebar">
+      <div class="chat-sidebar__header">
+        <h2>Conversations</h2>
+        <button class="btn-icon" id="btn-new-chat" title="New conversation">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none">
+            <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="chat-sidebar__list" id="conversation-list">
+        <div class="chat-sidebar__empty">No conversations yet</div>
+      </div>
+    </aside>
+
+    <!-- ---- Main chat area ---- -->
+    <section class="chat-main">
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-empty" id="chat-empty">
+          <svg viewBox="0 0 48 48" width="48" height="48" fill="none">
+            <rect x="4" y="4" width="40" height="40" rx="10" stroke="currentColor" stroke-width="2" opacity="0.3"/>
+            <circle cx="18" cy="20" r="2.5" fill="currentColor" opacity="0.3"/>
+            <circle cx="30" cy="20" r="2.5" fill="currentColor" opacity="0.3"/>
+            <path d="M18 30c2 3 4.5 4 6 4s4-1 6-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.3"/>
+          </svg>
+          <p>Voice conversations with Rio will appear here</p>
+          <p class="chat-empty__hint">Start talking to Rio and messages will be shown and saved automatically</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="js/chat.js"></script>
+</body>
+</html>

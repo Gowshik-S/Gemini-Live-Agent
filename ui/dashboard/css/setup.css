@@ -503,3 +503,55 @@ textarea {
     padding: 12px 8px;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Status badges (API Key, Vertex AI)
+   -------------------------------------------------------------------------- */
+.status-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.status-badge--ok {
+  background: var(--success-dim);
+  color: var(--success);
+  border: 1px solid rgba(52, 211, 153, 0.25);
+}
+
+.status-badge--missing {
+  background: var(--error-dim);
+  color: var(--error);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+}
+
+.status-badge--muted {
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border);
+}
+
+.status-badge--unknown {
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border);
+}
+
+/* --------------------------------------------------------------------------
+   Model badge (monospace display)
+   -------------------------------------------------------------------------- */
+.model-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--primary-bg);
+  color: var(--primary);
+  border: 1px solid rgba(108, 99, 255, 0.2);
+  word-break: break-all;
+}

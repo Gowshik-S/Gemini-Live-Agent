@@ -35,6 +35,12 @@
         </svg>
         <span>Dashboard</span>
       </a>
+      <a href="chat.html" class="status-pill status-pill--muted" style="text-decoration:none">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M3 3h10a1 1 0 011 1v6a1 1 0 01-1 1H6l-3 3V4a1 1 0 011-1z" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        <span>Chat</span>
+      </a>
     </div>
   </header>
 
@@ -45,7 +51,14 @@
 
     <!-- Tab bar -->
     <nav class="setup__tabs">
-      <button class="tab-btn tab-btn--active" data-tab="customer-care">
+      <button class="tab-btn tab-btn--active" data-tab="agent-settings">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M8 10a2 2 0 100-4 2 2 0 000 4z" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M13.5 8c0-.3-.2-.6-.4-.8l1-1.2-.8-1.4-1.5.4c-.4-.3-.8-.5-1.3-.6L10 3H8.5l-.5 1.4c-.5.1-.9.3-1.3.6l-1.5-.4-.8 1.4 1 1.2c-.2.2-.4.5-.4.8s.2.6.4.8l-1 1.2.8 1.4 1.5-.4c.4.3.8.5 1.3.6L8.5 13H10l.5-1.4c.5-.1.9-.3 1.3-.6l1.5.4.8-1.4-1-1.2c.2-.2.4-.5.4-.8z" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+        Agent Settings
+      </button>
+      <button class="tab-btn" data-tab="customer-care">
         <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
           <path d="M8 1a5 5 0 015 5c0 4-5 9-5 9S3 10 3 6a5 5 0 015-5z" stroke="currentColor" stroke-width="1.5"/>
           <circle cx="8" cy="6" r="1.5" stroke="currentColor" stroke-width="1.5"/>
@@ -62,9 +75,90 @@
     </nav>
 
     <!-- ============================================================== -->
+    <!-- AGENT SETTINGS TAB (first, default active)                     -->
+    <!-- ============================================================== -->
+    <section class="tab-content tab-content--active" id="tab-agent-settings">
+      <form id="form-agent-settings" autocomplete="off">
+
+        <!-- Toast -->
+        <div class="toast" id="toast-settings" style="display:none">
+          <span class="toast__icon">&#10003;</span>
+          <span class="toast__msg">Settings saved</span>
+        </div>
+
+        <!-- ---- Section: Agent Identity ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Agent Identity</legend>
+          <p class="form-hint">Customise how your agent introduces itself and behaves.</p>
+
+          <div class="form-group">
+            <label for="settings-name">Agent Name</label>
+            <input type="text" id="settings-name" placeholder="Rio" value="Rio">
+          </div>
+
+          <div class="form-group">
+            <label for="settings-tagline">Tagline</label>
+            <input type="text" id="settings-tagline" placeholder="Your Virtual Friend & Assistant">
+          </div>
+
+          <div class="form-group">
+            <label for="settings-role">Role / Personality</label>
+            <select id="settings-role">
+              <option value="assistant">Assistant (general-purpose helper)</option>
+              <option value="developer">Developer (AI pair programmer)</option>
+              <option value="tutor">Tutor (adaptive learning guide)</option>
+              <option value="customer_care">Customer Care (support agent)</option>
+            </select>
+          </div>
+        </fieldset>
+
+        <!-- ---- Section: API & Models ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Status</legend>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>API Key</label>
+              <div id="settings-api-status" class="status-badge status-badge--unknown">Checking...</div>
+              <p class="form-hint">Configured via <code>rio configure</code> or <code>.env</code> file.</p>
+            </div>
+            <div class="form-group">
+              <label>Vertex AI</label>
+              <div id="settings-vertex-status" class="status-badge status-badge--unknown">Checking...</div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Live Model</label>
+              <div class="model-badge" id="settings-live-model">--</div>
+            </div>
+            <div class="form-group">
+              <label>Orchestrator Model</label>
+              <div class="model-badge" id="settings-orch-model">--</div>
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Save ---- -->
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" id="btn-save-settings">
+            <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+              <path d="M12 3H4a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V6l-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M10 3v3H6V3" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            Save Settings
+          </button>
+        </div>
+
+      </form>
+    </section>
+
+    <!-- ============================================================== -->
     <!-- CUSTOMER CARE TAB                                              -->
     <!-- ============================================================== -->
-    <section class="tab-content tab-content--active" id="tab-customer-care">
+    <section class="tab-content" id="tab-customer-care">
       <form id="form-customer-care" autocomplete="off">
 
         <!-- Toast -->

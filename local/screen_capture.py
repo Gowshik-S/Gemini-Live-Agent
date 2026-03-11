@@ -357,6 +357,48 @@ class ScreenCapture:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.capture, force)
 
+    def capture_full_resolution(self) -> Optional[bytes]:
+        """Capture at original monitor resolution (no resize).
+
+        Used by _computer_use_ground() so the model receives the true
+        pixel grid and returns accurate coordinates that can be used
+        directly for clicking without any scaling.
+        """
+        if not self._available or _pil_image is None:
+            return None
+
+        try:
+            img = None
+            monitor_info: dict | None = None
+
+            if not self._use_wayland_fallback and _mss_mod is not None:
+                try:
+                    img, monitor_info = self._capture_mss()
+                except Exception:
+                    if self._wayland_tool:
+                        self._use_wayland_fallback = True
+                    else:
+                        raise
+
+            if img is None and self._use_wayland_fallback and self._wayland_tool:
+                img = self._capture_wayland()
+
+            if img is None:
+                return None
+
+            # NO resize — full resolution JPEG
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=self._quality)
+            return buf.getvalue()
+
+        except Exception:
+            return None
+
+    async def capture_full_resolution_async(self) -> Optional[bytes]:
+        """Async wrapper for capture_full_resolution()."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.capture_full_resolution)
+
     # ------------------------------------------------------------------
     # OCR-enhanced capture
     # ------------------------------------------------------------------

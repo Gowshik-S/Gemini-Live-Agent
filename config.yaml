@@ -1,14 +1,21 @@
-# Rio — Proactive AI Pair Programmer
+# Rio — Your Virtual Friend & Assistant
 # User configuration file
 # All values here can be overridden; sensible defaults exist in local/config.py
 
 rio:
+  # Agent identity — customise to your liking
+  agent_name: "Rio"                       # Display name (shown in UI, voice greetings)
+  agent_tagline: "Your Virtual Friend & Assistant"  # Short description
+  # Personality presets: "assistant" | "tutor" | "customer_care" | "developer"
+  # Or write your own in the system_instruction override below.
+  agent_role: "assistant"
+
   # WebSocket URL for the Rio cloud backend
   # Change to your Cloud Run URL after deployment
   cloud_url: "ws://localhost:8080/ws/rio/live"
 
-  # Backend mode: "adk" for ADK bidi-streaming (recommended), "legacy" for custom relay
-  backend: "adk"
+  # Backend mode: "direct" uses Gemini Live API directly for lowest latency
+  backend: "direct"
 
   # Session mode: "live" for Live API bidirectional audio, "text" for text-only fallback
   session_mode: "live"
@@ -74,7 +81,7 @@ rio:
     primary: "gemini-2.5-flash"
     live: "gemini-2.5-flash-native-audio-latest"
     secondary: "gemini-2.5-pro-preview-03-25"
-    computer_use: "gemini-2.5-computer-use-preview"
+    computer_use: "gemini-2.5-computer-use-preview-10-2025"
     imagen: "imagen-3"
     pro_rpm_budget: 5
     fallback_chain:                   # models tried after primary fails

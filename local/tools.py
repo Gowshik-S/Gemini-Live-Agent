@@ -43,6 +43,34 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+
+def _get_env_value(name: str) -> str:
+    """Read an env var, falling back to rio/cloud/.env when needed."""
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+
+    env_file = Path(__file__).resolve().parent.parent / "cloud" / ".env"
+    if not env_file.is_file():
+        return ""
+
+    try:
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            if key.strip() != name:
+                continue
+            value = raw_value.strip().strip('"').strip("'")
+            if value:
+                os.environ[name] = value
+            return value
+    except OSError as exc:
+        log.warning("tools.env_read_failed", path=str(env_file), error=str(exc))
+
+    return ""
+
 # ---------------------------------------------------------------------------
 # Safety constants
 # ---------------------------------------------------------------------------
@@ -91,6 +119,7 @@ class ToolExecutor:
     SCREEN_ACTION_TOOLS = frozenset({
         "screen_click", "screen_type", "screen_scroll",
         "screen_hotkey", "screen_move", "screen_drag",
+        "smart_click",  # Computer Use visual-grounding click
     })
 
     # Stuck detection: max identical consecutive actions before warning
@@ -223,6 +252,8 @@ class ToolExecutor:
             "screen_drag": self._screen_drag,
             "find_window": self._find_window,
             "focus_window": self._focus_window,
+            # Vision-grounded navigation (Computer Use model)
+            "smart_click": self._smart_click,
             # Persistent memory
             "get_task_status": self._get_task_status,
             "save_note": self._save_note,
@@ -874,15 +905,29 @@ class ToolExecutor:
             duration=float(duration),
         )
 
-    async def _find_window(self, title_contains: str) -> dict[str, Any]:
+    async def _find_window(
+        self,
+        title: str = "",
+        title_contains: str = "",
+    ) -> dict[str, Any]:
         if err := self._nav_or_error():
             return err
-        return await self._screen_navigator.find_window(title_contains)
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.find_window(query)
 
-    async def _focus_window(self, title_contains: str) -> dict[str, Any]:
+    async def _focus_window(
+        self,
+        title: str = "",
+        title_contains: str = "",
+    ) -> dict[str, Any]:
         if err := self._nav_or_error():
             return err
-        return await self._screen_navigator.focus_window(title_contains)
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.focus_window(query)
 
     # ------------------------------------------------------------------
     # Persistent Memory Tools
@@ -921,6 +966,139 @@ class ToolExecutor:
             return {"success": False, "error": f"Note '{key}' not found"}
         summary = self._session_memory.get_summary()
         return {"success": True, "notes": summary}
+
+    # ------------------------------------------------------------------
+    # Computer Use — visual-grounding screen navigation
+    # ------------------------------------------------------------------
+
+    async def _computer_use_ground(
+        self, description: str,
+    ) -> dict[str, Any]:
+        """Take a fresh screenshot and ask gemini-2.5-computer-use-preview-10-2025
+        to locate *description* on screen. Returns {success, x, y}."""
+        if self._screen_capture is None:
+            return {"success": False, "error": "Screen capture not attached"}
+
+        # Capture at FULL RESOLUTION so the model returns coordinates that
+        # map directly to the real screen — no scaling needed.
+        try:
+            jpeg = await self._screen_capture.capture_full_resolution_async()
+        except Exception as exc:
+            return {"success": False, "error": f"Screenshot failed: {exc}"}
+        if jpeg is None:
+            return {"success": False, "error": "Screenshot returned None"}
+
+        # Call Computer Use model via Vertex AI (free tier has 0 quota for
+        # computer-use on the Gemini API, so we route through Vertex AI).
+        try:
+            from google import genai as _genai
+            from google.genai import types as _gtypes
+
+            # Vertex AI for computer-use model (requires GCP project)
+            gcp_project = _get_env_value("GOOGLE_CLOUD_PROJECT")
+            gcp_location = _get_env_value("GOOGLE_CLOUD_LOCATION") or "global"
+            use_vertex = bool(gcp_project)
+
+            if use_vertex:
+                client = _genai.Client(
+                    vertexai=True,
+                    project=gcp_project,
+                    location=gcp_location,
+                )
+            else:
+                # Fallback to API key (requires paid billing for computer-use)
+                api_key = _get_env_value("GEMINI_API_KEY")
+                if not api_key:
+                    return {
+                        "success": False,
+                        "error": (
+                            "Neither GOOGLE_CLOUD_PROJECT (for Vertex AI) nor "
+                            "GEMINI_API_KEY is set. Computer Use model requires "
+                            "Vertex AI or paid billing. Set GOOGLE_CLOUD_PROJECT "
+                            "in rio/cloud/.env to use Vertex AI."
+                        ),
+                    }
+                client = _genai.Client(api_key=api_key)
+
+            prompt = (
+                f"Look at this screenshot carefully.\n"
+                f"Find the UI element: **{description}**\n"
+                f"Return ONLY a JSON object with the pixel coordinates of its center:\n"
+                f'  {{"x": <int>, "y": <int>}}\n'
+                f'If the element is not visible, return: {{"found": false}}\n'
+                f"No markdown fences, no explanation — raw JSON only."
+            )
+
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-computer-use-preview-10-2025",
+                contents=[
+                    _gtypes.Content(role="user", parts=[
+                        _gtypes.Part(
+                            inline_data=_gtypes.Blob(
+                                mime_type="image/jpeg", data=jpeg,
+                            )
+                        ),
+                        _gtypes.Part(text=prompt),
+                    ])
+                ],
+                config=_gtypes.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=128,
+                ),
+            )
+
+            text = (response.text or "").strip()
+            # Strip markdown fences if present
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            text = text.strip()
+
+            data = json.loads(text)
+            if not data.get("found", True):
+                return {"success": False, "error": f"Element not found on screen: {description}"}
+
+            return {"success": True, "x": int(data["x"]), "y": int(data["y"])}
+
+        except json.JSONDecodeError:
+            return {"success": False, "error": f"Computer Use model returned invalid JSON: {text[:200]}"}
+        except Exception as exc:
+            return {"success": False, "error": f"Computer Use model error: {exc}"}
+
+    async def _smart_click(
+        self,
+        target: str,
+        action: str = "click",
+        clicks: int = 1,
+    ) -> dict[str, Any]:
+        """Visual-grounding click using gemini-2.5-computer-use-preview-10-2025.
+
+        Describe the element you want to click in natural language
+        (e.g. 'the Save button', 'search input field').
+        The Computer Use model analyzes a fresh screenshot to find exact
+        pixel coordinates, then pyautogui executes the click.
+        """
+        if err := self._nav_or_error():
+            return err
+
+        log.info("tool.smart_click", target=target, action=action)
+
+        ground = await self._computer_use_ground(target)
+        if not ground.get("success"):
+            return ground
+
+        x, y = ground["x"], ground["y"]
+        button = "right" if action == "right_click" else "left"
+        n_clicks = 2 if action == "double_click" else int(clicks)
+
+        # Use click_absolute: the computer-use model saw a full-resolution
+        # screenshot so its coordinates map 1:1 to real screen pixels.
+        result = await self._screen_navigator.click_absolute(x, y, button=button, clicks=n_clicks)
+        result["grounded_by"] = "computer_use"
+        result["found_at"] = {"x": x, "y": y}
+        result["target"] = target
+        return result
 
     # ------------------------------------------------------------------
     # GenMedia — Imagen 3 + Veo 2 (proxied through CreativeAgent)

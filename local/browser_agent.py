@@ -3,7 +3,7 @@ Rio Local — Browser Agent (Gemini Computer Use + Playwright)
 
 Uses the Gemini 2.5 Computer Use model for accurate visual grounding:
   1. Capture page screenshot at 1280x720
-  2. Send to gemini-2.5-computer-use-preview — model returns PIXEL
+  2. Send to gemini-2.5-computer-use-preview-10-2025 — model returns PIXEL
      coordinates for clicks, not fragile CSS selectors
   3. Playwright executes coordinate-based actions (mouse.click, keyboard)
   4. Re-capture → model verifies/decides next action

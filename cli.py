@@ -310,14 +310,14 @@ def cmd_configure(args):
     print("  Available models:")
     print("    1. gemini-2.5-flash (fast, free tier)")
     print("    2. gemini-2.5-pro-preview-03-25 (powerful, requires billing)")
-    print("    3. gemini-2.5-computer-use-preview (screen/browser control)")
+    print("    3. gemini-2.5-computer-use-preview-10-2025 (screen/browser control)")
     current_primary = config_data.get("models", {}).get("primary", "gemini-2.5-flash")
     print(f"  Current primary: {current_primary}")
     choice = input("  Primary model [1/2/3] (Enter for current): ").strip()
     models_map = {
         "1": "gemini-2.5-flash",
         "2": "gemini-2.5-pro-preview-03-25",
-        "3": "gemini-2.5-computer-use-preview",
+        "3": "gemini-2.5-computer-use-preview-10-2025",
     }
     if choice in models_map:
         config_data.setdefault("models", {})["primary"] = models_map[choice]

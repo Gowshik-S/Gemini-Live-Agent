@@ -16,9 +16,16 @@ import uuid
 from typing import Any, Optional
 
 import structlog
-from google.adk.agents import Agent
 
 from gemini_session import build_system_instruction
+
+# ADK Agent is only needed for the legacy create_rio_agent() factory.
+# Optional import so the module works even when google-adk is not installed
+# (the direct Live API server only needs ToolBridge + _make_tools).
+try:
+    from google.adk.agents import Agent
+except ImportError:
+    Agent = None  # type: ignore[assignment,misc]
 
 logger = structlog.get_logger(__name__)
 
@@ -287,12 +294,36 @@ def _make_tools(bridge: ToolBridge) -> list:
             }
         )
 
+    # -- Vision-grounded navigation (Computer Use model) --
+
+    async def smart_click(
+        target: str, action: str = "click", clicks: int = 1,
+    ) -> dict:
+        """Click a UI element by describing it in natural language.
+
+        Uses gemini-2.5-computer-use-preview-10-2025 to take a fresh screenshot
+        and visually locate the element before clicking — far more reliable
+        than guessing pixel coordinates from an earlier screenshot.
+
+        target: describe what to click, e.g. "the Save button",
+                "search input field", "file menu", "OK dialog button"
+        action: "click" (default) | "double_click" | "right_click"
+        clicks: number of clicks (default 1)
+
+        PREFER this over screen_click whenever you know what you want
+        to click but not the exact coordinates."""
+        return await bridge.dispatch(
+            "smart_click", {"target": target, "action": action, "clicks": clicks}
+        )
+
     return [
         # Core dev tools
         read_file, write_file, patch_file, run_command, capture_screen,
-        # Screen navigation
+        # Screen navigation (coordinate-based)
         screen_click, screen_type, screen_scroll, screen_hotkey,
         screen_move, screen_drag, find_window, focus_window,
+        # Vision-grounded navigation (Computer Use model)
+        smart_click,
         # Customer care
         create_ticket, update_ticket,
         # Tutor

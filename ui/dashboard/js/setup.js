@@ -302,12 +302,83 @@ document.getElementById('btn-reset-tutor').addEventListener('click', async () =>
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Agent Settings
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function loadAgentSettings() {
+  try {
+    const res = await fetch(`${API_BASE}/api/settings`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const s = data.settings || {};
+    document.getElementById('settings-name').value = s.agent_name || 'Rio';
+    document.getElementById('settings-tagline').value = s.agent_tagline || '';
+    document.getElementById('settings-role').value = s.agent_role || 'assistant';
+  } catch (err) {
+    console.warn('Failed to load agent settings:', err);
+  }
+}
+
+async function loadModelsStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/models/status`);
+    if (!res.ok) return;
+    const data = await res.json();
+
+    // API Key badge
+    const apiEl = document.getElementById('settings-api-status');
+    if (apiEl) {
+      apiEl.textContent = data.api_key_set ? 'Configured' : 'Missing';
+      apiEl.className = 'status-badge ' + (data.api_key_set ? 'status-badge--ok' : 'status-badge--missing');
+    }
+
+    // Vertex AI badge
+    const vxEl = document.getElementById('settings-vertex-status');
+    if (vxEl) {
+      vxEl.textContent = data.vertex_ai ? 'Enabled' : 'Disabled';
+      vxEl.className = 'status-badge ' + (data.vertex_ai ? 'status-badge--ok' : 'status-badge--muted');
+    }
+
+    // Model badges
+    const models = data.models || {};
+    const liveEl = document.getElementById('settings-live-model');
+    if (liveEl) liveEl.textContent = models.live || '--';
+    const orchEl = document.getElementById('settings-orch-model');
+    if (orchEl) orchEl.textContent = models.orchestrator || '--';
+  } catch (err) {
+    console.warn('Failed to load model status:', err);
+  }
+}
+
+document.getElementById('form-agent-settings').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const body = {
+      agent_name: document.getElementById('settings-name').value.trim(),
+      agent_tagline: document.getElementById('settings-tagline').value.trim(),
+      agent_role: document.getElementById('settings-role').value,
+    };
+    const res = await fetch(`${API_BASE}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    showToast('toast-settings', 'Settings saved! Restart the server for changes to take effect.');
+  } catch (err) {
+    showToast('toast-settings', `Error: ${err.message}`, true);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Init — load existing profiles on page load
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
   const [cc, tutor] = await Promise.all([
     loadProfile('customer_care'),
     loadProfile('tutor'),
+    loadAgentSettings(),
+    loadModelsStatus(),
   ]);
   if (cc) populateCustomerCare(cc);
   if (tutor) populateTutor(tutor);

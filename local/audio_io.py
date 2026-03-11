@@ -46,6 +46,37 @@ def _get_wasapi_settings(exclusive: bool = False) -> object | None:
         return None
 
 
+def _get_device_info(
+    device: Optional[str | int],
+    kind: str,
+) -> dict | None:
+    """Resolve a sounddevice device selector to a concrete device record."""
+    try:
+        return sd.query_devices(device=device, kind=kind)
+    except Exception as exc:
+        log.debug(
+            "audio.device_lookup_failed",
+            device=device,
+            kind=kind,
+            error=str(exc),
+        )
+        return None
+
+
+def _get_hostapi_name(device_info: dict | None) -> str | None:
+    """Return the PortAudio host API name for a device record."""
+    if not device_info:
+        return None
+
+    try:
+        hostapi_index = int(device_info["hostapi"])
+        hostapi = sd.query_hostapis(hostapi_index)
+        return str(hostapi.get("name", ""))
+    except Exception as exc:
+        log.debug("audio.hostapi_lookup_failed", error=str(exc))
+        return None
+
+
 class AudioCapture:
     """Captures audio from the microphone as PCM 16-bit 16kHz mono chunks.
 
@@ -97,10 +128,25 @@ class AudioCapture:
 
         # WASAPI exclusive mode for lowest latency on Windows
         extra_settings = None
+        device_info = _get_device_info(self._input_device, kind="input")
+        hostapi_name = _get_hostapi_name(device_info)
         if self._use_wasapi and _IS_WINDOWS:
-            extra_settings = _get_wasapi_settings(exclusive=False)
-            if extra_settings:
-                log.info("audio.wasapi_enabled", exclusive=False)
+            if hostapi_name == "Windows WASAPI":
+                extra_settings = _get_wasapi_settings(exclusive=False)
+                if extra_settings:
+                    log.info(
+                        "audio.wasapi_enabled",
+                        exclusive=False,
+                        device=self._input_device,
+                        hostapi=hostapi_name,
+                    )
+            elif hostapi_name:
+                log.info(
+                    "audio.wasapi_skipped",
+                    reason="non_wasapi_device",
+                    device=self._input_device,
+                    hostapi=hostapi_name,
+                )
 
         log.info(
             "audio.starting",
@@ -109,6 +155,7 @@ class AudioCapture:
             device=self._input_device,
             latency="low",
             wasapi=extra_settings is not None,
+            hostapi=hostapi_name,
         )
 
         try:
@@ -266,6 +313,7 @@ class AudioPlayback:
         self._output_device = output_device
         self._use_wasapi = use_wasapi
         self._running = False
+        self._interrupted = False  # set during interrupt to skip queued chunks
         self._resample_ratio: float = 1.0
 
         # Thread-safe queue: enqueue() writes, drain_loop() reads
@@ -352,6 +400,24 @@ class AudioPlayback:
             self._pa = None
         self.clear()
         log.info("playback.stopped")
+
+    def interrupt(self) -> None:
+        """Immediately silence playback but keep the stream open for future audio.
+
+        Clears the queue and resets the OS audio buffer so the speaker
+        goes silent within ~20ms.  The stream stays open so the next
+        model response can play immediately.
+        """
+        self._interrupted = True
+        self.clear()
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.start_stream()
+            except Exception:
+                log.exception("playback.interrupt.stream_reset_error")
+        self._interrupted = False
+        log.info("playback.interrupted")
 
     # ------------------------------------------------------------------
     # Resampling (scipy polyphase filter)
@@ -450,9 +516,19 @@ class AudioPlayback:
                 except asyncio.TimeoutError:
                     continue
 
+                # Skip chunk if interrupted (queue was cleared but this
+                # chunk was already dequeued)
+                if self._interrupted:
+                    continue
+
                 if self._stream is not None and chunk:
-                    # Blocking write in a thread — lets the event loop continue
-                    await asyncio.to_thread(self._stream.write, chunk)
+                    try:
+                        await asyncio.to_thread(self._stream.write, chunk)
+                    except OSError:
+                        # stream.write() can fail if stream was reset by interrupt()
+                        if self._interrupted:
+                            continue
+                        raise
 
             except asyncio.CancelledError:
                 break
@@ -471,14 +547,21 @@ class AudioPlayback:
 def list_audio_devices() -> list[dict]:
     """Return a list of available audio input devices."""
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
     result = []
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
+            hostapi_name = None
+            try:
+                hostapi_name = hostapis[int(dev["hostapi"])]["name"]
+            except Exception:
+                pass
             result.append({
                 "index": i,
                 "name": dev["name"],
                 "channels": dev["max_input_channels"],
                 "default_samplerate": dev["default_samplerate"],
+                "hostapi": hostapi_name,
                 "is_default": i == sd.default.device[0],
             })
     return result
@@ -487,15 +570,16 @@ def list_audio_devices() -> list[dict]:
 def get_default_input_device() -> dict | None:
     """Return info about the default input device, or None."""
     try:
+        dev = _get_device_info(None, kind="input")
         idx = sd.default.device[0]
-        if idx is None or idx < 0:
+        if dev is None or idx is None or idx < 0:
             return None
-        dev = sd.query_devices(idx)
         return {
             "index": idx,
             "name": dev["name"],
             "channels": dev["max_input_channels"],
             "default_samplerate": dev["default_samplerate"],
+            "hostapi": _get_hostapi_name(dev),
         }
     except Exception:
         return None
@@ -504,14 +588,21 @@ def get_default_input_device() -> dict | None:
 def list_output_devices() -> list[dict]:
     """Return a list of available audio output devices."""
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
     result = []
     for i, dev in enumerate(devices):
         if dev["max_output_channels"] > 0:
+            hostapi_name = None
+            try:
+                hostapi_name = hostapis[int(dev["hostapi"])]["name"]
+            except Exception:
+                pass
             result.append({
                 "index": i,
                 "name": dev["name"],
                 "channels": dev["max_output_channels"],
                 "default_samplerate": dev["default_samplerate"],
+                "hostapi": hostapi_name,
                 "is_default": i == sd.default.device[1],
             })
     return result
@@ -520,15 +611,16 @@ def list_output_devices() -> list[dict]:
 def get_default_output_device() -> dict | None:
     """Return info about the default output device, or None."""
     try:
+        dev = _get_device_info(None, kind="output")
         idx = sd.default.device[1]  # [1] is output, [0] is input
-        if idx is None or idx < 0:
+        if dev is None or idx is None or idx < 0:
             return None
-        dev = sd.query_devices(idx)
         return {
             "index": idx,
             "name": dev["name"],
             "channels": dev["max_output_channels"],
             "default_samplerate": dev["default_samplerate"],
+            "hostapi": _get_hostapi_name(dev),
         }
     except Exception:
         return None

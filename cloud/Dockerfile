@@ -28,6 +28,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
 
-# Start the server
-# Set RIO_USE_ADK=1 to use the ADK bidi-streaming server instead of the legacy relay
-CMD ["sh", "-c", "if [ \"$RIO_USE_ADK\" = '1' ]; then uvicorn adk_server:app --host 0.0.0.0 --port 8080; else uvicorn main:app --host 0.0.0.0 --port 8080; fi"]
+# Start the direct Live API server
+CMD ["uvicorn", "adk_server:app", "--host", "0.0.0.0", "--port", "8080"]

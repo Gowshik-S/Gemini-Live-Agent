@@ -176,6 +176,54 @@ structlog.configure(
 
 log = structlog.get_logger("rio.main")
 
+
+def _load_cloud_env() -> Path | None:
+    """Load rio/cloud/.env into process env without overriding existing vars."""
+    candidates: list[Path] = []
+    override = os.environ.get("RIO_ENV_FILE", "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.append(Path(__file__).resolve().parent.parent / "cloud" / ".env")
+    candidates.append(Path.cwd() / "cloud" / ".env")
+
+    seen: set[str] = set()
+    for env_path in candidates:
+        try:
+            path_key = str(env_path.resolve())
+        except OSError:
+            path_key = str(env_path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+
+        if not env_path.is_file():
+            continue
+
+        try:
+            for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                os.environ[key] = value.strip().strip('"').strip("'")
+        except OSError:
+            return None
+        return env_path
+
+    return None
+
+
+_loaded_env_path = _load_cloud_env()
+if _loaded_env_path is not None:
+    log.info(
+        "env.loaded",
+        path=str(_loaded_env_path),
+        gemini_key_set=bool(os.environ.get("GEMINI_API_KEY")),
+    )
+
 # ---------------------------------------------------------------------------
 # Banner
 # ---------------------------------------------------------------------------
@@ -572,7 +620,9 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                 elif action == "interrupted":
                     # ADK: user spoke while agent was responding — stop playback
                     log.info("cloud.interrupted")
-                    if playback is not None and hasattr(playback, 'stop'):
+                    if playback is not None and hasattr(playback, 'interrupt'):
+                        playback.interrupt()
+                    elif playback is not None and hasattr(playback, 'stop'):
                         playback.stop()
                     print("\n  [interrupted — listening...]")
                     print("  You: ", end="", flush=True)

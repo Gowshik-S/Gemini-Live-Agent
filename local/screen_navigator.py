@@ -287,6 +287,46 @@ class ScreenNavigator:
     # Actions — Phase 1: Core Navigation
     # ------------------------------------------------------------------
 
+    async def click_absolute(
+        self,
+        x: int,
+        y: int,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> dict[str, Any]:
+        """Click at absolute screen coordinates (no coordinate mapping).
+
+        Used by smart_click when the computer-use model returns coordinates
+        based on a full-resolution screenshot that maps 1:1 to the real screen.
+        """
+        if err := self._check_available():
+            return err
+        if err := self._check_rate_limit():
+            return err
+
+        if button not in ("left", "right", "middle"):
+            button = "left"
+        clicks = max(1, min(clicks, 3))
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None, lambda: _safe_execute(_pyautogui.click, x, y, button=button, clicks=clicks)
+            )
+        except _FailSafeAbort as e:
+            self._log_action("click_absolute", (x, y), (x, y), error="failsafe")
+            return {"success": False, "error": str(e)}
+
+        self._log_action("click_absolute", (x, y), (x, y), button=button, clicks=clicks)
+        return {
+            "success": True,
+            "action": "click",
+            "screenshot_coords": [x, y],
+            "real_coords": [x, y],
+            "button": button,
+            "clicks": clicks,
+        }
+
     async def click(
         self,
         x: int,

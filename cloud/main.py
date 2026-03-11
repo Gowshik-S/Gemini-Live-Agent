@@ -337,7 +337,7 @@ async def models_status() -> dict:
         "models": {
             "flash": "gemini-2.5-flash",
             "pro": "gemini-2.5-pro-preview-03-25",
-            "computer_use": "gemini-2.5-computer-use-preview",
+            "computer_use": "gemini-2.5-computer-use-preview-10-2025",
         },
     }
 
