@@ -72,6 +72,14 @@
         </svg>
         Tutor
       </button>
+      <button class="tab-btn" data-tab="agents">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.5"/>
+          <circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M1 14c0-2.2 1.8-4 4-4s4 1.8 4 4M7 14c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        Agents
+      </button>
     </nav>
 
     <!-- ============================================================== -->
@@ -545,6 +553,190 @@
               <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
             </svg>
             Save Profile
+          </button>
+        </div>
+
+      </form>
+    </section>
+
+    <!-- ============================================================== -->
+    <!-- AGENTS TAB                                                     -->
+    <!-- ============================================================== -->
+    <section class="tab-content" id="tab-agents">
+      <form id="form-agents" autocomplete="off">
+
+        <!-- Toast -->
+        <div class="toast" id="toast-agents" style="display:none">
+          <span class="toast__icon">&#10003;</span>
+          <span class="toast__msg">Agent configuration saved</span>
+        </div>
+
+        <p class="form-hint" style="margin-bottom:1.5rem">
+          Configure multiple agents for different task types. The orchestrator will
+          automatically route tasks to the best-matching agent based on task content.
+          Each agent can use a different Gemini model and tool set.
+        </p>
+
+        <!-- ---- Agent: Task Executor ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Task Executor</legend>
+          <p class="form-hint">Executes computer tasks: opening apps, clicking, typing, file operations.</p>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="agent-task-enabled" checked>
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Enabled</span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="agent-task-model">Model</label>
+              <select id="agent-task-model">
+                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro (Preview)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-task-tools">Tool Set</label>
+              <select id="agent-task-tools">
+                <option value="all">All Tools</option>
+                <option value="screen">Screen Only</option>
+                <option value="dev">Dev Only</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-task-iterations">Max Iterations</label>
+              <input type="number" id="agent-task-iterations" value="25" min="1" max="50">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Agent: Code Agent ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Code Agent</legend>
+          <p class="form-hint">Code analysis, debugging, file reading/writing, refactoring.</p>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="agent-code-enabled" checked>
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Enabled</span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="agent-code-model">Model</label>
+              <select id="agent-code-model">
+                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro (Preview)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-code-tools">Tool Set</label>
+              <select id="agent-code-tools">
+                <option value="dev" selected>Dev Only</option>
+                <option value="all">All Tools</option>
+                <option value="memory">Memory Only</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-code-iterations">Max Iterations</label>
+              <input type="number" id="agent-code-iterations" value="15" min="1" max="50">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Agent: Research Agent ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Research Agent</legend>
+          <p class="form-hint">Research, analysis, explanations, complex reasoning.</p>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="agent-research-enabled" checked>
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Enabled</span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="agent-research-model">Model</label>
+              <select id="agent-research-model">
+                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro (Preview)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-research-tools">Tool Set</label>
+              <select id="agent-research-tools">
+                <option value="memory" selected>Memory Only</option>
+                <option value="dev">Dev Only</option>
+                <option value="all">All Tools</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-research-iterations">Max Iterations</label>
+              <input type="number" id="agent-research-iterations" value="10" min="1" max="50">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Agent: Creative Agent ---- -->
+        <fieldset class="form-section">
+          <legend class="form-section__title">Creative Agent</legend>
+          <p class="form-hint">Image and video generation using Imagen 3 and Veo 2.</p>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="agent-creative-enabled">
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Enabled</span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="agent-creative-model">Model</label>
+              <select id="agent-creative-model">
+                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro (Preview)</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-creative-tools">Tool Set</label>
+              <select id="agent-creative-tools">
+                <option value="creative" selected>Creative Only</option>
+                <option value="all">All Tools</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="agent-creative-iterations">Max Iterations</label>
+              <input type="number" id="agent-creative-iterations" value="5" min="1" max="50">
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- ---- Save ---- -->
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" id="btn-save-agents">
+            <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+              <path d="M12 3H4a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V6l-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M10 3v3H6V3" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            Save Agent Configuration
           </button>
         </div>
 

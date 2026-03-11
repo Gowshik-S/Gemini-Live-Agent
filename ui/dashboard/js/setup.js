@@ -371,17 +371,89 @@ document.getElementById('form-agent-settings').addEventListener('submit', async 
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Agent Orchestration Config
+// ═══════════════════════════════════════════════════════════════════════════
+const AGENT_TYPES = ['task', 'code', 'research', 'creative'];
+const AGENT_KEY_MAP = {
+  task: 'task_executor',
+  code: 'code_agent',
+  research: 'research_agent',
+  creative: 'creative_agent',
+};
+
+function collectAgents() {
+  const agents = {};
+  for (const type of AGENT_TYPES) {
+    const key = AGENT_KEY_MAP[type];
+    agents[key] = {
+      enabled: document.getElementById(`agent-${type}-enabled`).checked,
+      model: document.getElementById(`agent-${type}-model`).value,
+      tools: document.getElementById(`agent-${type}-tools`).value,
+      max_iterations: parseInt(document.getElementById(`agent-${type}-iterations`).value) || 10,
+    };
+  }
+  return agents;
+}
+
+function populateAgents(data) {
+  if (!data) return;
+  for (const type of AGENT_TYPES) {
+    const key = AGENT_KEY_MAP[type];
+    const agent = data[key];
+    if (!agent) continue;
+    const enabledEl = document.getElementById(`agent-${type}-enabled`);
+    const modelEl = document.getElementById(`agent-${type}-model`);
+    const toolsEl = document.getElementById(`agent-${type}-tools`);
+    const iterEl = document.getElementById(`agent-${type}-iterations`);
+    if (enabledEl) enabledEl.checked = agent.enabled !== false;
+    if (modelEl) modelEl.value = agent.model || 'gemini-2.5-flash';
+    if (toolsEl) toolsEl.value = agent.tools || 'all';
+    if (iterEl) iterEl.value = agent.max_iterations || 10;
+  }
+}
+
+async function loadAgents() {
+  try {
+    const res = await fetch(`${API_BASE}/api/agents`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.agents || null;
+  } catch (err) {
+    console.warn('Failed to load agents config:', err);
+    return null;
+  }
+}
+
+document.getElementById('form-agents').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const agents = collectAgents();
+    const res = await fetch(`${API_BASE}/api/agents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agents }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    showToast('toast-agents', 'Agent configuration saved!');
+  } catch (err) {
+    showToast('toast-agents', `Error: ${err.message}`, true);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Init — load existing profiles on page load
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
-  const [cc, tutor] = await Promise.all([
+  const [cc, tutor, , , agents] = await Promise.all([
     loadProfile('customer_care'),
     loadProfile('tutor'),
     loadAgentSettings(),
     loadModelsStatus(),
+    loadAgents(),
   ]);
   if (cc) populateCustomerCare(cc);
   if (tutor) populateTutor(tutor);
+  if (agents) populateAgents(agents);
 
   // Initialize FAQ list (render empty or loaded)
   renderFaq();

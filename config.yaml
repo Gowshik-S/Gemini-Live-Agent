@@ -107,3 +107,32 @@ rio:
       default_difficulty: "intermediate"    # beginner | novice | intermediate | advanced
       quiz_num_questions: 5                 # default number of quiz questions
       socratic_mode: true                   # use Socratic method (questions, not answers)
+
+  # Multi-agent orchestration
+  # Each agent specializes in a task type and uses the best model for it.
+  # The orchestrator auto-selects the right agent based on task content.
+  agents:
+    task_executor:
+      enabled: true
+      model: "gemini-2.5-flash"             # Fast, tool-capable model for computer tasks
+      description: "Executes computer tasks: opening apps, clicking, typing, file operations"
+      tools: "all"                           # all | screen | dev | memory
+      max_iterations: 25
+    code_agent:
+      enabled: true
+      model: "gemini-2.5-flash"             # Strong coding model
+      description: "Code analysis, debugging, file reading/writing, refactoring"
+      tools: "dev"                           # read_file, write_file, patch_file, run_command
+      max_iterations: 15
+    research_agent:
+      enabled: true
+      model: "gemini-2.5-flash"             # Good reasoning model
+      description: "Research, analysis, explanations, complex reasoning"
+      tools: "memory"                        # search_notes, save_note, get_notes
+      max_iterations: 10
+    creative_agent:
+      enabled: false
+      model: "gemini-2.5-flash"             # Model for image/video generation
+      description: "Image and video generation using Imagen 3 and Veo 2"
+      tools: "creative"                      # generate_image, generate_video
+      max_iterations: 5

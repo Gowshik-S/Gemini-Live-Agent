@@ -12,12 +12,14 @@ const RioSocket = (() => {
   let _reconnectTimer = null;
   let _reconnectDelay = 1000;
   let _pingTimer = null;
+  let _connectTimeout = null;
   let _lastPong = 0;
   let _connectTime = 0;
   let _pingSentAt = 0;
   let _latencyMs = null;
 
   const MAX_RECONNECT_DELAY = 15000;
+  const CONNECT_TIMEOUT_MS = 5000;
 
   // Event handlers registry
   const _handlers = {};
@@ -60,7 +62,11 @@ const RioSocket = (() => {
       return;
     }
 
+    // Guard against hanging CONNECTING state
+    _startConnectTimeout();
+
     _ws.onopen = () => {
+      _clearConnectTimeout();
       _connected = true;
       _reconnectDelay = 1000;
       _connectTime = Date.now();
@@ -114,6 +120,7 @@ const RioSocket = (() => {
     };
 
     _ws.onclose = (e) => {
+      _clearConnectTimeout();
       _connected = false;
       _stopPing();
       console.log(`[rio-ws] closed: code=${e.code} reason=${e.reason}`);
@@ -129,6 +136,7 @@ const RioSocket = (() => {
       clearTimeout(_reconnectTimer);
       _reconnectTimer = null;
     }
+    _clearConnectTimeout();
     _stopPing();
     if (_ws) {
       _ws.close();
@@ -158,6 +166,26 @@ const RioSocket = (() => {
   }
 
   // ---- Internals ----
+
+  function _startConnectTimeout() {
+    _clearConnectTimeout();
+    _connectTimeout = setTimeout(() => {
+      if (_ws && _ws.readyState === WebSocket.CONNECTING) {
+        console.warn('[rio-ws] connect timeout — aborting stale socket');
+        _ws.close();
+        _ws = null;
+        _updateConnectionUI('disconnected');
+        _scheduleReconnect();
+      }
+    }, CONNECT_TIMEOUT_MS);
+  }
+
+  function _clearConnectTimeout() {
+    if (_connectTimeout) {
+      clearTimeout(_connectTimeout);
+      _connectTimeout = null;
+    }
+  }
 
   function _scheduleReconnect() {
     if (_reconnectTimer) return;

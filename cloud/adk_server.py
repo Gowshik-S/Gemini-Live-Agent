@@ -467,6 +467,46 @@ async def save_settings(request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Multi-Agent configuration API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/agents")
+async def get_agents() -> dict:
+    """Return multi-agent configurations from config.yaml."""
+    import yaml
+    if not _config_yaml_path.exists():
+        return {"agents": {}}
+    try:
+        raw = yaml.safe_load(_config_yaml_path.read_text(encoding="utf-8")) or {}
+        agents = raw.get("rio", {}).get("agents", {})
+        return {"agents": agents}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/agents")
+async def save_agents(request: Request) -> dict:
+    """Update multi-agent configurations in config.yaml."""
+    import yaml
+    body = await request.json()
+    agents_data = body.get("agents", {})
+    try:
+        raw = {}
+        if _config_yaml_path.exists():
+            raw = yaml.safe_load(_config_yaml_path.read_text(encoding="utf-8")) or {}
+        rio = raw.setdefault("rio", {})
+        rio["agents"] = agents_data
+
+        _config_yaml_path.write_text(
+            yaml.dump(raw, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"status": "saved", "agents": agents_data}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Conversation API endpoints
 # ---------------------------------------------------------------------------
 
@@ -953,6 +993,27 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                         "client_id": client_id,
                                     })
 
+                            # ---- Go-away (session about to expire) ----
+                            ga = getattr(response, "go_away", None)
+                            if ga:
+                                time_left = getattr(ga, "time_left", "?")
+                                log.warning(
+                                    "live.go_away",
+                                    time_left=time_left,
+                                )
+                                try:
+                                    await websocket.send_text(json.dumps({
+                                        "type": "control",
+                                        "action": "go_away",
+                                        "detail": f"Session expiring in {time_left}",
+                                    }))
+                                except Exception:
+                                    pass
+                                # Break out of the receive loop — the outer
+                                # while-active loop will reconnect automatically
+                                # using session_handle for resumption.
+                                break
+
                             # ---- Session resumption update ----
                             sru = getattr(response, "session_resumption_update", None)
                             if sru:
@@ -978,6 +1039,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                     "smart_click", "screen_click", "screen_type",
                                     "screen_scroll", "screen_hotkey", "screen_move",
                                     "screen_drag", "focus_window",
+                                    "open_application", "minimize_window",
+                                    "maximize_window", "close_window",
                                 })
 
                                 calls_to_run = list(tc.function_calls)

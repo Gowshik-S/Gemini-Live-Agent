@@ -53,6 +53,122 @@ _MAX_ITERATIONS = 25
 # How many past task summaries to keep in the session context
 _MAX_TASK_MEMORY = 20
 
+
+# ---------------------------------------------------------------------------
+# Multi-agent configuration loader
+# ---------------------------------------------------------------------------
+
+def _load_agent_configs() -> dict[str, dict]:
+    """Load multi-agent configs from config.yaml.
+
+    Returns a dict of agent_name → config dict with keys:
+    enabled, model, description, tools, max_iterations
+    """
+    import os
+    from pathlib import Path as _P
+
+    defaults = {
+        "task_executor": {
+            "enabled": True,
+            "model": _DEFAULT_ORCHESTRATOR_MODEL,
+            "description": "Executes computer tasks",
+            "tools": "all",
+            "max_iterations": 25,
+        },
+    }
+
+    try:
+        import yaml
+        for candidate in (
+            _P(__file__).resolve().parent.parent / "config.yaml",
+            _P(os.getcwd()) / "config.yaml",
+        ):
+            if candidate.is_file():
+                data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+                agents = data.get("rio", {}).get("agents", {})
+                if agents:
+                    return {
+                        name: {
+                            "enabled": cfg.get("enabled", True),
+                            "model": cfg.get("model", _DEFAULT_ORCHESTRATOR_MODEL),
+                            "description": cfg.get("description", ""),
+                            "tools": cfg.get("tools", "all"),
+                            "max_iterations": cfg.get("max_iterations", 25),
+                        }
+                        for name, cfg in agents.items()
+                    }
+    except Exception:
+        pass
+
+    return defaults
+
+
+# Tool sets for multi-agent routing
+_TOOL_SETS = {
+    "all": None,  # All tools (default)
+    "screen": frozenset({
+        "smart_click", "screen_click", "screen_type", "screen_scroll",
+        "screen_hotkey", "screen_move", "screen_drag", "find_window",
+        "focus_window", "open_application", "list_all_windows",
+        "get_active_window", "minimize_window", "maximize_window",
+        "close_window", "resize_window", "move_window",
+        "capture_screen", "get_screen_info",
+        "save_note", "get_notes", "search_notes",
+    }),
+    "dev": frozenset({
+        "read_file", "write_file", "patch_file", "run_command",
+        "capture_screen", "save_note", "get_notes", "search_notes",
+    }),
+    "memory": frozenset({
+        "save_note", "get_notes", "search_notes", "export_context",
+        "memory_stats", "read_file",
+    }),
+    "creative": frozenset({
+        "generate_image", "generate_video",
+        "save_note", "get_notes", "search_notes",
+    }),
+}
+
+
+def _select_agent(goal: str, agent_configs: dict[str, dict]) -> str:
+    """Select the best agent for a given task goal.
+
+    Keyword-based routing — maps task content to agent specializations.
+    """
+    goal_lower = goal.lower()
+
+    # Code/dev keywords → code_agent
+    code_keywords = (
+        "code", "debug", "fix", "refactor", "function", "class", "variable",
+        "import", "error", "traceback", "syntax", "compile", "build", "test",
+        "read file", "write file", "patch", "git", "commit", "deploy",
+        ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
+    )
+    if any(kw in goal_lower for kw in code_keywords):
+        if "code_agent" in agent_configs and agent_configs["code_agent"]["enabled"]:
+            return "code_agent"
+
+    # Creative keywords → creative_agent
+    creative_keywords = (
+        "generate image", "create image", "draw", "design", "generate video",
+        "imagen", "veo", "picture", "illustration", "photo",
+    )
+    if any(kw in goal_lower for kw in creative_keywords):
+        if "creative_agent" in agent_configs and agent_configs["creative_agent"]["enabled"]:
+            return "creative_agent"
+
+    # Research/explanation keywords → research_agent
+    research_keywords = (
+        "research", "analyze", "explain", "compare", "summarize",
+        "what is", "how does", "why", "investigate", "study",
+    )
+    if any(kw in goal_lower for kw in research_keywords):
+        if "research_agent" in agent_configs and agent_configs["research_agent"]["enabled"]:
+            return "research_agent"
+
+    # Default → task_executor for screen/computer tasks
+    return "task_executor"
+
 # ---------------------------------------------------------------------------
 # Task-request detector (mirrors the one in local/main.py)
 # ---------------------------------------------------------------------------
@@ -155,22 +271,32 @@ _ORCHESTRATOR_SYSTEM_INSTRUCTION = (
     "The user has asked you to complete a specific task on their computer. "
     "Execute it fully using the available tools — do NOT stop to ask for "
     "confirmation mid-task. Complete the ENTIRE task autonomously.\n\n"
-    "MEMORY:\n"
-    "- You receive context from PREVIOUS TASKS completed earlier in this session.\n"
+    "MEMORY — RECALL BEFORE RESPOND:\n"
+    "- FIRST: Call search_notes(query) with keywords from the current task to "
+    "recall relevant context from previous sessions. Do this BEFORE any actions.\n"
     "- Use save_note(key, value) to persist important information (e.g. file paths, "
-    "user preferences, progress) that you or future tasks may need.\n"
-    "- Use get_notes() to retrieve all saved notes before starting work if the task "
-    "seems related to earlier work.\n"
-    "- The PREVIOUS TASKS section shows what was already done — avoid repeating work.\n\n"
+    "user preferences, progress, decisions) for future tasks.\n"
+    "- Use get_notes() to retrieve all saved notes when you need full context.\n"
+    "- The PREVIOUS TASKS section shows what was already done — avoid repeating work.\n"
+    "- Save a concise summary note after completing each task.\n\n"
+    "ACTION VERIFICATION:\n"
+    "- After EVERY screen action, verify the result using the auto-captured screenshot.\n"
+    "- For open_application: check the result's 'verified' field. If false, try again "
+    "or use an alternative approach.\n"
+    "- For window actions: check 'verification' or 'verification_warning' fields.\n"
+    "- If verification fails, retry with a different approach (max 2 retries per step).\n"
+    "- Use list_all_windows() to confirm window state when unsure.\n\n"
     "THE LOOP for every computer task:\n"
-    "1. PLAN: Silently break the task into steps.\n"
-    "2. CAPTURE: Call capture_screen first if you need to see the current state.\n"
-    "3. ANALYZE: Look at the screenshot. Identify what needs to be clicked/typed.\n"
-    "4. ACT: Call the appropriate tool (smart_click, screen_type, screen_hotkey…)\n"
-    "5. VERIFY: After each screen action you receive an auto-captured screenshot. "
-    "Analyze it to confirm the action succeeded.\n"
-    "6. CONTINUE: Repeat 3-5 until the task is fully complete.\n"
-    "7. REPORT: Return a concise 1-2 sentence summary of what you accomplished.\n\n"
+    "1. RECALL: Search notes for relevant context from previous work.\n"
+    "2. PLAN: Silently break the task into steps.\n"
+    "3. CAPTURE: Call capture_screen first if you need to see the current state.\n"
+    "4. ANALYZE: Look at the screenshot. Identify what needs to be clicked/typed.\n"
+    "5. ACT: Call the appropriate tool (smart_click, screen_type, screen_hotkey…)\n"
+    "6. VERIFY: After each screen action, analyze the auto-captured screenshot "
+    "AND the verification fields in the tool result to confirm success.\n"
+    "7. CONTINUE: Repeat 4-6 until the task is fully complete.\n"
+    "8. SAVE: Save a summary note of what was accomplished.\n"
+    "9. REPORT: Return a concise 1-2 sentence summary of what you accomplished.\n\n"
     "RULES:\n"
     "- ALWAYS use smart_click(target='description') instead of screen_click when "
     "you know what UI element to click but not its exact pixel coordinates.\n"
@@ -218,12 +344,14 @@ class ToolOrchestrator:
         )
         # Persistent notes the model can save/retrieve during the session
         self._notes: dict[str, str] = {}
+        # Multi-agent configs
+        self._agent_configs = _load_agent_configs()
 
         # Register built-in memory tools so the model can save/recall notes
         self._register_memory_tools()
 
     def _register_memory_tools(self) -> None:
-        """Add save_note and get_notes as callable tools for the model."""
+        """Add save_note, get_notes, and search_notes as callable tools for the model."""
 
         async def save_note(key: str, value: str) -> dict:
             """Save a persistent note for this session. Use this to remember
@@ -243,7 +371,23 @@ class ToolOrchestrator:
                 return {"success": True, "key": key, "value": val}
             return {"success": True, "notes": dict(self._notes)}
 
-        for fn in (save_note, get_notes):
+        async def search_notes(query: str, limit: int = 5) -> dict:
+            """Search saved notes by keyword. Returns matching notes ranked
+            by relevance. ALWAYS call this before starting a task to recall
+            relevant context from previous work."""
+            if not query.strip():
+                return {"success": True, "results": [], "message": "Empty query."}
+            keywords = query.lower().split()
+            results = []
+            for k, v in self._notes.items():
+                text = f"{k} {v}".lower()
+                score = sum(1 for kw in keywords if kw in text)
+                if score > 0:
+                    results.append({"key": k, "value": v[:500], "score": score})
+            results.sort(key=lambda r: -r["score"])
+            return {"success": True, "results": results[:limit]}
+
+        for fn in (save_note, get_notes, search_notes):
             self._tool_fns.append(fn)
             self._tool_map[fn.__name__] = fn
 
@@ -277,24 +421,56 @@ class ToolOrchestrator:
     ) -> None:
         """Run the agentic loop to completion and inject the result.
 
-        Args:
-            goal: Natural-language task description from the user's transcription.
-            inject_context: Async callable that sends a SYSTEM message into the
-                            live audio session so the model can speak the result.
+        Uses multi-agent routing to select the best agent (model + tools)
+        for the task. Falls back to the default task_executor if routing fails.
         """
-        self._log.info("orchestrator.task.start", goal=goal[:120])
+        # Select the best agent for this task
+        agent_name = _select_agent(goal, self._agent_configs)
+        agent_cfg = self._agent_configs.get(agent_name, {})
+        agent_model = agent_cfg.get("model", self._model)
+        agent_tools_key = agent_cfg.get("tools", "all")
+        max_iters = agent_cfg.get("max_iterations", _MAX_ITERATIONS)
+
+        self._log.info(
+            "orchestrator.task.start",
+            goal=goal[:120],
+            agent=agent_name,
+            model=agent_model,
+        )
         try:
-            result_text = await self._agent_loop(goal)
+            # Filter tools based on agent's tool set
+            tool_set = _TOOL_SETS.get(agent_tools_key)
+            if tool_set is not None:
+                agent_tool_fns = [
+                    fn for fn in self._tool_fns if fn.__name__ in tool_set
+                ]
+                agent_tool_map = {fn.__name__: fn for fn in agent_tool_fns}
+            else:
+                agent_tool_fns = self._tool_fns
+                agent_tool_map = self._tool_map
+
+            result_text = await self._agent_loop(
+                goal,
+                model=agent_model,
+                tool_fns=agent_tool_fns,
+                tool_map=agent_tool_map,
+                max_iterations=max_iters,
+            )
             # Record in session memory so future tasks have context
             self._task_history.append((goal, result_text))
             completion_msg = (
                 f"[SYSTEM: The autonomous task executor has completed the task.\n"
+                f"Agent: {agent_name} (model: {agent_model})\n"
                 f"Original goal: {goal}\n"
                 f"What was done: {result_text}\n"
                 f"Acknowledge completion in 1-2 sentences. Be concise and natural.]"
             )
             await inject_context(completion_msg)
-            self._log.info("orchestrator.task.complete", goal=goal[:80])
+            self._log.info(
+                "orchestrator.task.complete",
+                goal=goal[:80],
+                agent=agent_name,
+            )
 
         except asyncio.CancelledError:
             self._log.info("orchestrator.task.cancelled", goal=goal[:60])
@@ -318,13 +494,24 @@ class ToolOrchestrator:
     # Internal: ReAct agent loop
     # ------------------------------------------------------------------
 
-    async def _agent_loop(self, goal: str) -> str:
+    async def _agent_loop(
+        self,
+        goal: str,
+        model: str | None = None,
+        tool_fns: list | None = None,
+        tool_map: dict | None = None,
+        max_iterations: int = _MAX_ITERATIONS,
+    ) -> str:
         """ReAct loop: think → call tools → observe → repeat until done.
 
         Returns the final summary text from the orchestrator model.
         Raises on unrecoverable errors.
         """
         from google.genai import types as _types
+
+        use_model = model or self._model
+        use_tool_fns = tool_fns if tool_fns is not None else self._tool_fns
+        use_tool_map = tool_map if tool_map is not None else self._tool_map
 
         # Build context preamble from past tasks and saved notes
         context_parts: list[str] = []
@@ -348,19 +535,19 @@ class ToolOrchestrator:
             )
         ]
 
-        for iteration in range(_MAX_ITERATIONS):
+        for iteration in range(max_iterations):
             self._log.debug(
                 "orchestrator.loop", iteration=iteration, goal=goal[:60],
             )
 
             # Call the orchestrator model with full tool list
             response = await self._client.aio.models.generate_content(
-                model=self._model,
+                model=use_model,
                 contents=history,
                 config=_types.GenerateContentConfig(
                     system_instruction=_ORCHESTRATOR_SYSTEM_INSTRUCTION,
                     # generate_content auto-converts Python callables → schemas
-                    tools=self._tool_fns,
+                    tools=use_tool_fns,
                     temperature=0.2,
                     max_output_tokens=4096,
                     # Disable auto function calling — we execute tools ourselves
@@ -400,7 +587,7 @@ class ToolOrchestrator:
                 tool_name = fc.name
                 tool_args = dict(fc.args) if fc.args else {}
 
-                fn = self._tool_map.get(tool_name)
+                fn = use_tool_map.get(tool_name)
                 if fn is None:
                     self._log.warning(
                         "orchestrator.unknown_tool", name=tool_name,
@@ -408,7 +595,7 @@ class ToolOrchestrator:
                     exec_result: dict = {
                         "success": False,
                         "error": f"Unknown tool: '{tool_name}'. "
-                                 f"Available: {sorted(self._tool_map.keys())}",
+                                 f"Available: {sorted(use_tool_map.keys())}",
                     }
                 else:
                     self._log.info(
@@ -453,4 +640,4 @@ class ToolOrchestrator:
                 _types.Content(role="user", parts=fn_response_parts)
             )
 
-        return f"Task reached the {_MAX_ITERATIONS}-step safety limit."
+        return f"Task reached the {max_iterations}-step safety limit."

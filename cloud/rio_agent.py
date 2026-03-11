@@ -316,6 +316,102 @@ def _make_tools(bridge: ToolBridge) -> list:
             "smart_click", {"target": target, "action": action, "clicks": clicks}
         )
 
+    # -- Windows Power Tools --
+
+    async def open_application(name_or_path: str) -> dict:
+        """Open an application by name or path.
+        Supports common app names (notepad, chrome, firefox, explorer, calc,
+        paint, cmd, powershell, code, edge, word, excel, teams, spotify, etc.),
+        full executable paths, file associations, and URLs.
+        The application launches asynchronously — it may take a moment to appear."""
+        return await bridge.dispatch(
+            "open_application", {"name_or_path": name_or_path}
+        )
+
+    async def list_all_windows() -> dict:
+        """List all visible windows on the desktop with their titles,
+        positions, sizes, and states (minimized/maximized/active)."""
+        return await bridge.dispatch("list_all_windows", {})
+
+    async def get_active_window() -> dict:
+        """Get information about the currently active (foreground) window."""
+        return await bridge.dispatch("get_active_window", {})
+
+    async def minimize_window(title: str) -> dict:
+        """Minimize a window by title (substring match)."""
+        return await bridge.dispatch("minimize_window", {"title": title})
+
+    async def maximize_window(title: str) -> dict:
+        """Maximize a window by title (substring match)."""
+        return await bridge.dispatch("maximize_window", {"title": title})
+
+    async def close_window(title: str) -> dict:
+        """Close a window by title (substring match).
+        Use with caution — unsaved work in the window may be lost."""
+        return await bridge.dispatch("close_window", {"title": title})
+
+    async def resize_window(title: str, width: int, height: int) -> dict:
+        """Resize a window by title to the specified width and height (pixels)."""
+        return await bridge.dispatch(
+            "resize_window", {"title": title, "width": width, "height": height}
+        )
+
+    async def move_window(title: str, x: int, y: int) -> dict:
+        """Move a window by title to position (x, y) on screen."""
+        return await bridge.dispatch(
+            "move_window", {"title": title, "x": x, "y": y}
+        )
+
+    async def list_processes(name_filter: str = "") -> dict:
+        """List running processes sorted by memory usage.
+        Optionally filter by name (case-insensitive substring match).
+        Returns top 50 processes with PID, name, and memory usage."""
+        return await bridge.dispatch(
+            "list_processes", {"name_filter": name_filter}
+        )
+
+    async def kill_process(name_or_pid: str) -> dict:
+        """Kill a process by name or PID. Multi-match support:
+        if name matches multiple processes, all matching are terminated.
+        Protected system processes (csrss, lsass, svchost, etc.) cannot be killed."""
+        return await bridge.dispatch(
+            "kill_process", {"name_or_pid": name_or_pid}
+        )
+
+    async def get_clipboard() -> dict:
+        """Read the current clipboard text content."""
+        return await bridge.dispatch("get_clipboard", {})
+
+    async def set_clipboard(text: str) -> dict:
+        """Set the clipboard text content. Useful for sharing text
+        between applications."""
+        return await bridge.dispatch("set_clipboard", {"text": text})
+
+    async def get_screen_info() -> dict:
+        """Get monitor information: resolution, DPI, bounds for all screens.
+        Useful for understanding the display layout."""
+        return await bridge.dispatch("get_screen_info", {})
+
+    # -- Persistent Memory (enhanced) --
+
+    async def search_notes(query: str, limit: int = 5) -> dict:
+        """Search persistent notes by keyword. Returns matching notes ranked
+        by relevance. Use this BEFORE starting a task to recall relevant context
+        from previous sessions."""
+        return await bridge.dispatch(
+            "search_notes", {"query": query, "limit": limit}
+        )
+
+    async def export_context() -> dict:
+        """Export all session memory to a compact context.txt file.
+        Useful for creating a persistent reference of everything learned."""
+        return await bridge.dispatch("export_context", {})
+
+    async def memory_stats() -> dict:
+        """Get memory system statistics: note count, total size,
+        and whether compaction is needed."""
+        return await bridge.dispatch("memory_stats", {})
+
     return [
         # Core dev tools
         read_file, write_file, patch_file, run_command, capture_screen,
@@ -324,6 +420,14 @@ def _make_tools(bridge: ToolBridge) -> list:
         screen_move, screen_drag, find_window, focus_window,
         # Vision-grounded navigation (Computer Use model)
         smart_click,
+        # Windows power tools
+        open_application, list_all_windows, get_active_window,
+        minimize_window, maximize_window, close_window,
+        resize_window, move_window,
+        list_processes, kill_process,
+        get_clipboard, set_clipboard, get_screen_info,
+        # Persistent memory (enhanced)
+        search_notes, export_context, memory_stats,
         # Customer care
         create_ticket, update_ticket,
         # Tutor

@@ -120,6 +120,8 @@ class ToolExecutor:
         "screen_click", "screen_type", "screen_scroll",
         "screen_hotkey", "screen_move", "screen_drag",
         "smart_click",  # Computer Use visual-grounding click
+        "open_application", "focus_window",
+        "minimize_window", "maximize_window", "close_window",
     })
 
     # Stuck detection: max identical consecutive actions before warning
@@ -157,18 +159,105 @@ class ToolExecutor:
         self._ws_send_binary = send_binary_fn
         log.info("tools.ws_sender_attached")
 
+    # Actions that modify window state — these get post-action verification
+    _WINDOW_VERIFY_ACTIONS = frozenset({
+        "open_application", "focus_window", "close_window",
+        "minimize_window", "maximize_window",
+    })
+
+    async def _verify_action(
+        self, name: str, args: dict[str, Any], result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Post-action verification for window management actions.
+
+        Checks whether the expected window state change actually occurred.
+        Returns the result dict enriched with verification data.
+        """
+        if name not in self._WINDOW_VERIFY_ACTIONS:
+            return result
+        if self._screen_navigator is None:
+            return result
+
+        try:
+            if name == "open_application":
+                # open_application already has built-in verification
+                # Just add a window list snapshot for the model
+                win_result = await self._screen_navigator.list_all_windows()
+                if win_result.get("success"):
+                    top_windows = [
+                        w["title"] for w in win_result.get("windows", [])[:10]
+                    ]
+                    result["visible_windows"] = top_windows
+
+            elif name == "focus_window":
+                title_query = (args.get("title") or args.get("title_contains") or "").lower()
+                if title_query:
+                    active = await self._screen_navigator.get_active_window()
+                    if active.get("success"):
+                        active_title = (active.get("window", {}) or {}).get("title", "")
+                        if not active_title:
+                            active_title = active.get("title", "")
+                        if title_query in active_title.lower():
+                            result["verification"] = "Window is now in foreground."
+                        else:
+                            result["verification_warning"] = (
+                                f"Focus requested for '{title_query}' but active window "
+                                f"is '{active_title}'. The window may not have focused correctly."
+                            )
+
+            elif name == "close_window":
+                title_query = (args.get("title") or args.get("title_contains") or "").lower()
+                if title_query:
+                    await asyncio.sleep(0.3)
+                    win_result = await self._screen_navigator.list_all_windows()
+                    if win_result.get("success"):
+                        still_open = [
+                            w["title"] for w in win_result.get("windows", [])
+                            if title_query in w["title"].lower()
+                        ]
+                        if still_open:
+                            result["verification_warning"] = (
+                                f"Window matching '{title_query}' is still visible: {still_open}. "
+                                "Close may have been blocked by an unsaved-changes dialog."
+                            )
+                        else:
+                            result["verification"] = "Window closed successfully."
+
+            elif name in ("minimize_window", "maximize_window"):
+                title_query = (args.get("title") or args.get("title_contains") or "").lower()
+                if title_query:
+                    win_result = await self._screen_navigator.list_all_windows()
+                    if win_result.get("success"):
+                        for w in win_result.get("windows", []):
+                            if title_query in w.get("title", "").lower():
+                                if name == "minimize_window" and w.get("minimized"):
+                                    result["verification"] = "Window minimized."
+                                elif name == "maximize_window" and w.get("maximized"):
+                                    result["verification"] = "Window maximized."
+                                else:
+                                    result["verification_warning"] = (
+                                        f"Window state may not have changed as expected."
+                                    )
+                                break
+
+        except Exception as exc:
+            log.debug("tool.verify.error", action=name, error=str(exc))
+            # Verification is best-effort — don't fail the action
+        return result
+
     async def execute_with_auto_capture(
         self, name: str, args: dict[str, Any],
     ) -> dict[str, Any]:
-        """Execute a screen action tool, then auto-capture a screenshot.
+        """Execute a screen action tool, verify results, then auto-capture.
 
-        This closes the autonomous agent feedback loop:
+        Feedback loop (OpenClaw-inspired):
         1. Execute the screen action (click, type, scroll, etc.)
-        2. Wait briefly for the UI to update (300ms)
-        3. Capture a new screenshot
-        4. Send the screenshot to the cloud as a binary image frame
+        2. Verify the action result (window state checks for window tools)
+        3. Wait briefly for the UI to update
+        4. Capture a new screenshot
+        5. Send the screenshot to the cloud as a binary image frame
 
-        Gemini sees: tool result + fresh screenshot of the result
+        Gemini sees: tool result + verification status + fresh screenshot
         → can decide the next action without another user request.
         """
         # Stuck detection: track repeated identical actions
@@ -181,7 +270,7 @@ class ToolExecutor:
         result = await self.execute(name, args)
 
         if not result.get("success", False):
-            return result  # Action failed — skip auto-capture
+            return result  # Action failed — skip verification and capture
 
         # Check if stuck (same action repeated MAX_REPEATED_ACTIONS times)
         if (
@@ -195,10 +284,13 @@ class ToolExecutor:
             )
             log.warning("tool.stuck_detected", action=name, repeats=self.MAX_REPEATED_ACTIONS)
 
-        # Step 2: Brief pause for UI to settle (reduced from 300ms for B-13)
+        # Step 2: Verify action result (window management actions)
+        result = await self._verify_action(name, args, result)
+
+        # Step 3: Brief pause for UI to settle
         await asyncio.sleep(0.15)
 
-        # Step 3 + 4: Auto-capture and send
+        # Step 4 + 5: Auto-capture and send
         if self._screen_capture is not None and self._ws_send_binary is not None:
             try:
                 jpeg = await self._screen_capture.capture_async(force=True)
@@ -254,10 +346,27 @@ class ToolExecutor:
             "focus_window": self._focus_window,
             # Vision-grounded navigation (Computer Use model)
             "smart_click": self._smart_click,
+            # Windows power tools
+            "open_application": self._open_application,
+            "list_all_windows": self._list_all_windows,
+            "get_active_window": self._get_active_window,
+            "minimize_window": self._minimize_window,
+            "maximize_window": self._maximize_window,
+            "close_window": self._close_window,
+            "resize_window": self._resize_window,
+            "move_window": self._move_window,
+            "list_processes": self._list_processes,
+            "kill_process": self._kill_process,
+            "get_clipboard": self._get_clipboard,
+            "set_clipboard": self._set_clipboard,
+            "get_screen_info": self._get_screen_info,
             # Persistent memory
             "get_task_status": self._get_task_status,
             "save_note": self._save_note,
             "get_notes": self._get_notes,
+            "search_notes": self._search_notes,
+            "export_context": self._export_context,
+            "memory_stats": self._memory_stats,
             # GenMedia (Imagen 3 + Veo 2)
             "generate_image": self._generate_image,
             "generate_video": self._generate_video,
@@ -930,6 +1039,104 @@ class ToolExecutor:
         return await self._screen_navigator.focus_window(query)
 
     # ------------------------------------------------------------------
+    # Windows Power Tools (delegate to ScreenNavigator)
+    # ------------------------------------------------------------------
+
+    async def _open_application(self, name_or_path: str) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.open_application(name_or_path)
+
+    async def _list_all_windows(self) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.list_all_windows()
+
+    async def _get_active_window(self) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.get_active_window()
+
+    async def _minimize_window(
+        self, title: str = "", title_contains: str = "",
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.minimize_window(query)
+
+    async def _maximize_window(
+        self, title: str = "", title_contains: str = "",
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.maximize_window(query)
+
+    async def _close_window(
+        self, title: str = "", title_contains: str = "",
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.close_window(query)
+
+    async def _resize_window(
+        self, title: str = "", title_contains: str = "",
+        width: int = 800, height: int = 600,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.resize_window(query, int(width), int(height))
+
+    async def _move_window(
+        self, title: str = "", title_contains: str = "",
+        x: int = 0, y: int = 0,
+    ) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        query = (title or title_contains).strip()
+        if not query:
+            return {"success": False, "error": "Missing required argument: title"}
+        return await self._screen_navigator.move_window(query, int(x), int(y))
+
+    async def _list_processes(self, name_filter: str = "") -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.list_processes(name_filter)
+
+    async def _kill_process(self, name_or_pid: str = "") -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        if not name_or_pid.strip():
+            return {"success": False, "error": "Missing required argument: name_or_pid"}
+        return await self._screen_navigator.kill_process(name_or_pid)
+
+    async def _get_clipboard(self) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.get_clipboard()
+
+    async def _set_clipboard(self, text: str) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.set_clipboard(text)
+
+    async def _get_screen_info(self) -> dict[str, Any]:
+        if err := self._nav_or_error():
+            return err
+        return await self._screen_navigator.get_screen_info()
+
+    # ------------------------------------------------------------------
     # Persistent Memory Tools
     # ------------------------------------------------------------------
 
@@ -948,11 +1155,11 @@ class ToolExecutor:
         summary = self._task_store.get_status_summary()
         return {"success": True, "summary": summary}
 
-    async def _save_note(self, key: str, value: str) -> dict[str, Any]:
+    async def _save_note(self, key: str, value: str, category: str = "general") -> dict[str, Any]:
         """Save a persistent session note that survives across sessions."""
         if not hasattr(self, '_session_memory') or self._session_memory is None:
             return {"success": False, "error": "Session memory not available"}
-        self._session_memory.set(key, value)
+        self._session_memory.set(key, value, category=category)
         return {"success": True, "key": key, "message": f"Note '{key}' saved."}
 
     async def _get_notes(self, key: str = "") -> dict[str, Any]:
@@ -967,103 +1174,426 @@ class ToolExecutor:
         summary = self._session_memory.get_summary()
         return {"success": True, "notes": summary}
 
+    async def _search_notes(self, query: str, limit: int = 5) -> dict[str, Any]:
+        """Search persistent notes by keyword. Returns matching notes ranked by relevance."""
+        if not hasattr(self, '_session_memory') or self._session_memory is None:
+            return {"success": False, "error": "Session memory not available"}
+        results = self._session_memory.search(query, limit=limit)
+        if not results:
+            return {"success": True, "results": [], "message": "No matching notes found."}
+        return {"success": True, "results": results, "count": len(results)}
+
+    async def _export_context(self) -> dict[str, Any]:
+        """Export all session memory to a compact context.txt file."""
+        if not hasattr(self, '_session_memory') or self._session_memory is None:
+            return {"success": False, "error": "Session memory not available"}
+        from pathlib import Path
+        ctx_path = str(Path(self._cwd) / "context.txt")
+        content = self._session_memory.export_context(filepath=ctx_path)
+        return {
+            "success": True,
+            "path": ctx_path,
+            "size": len(content),
+            "message": f"Context exported to {ctx_path} ({len(content)} chars)",
+        }
+
+    async def _memory_stats(self) -> dict[str, Any]:
+        """Get memory system statistics: note count, total size, compaction status."""
+        if not hasattr(self, '_session_memory') or self._session_memory is None:
+            return {"success": False, "error": "Session memory not available"}
+        stats = self._session_memory.get_stats()
+        return {"success": True, **stats}
+
     # ------------------------------------------------------------------
-    # Computer Use — visual-grounding screen navigation
+    # Computer Use — official predefined-actions API
     # ------------------------------------------------------------------
+
+    def _get_computer_use_client(self):
+        """Lazy-create a genai Client for the computer-use model."""
+        if hasattr(self, "_cu_client") and self._cu_client is not None:
+            return self._cu_client
+
+        from google import genai as _genai
+
+        gcp_project = _get_env_value("GOOGLE_CLOUD_PROJECT")
+        gcp_location = _get_env_value("GOOGLE_CLOUD_LOCATION") or "global"
+
+        if gcp_project:
+            self._cu_client = _genai.Client(
+                vertexai=True,
+                project=gcp_project,
+                location=gcp_location,
+            )
+        else:
+            api_key = _get_env_value("GEMINI_API_KEY")
+            if not api_key:
+                return None
+            self._cu_client = _genai.Client(api_key=api_key)
+
+        return self._cu_client
+
+    def _get_screen_size(self) -> tuple[int, int]:
+        """Get real screen resolution from screen capture metadata."""
+        if self._screen_capture is not None:
+            cr = self._screen_capture.get_last_capture_result()
+            if cr is not None:
+                return cr.original_width, cr.original_height
+        # Fallback: try mss
+        try:
+            import mss
+            with mss.mss() as sct:
+                m = sct.monitors[1]
+                return m["width"], m["height"]
+        except Exception:
+            return 1920, 1080  # Safe default
+
+    def _denormalize_x(self, x: int) -> int:
+        """Convert 0-1000 normalized X → real screen pixel X."""
+        w, _ = self._get_screen_size()
+        return int(x / 1000 * w)
+
+    def _denormalize_y(self, y: int) -> int:
+        """Convert 0-1000 normalized Y → real screen pixel Y."""
+        _, h = self._get_screen_size()
+        return int(y / 1000 * h)
+
+    async def _capture_png_for_cu(self) -> bytes | None:
+        """Capture a full-resolution screenshot as PNG for computer-use model feedback."""
+        if self._screen_capture is None:
+            return None
+        try:
+            jpeg = await self._screen_capture.capture_full_resolution_async()
+            if jpeg is None:
+                return None
+            # Computer-use model prefers PNG for response; convert JPEG→PNG
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(jpeg))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            log.warning("cu.capture_png_failed", error=str(exc))
+            return None
+
+    async def _execute_cu_action(
+        self, action_name: str, args: dict,
+    ) -> dict[str, Any]:
+        """Execute a single predefined computer-use action on the local screen.
+
+        Handles all 13 official predefined actions + coordinate denormalization.
+        Returns the action result dict.
+        """
+        nav = self._screen_navigator
+        if nav is None or not nav.available:
+            return {"success": False, "error": "Screen navigator not available"}
+
+        log.info("cu.action", name=action_name, args=args)
+
+        if action_name == "click_at":
+            rx = self._denormalize_x(int(args.get("x", 0)))
+            ry = self._denormalize_y(int(args.get("y", 0)))
+            return await nav.click_absolute(rx, ry)
+
+        elif action_name == "hover_at":
+            rx = self._denormalize_x(int(args.get("x", 0)))
+            ry = self._denormalize_y(int(args.get("y", 0)))
+            return await nav.move(rx, ry)
+
+        elif action_name == "type_text_at":
+            rx = self._denormalize_x(int(args.get("x", 0)))
+            ry = self._denormalize_y(int(args.get("y", 0)))
+            text = args.get("text", "")
+            press_enter = args.get("press_enter", False)
+            clear_first = args.get("clear_before_typing", True)
+            # Click the target position first
+            click_result = await nav.click_absolute(rx, ry)
+            if not click_result.get("success"):
+                return click_result
+            await asyncio.sleep(0.1)
+            # Clear existing text if requested
+            if clear_first:
+                await nav.hotkey("ctrl+a")
+                await asyncio.sleep(0.05)
+            # Type the text
+            result = await nav.type_text(text)
+            if press_enter and result.get("success"):
+                await asyncio.sleep(0.05)
+                await nav.hotkey("enter")
+            return result
+
+        elif action_name == "scroll_at":
+            rx = self._denormalize_x(int(args.get("x", 0)))
+            ry = self._denormalize_y(int(args.get("y", 0)))
+            direction = args.get("direction", "down")
+            amount = int(args.get("amount", 3))
+            clicks = amount if direction == "up" else -amount
+            return await nav.scroll(rx, ry, clicks)
+
+        elif action_name == "scroll_document":
+            direction = args.get("direction", "down")
+            amount = int(args.get("amount", 3))
+            clicks = amount if direction == "up" else -amount
+            # Scroll at screen center
+            w, h = self._get_screen_size()
+            return await nav.scroll(w // 2, h // 2, clicks)
+
+        elif action_name == "key_combination":
+            keys = args.get("keys", [])
+            if isinstance(keys, list):
+                key_str = "+".join(keys)
+            else:
+                key_str = str(keys)
+            return await nav.hotkey(key_str)
+
+        elif action_name == "drag_and_drop":
+            sx = self._denormalize_x(int(args.get("startX", args.get("start_x", 0))))
+            sy = self._denormalize_y(int(args.get("startY", args.get("start_y", 0))))
+            ex = self._denormalize_x(int(args.get("endX", args.get("end_x", 0))))
+            ey = self._denormalize_y(int(args.get("endY", args.get("end_y", 0))))
+            return await nav.drag(sx, sy, ex, ey)
+
+        elif action_name == "wait_5_seconds":
+            await asyncio.sleep(5)
+            return {"success": True, "action": "wait", "duration": 5}
+
+        elif action_name == "navigate":
+            url = args.get("url", "")
+            if url:
+                await nav.hotkey("ctrl+l")
+                await asyncio.sleep(0.2)
+                await nav.type_text(url)
+                await asyncio.sleep(0.1)
+                await nav.hotkey("enter")
+            return {"success": True, "action": "navigate", "url": url}
+
+        elif action_name == "go_back":
+            return await nav.hotkey("alt+left")
+
+        elif action_name == "go_forward":
+            return await nav.hotkey("alt+right")
+
+        elif action_name == "search":
+            query = args.get("query", "")
+            await nav.hotkey("ctrl+l")
+            await asyncio.sleep(0.2)
+            await nav.type_text(query)
+            await asyncio.sleep(0.1)
+            return await nav.hotkey("enter")
+
+        elif action_name == "open_web_browser":
+            import subprocess as _sp
+            try:
+                _sp.Popen("start msedge", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            except Exception:
+                _sp.Popen("start chrome", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            await asyncio.sleep(1.5)
+            return {"success": True, "action": "open_web_browser"}
+
+        else:
+            log.warning("cu.unknown_action", name=action_name)
+            return {"success": False, "error": f"Unknown computer-use action: {action_name}"}
 
     async def _computer_use_ground(
         self, description: str,
     ) -> dict[str, Any]:
-        """Take a fresh screenshot and ask gemini-2.5-computer-use-preview-10-2025
-        to locate *description* on screen. Returns {success, x, y}."""
+        """Use the official Computer Use predefined-actions API to locate
+        an element on screen.
+
+        Follows the official Google agentic loop pattern:
+          1. Take screenshot → send with task description
+          2. Model returns predefined actions (click_at, type_text_at, etc.)
+             with 0-1000 normalized coordinates
+          3. Execute actions, capture new screenshot
+          4. Send FunctionResponse with screenshot as FunctionResponseBlob
+          5. Loop until model returns no more actions or max turns reached
+          6. Return coordinates of the first click_at action
+        """
         if self._screen_capture is None:
             return {"success": False, "error": "Screen capture not attached"}
 
-        # Capture at FULL RESOLUTION so the model returns coordinates that
-        # map directly to the real screen — no scaling needed.
+        # Take initial screenshot
         try:
-            jpeg = await self._screen_capture.capture_full_resolution_async()
+            screenshot = await self._screen_capture.capture_full_resolution_async()
         except Exception as exc:
             return {"success": False, "error": f"Screenshot failed: {exc}"}
-        if jpeg is None:
+        if screenshot is None:
             return {"success": False, "error": "Screenshot returned None"}
 
-        # Call Computer Use model via Vertex AI (free tier has 0 quota for
-        # computer-use on the Gemini API, so we route through Vertex AI).
+        client = self._get_computer_use_client()
+        if client is None:
+            return {
+                "success": False,
+                "error": (
+                    "Neither GOOGLE_CLOUD_PROJECT (for Vertex AI) nor "
+                    "GEMINI_API_KEY is set. Computer Use model requires "
+                    "Vertex AI or paid billing."
+                ),
+            }
+
         try:
-            from google import genai as _genai
             from google.genai import types as _gtypes
 
-            # Vertex AI for computer-use model (requires GCP project)
-            gcp_project = _get_env_value("GOOGLE_CLOUD_PROJECT")
-            gcp_location = _get_env_value("GOOGLE_CLOUD_LOCATION") or "global"
-            use_vertex = bool(gcp_project)
+            cu_model = (
+                _get_env_value("COMPUTER_USE_MODEL")
+                or "gemini-2.5-computer-use-preview-10-2025"
+            )
 
-            if use_vertex:
-                client = _genai.Client(
-                    vertexai=True,
-                    project=gcp_project,
-                    location=gcp_location,
-                )
-            else:
-                # Fallback to API key (requires paid billing for computer-use)
-                api_key = _get_env_value("GEMINI_API_KEY")
-                if not api_key:
+            # Build initial contents with screenshot + task description
+            contents: list = [
+                _gtypes.Content(role="user", parts=[
+                    _gtypes.Part(text=(
+                        f"Find and click on: {description}\n"
+                        f"If you can see the element, use click_at to click it."
+                    )),
+                    _gtypes.Part.from_bytes(
+                        data=screenshot, mime_type="image/jpeg",
+                    ),
+                ])
+            ]
+
+            # Official Computer Use config (matches Google reference impl)
+            config = _gtypes.GenerateContentConfig(
+                temperature=1.0,
+                top_p=0.95,
+                max_output_tokens=8192,
+                tools=[
+                    _gtypes.Tool(
+                        computer_use=_gtypes.ComputerUse(
+                            environment=_gtypes.Environment.ENVIRONMENT_BROWSER,
+                        ),
+                    ),
+                ],
+            )
+
+            first_click = None
+            max_turns = 5  # Safety limit for the agentic loop
+
+            for turn in range(max_turns):
+                # --- Call model with retry for transient 500s ---
+                response = None
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        response = await client.aio.models.generate_content(
+                            model=cu_model,
+                            contents=contents,
+                            config=config,
+                        )
+                        break
+                    except Exception as retry_exc:
+                        last_exc = retry_exc
+                        err_str = str(retry_exc)
+                        if "500" in err_str or "503" in err_str or "INTERNAL" in err_str:
+                            wait = (attempt + 1) * 2
+                            log.warning("cu.retry", attempt=attempt + 1, wait=wait, error=err_str[:200])
+                            await asyncio.sleep(wait)
+                            continue
+                        raise
+                else:
+                    log.error("cu.ground_error", description=description, error=str(last_exc))
+                    return {"success": False, "error": f"Computer Use model error after 3 attempts: {last_exc}"}
+
+                # --- Parse model response ---
+                candidate = response.candidates[0] if response.candidates else None
+                if candidate is None or candidate.content is None:
+                    return {"success": False, "error": "No response from Computer Use model"}
+
+                # Append model response to conversation history
+                contents.append(candidate.content)
+
+                # Extract function calls and thoughts
+                function_calls = []
+                thoughts = []
+                for part in candidate.content.parts or []:
+                    fc = getattr(part, "function_call", None)
+                    if fc:
+                        function_calls.append(fc)
+                    elif hasattr(part, "text") and part.text:
+                        thoughts.append(part.text)
+
+                if thoughts:
+                    log.debug("cu.reasoning", text=" ".join(thoughts)[:300])
+
+                # No actions → model is done (or element not found)
+                if not function_calls:
+                    if first_click:
+                        break  # We already found what we needed
+                    text = " ".join(thoughts) if thoughts else "(no explanation)"
                     return {
                         "success": False,
-                        "error": (
-                            "Neither GOOGLE_CLOUD_PROJECT (for Vertex AI) nor "
-                            "GEMINI_API_KEY is set. Computer Use model requires "
-                            "Vertex AI or paid billing. Set GOOGLE_CLOUD_PROJECT "
-                            "in rio/cloud/.env to use Vertex AI."
-                        ),
+                        "error": f"Element not found on screen: {description}. Model said: {text[:300]}",
                     }
-                client = _genai.Client(api_key=api_key)
 
-            prompt = (
-                f"Look at this screenshot carefully.\n"
-                f"Find the UI element: **{description}**\n"
-                f"Return ONLY a JSON object with the pixel coordinates of its center:\n"
-                f'  {{"x": <int>, "y": <int>}}\n'
-                f'If the element is not visible, return: {{"found": false}}\n'
-                f"No markdown fences, no explanation — raw JSON only."
-            )
+                # --- Execute actions and capture feedback ---
+                fn_response_parts = []
+                for fc in function_calls:
+                    log.info("cu.action", name=fc.name, args=fc.args)
 
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-computer-use-preview-10-2025",
-                contents=[
-                    _gtypes.Content(role="user", parts=[
+                    # Record first click_at coordinates
+                    if fc.name == "click_at" and first_click is None:
+                        nx = int(fc.args.get("x", 0))
+                        ny = int(fc.args.get("y", 0))
+                        first_click = {
+                            "normalized_x": nx,
+                            "normalized_y": ny,
+                            "x": self._denormalize_x(nx),
+                            "y": self._denormalize_y(ny),
+                        }
+
+                    # Capture new screenshot after action
+                    # (For ground-only mode we don't physically execute —
+                    #  smart_click will do the actual click later)
+                    try:
+                        new_screenshot = await self._screen_capture.capture_full_resolution_async()
+                    except Exception:
+                        new_screenshot = screenshot  # reuse last
+
+                    # Build FunctionResponse with screenshot blob
+                    # (matches official Google pattern)
+                    fn_response_parts.append(
                         _gtypes.Part(
-                            inline_data=_gtypes.Blob(
-                                mime_type="image/jpeg", data=jpeg,
-                            )
+                            function_response=_gtypes.FunctionResponse(
+                                name=fc.name,
+                                response={"result": "success"},
+                            ),
                         ),
-                        _gtypes.Part(text=prompt),
-                    ])
-                ],
-                config=_gtypes.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=128,
-                ),
-            )
+                    )
 
-            text = (response.text or "").strip()
-            # Strip markdown fences if present
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
+                # Append function responses + new screenshot to history
+                # (Separate screenshot part — more reliable than FunctionResponseBlob
+                #  which may not be supported by all model versions)
+                feedback_parts = fn_response_parts + [
+                    _gtypes.Part.from_bytes(
+                        data=new_screenshot if new_screenshot else screenshot,
+                        mime_type="image/jpeg",
+                    ),
+                ]
+                contents.append(_gtypes.Content(role="user", parts=feedback_parts))
 
-            data = json.loads(text)
-            if not data.get("found", True):
-                return {"success": False, "error": f"Element not found on screen: {description}"}
+                # If we found a click target, we're done
+                if first_click:
+                    break
 
-            return {"success": True, "x": int(data["x"]), "y": int(data["y"])}
+            if first_click is None:
+                return {
+                    "success": False,
+                    "error": f"Element not found after {max_turns} turns: {description}",
+                }
 
-        except json.JSONDecodeError:
-            return {"success": False, "error": f"Computer Use model returned invalid JSON: {text[:200]}"}
+            return {
+                "success": True,
+                "x": first_click["x"],
+                "y": first_click["y"],
+                "normalized": {
+                    "x": first_click["normalized_x"],
+                    "y": first_click["normalized_y"],
+                },
+                "method": "computer_use_predefined_actions",
+            }
+
         except Exception as exc:
+            log.exception("cu.ground_error", description=description)
             return {"success": False, "error": f"Computer Use model error: {exc}"}
 
     async def _smart_click(
@@ -1072,12 +1602,13 @@ class ToolExecutor:
         action: str = "click",
         clicks: int = 1,
     ) -> dict[str, Any]:
-        """Visual-grounding click using gemini-2.5-computer-use-preview-10-2025.
+        """Visual-grounding click using the official Computer Use predefined-actions API.
 
         Describe the element you want to click in natural language
         (e.g. 'the Save button', 'search input field').
-        The Computer Use model analyzes a fresh screenshot to find exact
-        pixel coordinates, then pyautogui executes the click.
+        Uses gemini-2.5-computer-use-preview-10-2025 with the official
+        types.Tool(computer_use=ComputerUse(...)) API and 0-1000 normalized
+        coordinates for reliable element detection.
         """
         if err := self._nav_or_error():
             return err
@@ -1092,11 +1623,12 @@ class ToolExecutor:
         button = "right" if action == "right_click" else "left"
         n_clicks = 2 if action == "double_click" else int(clicks)
 
-        # Use click_absolute: the computer-use model saw a full-resolution
-        # screenshot so its coordinates map 1:1 to real screen pixels.
+        # Coordinates are already denormalized to real screen pixels
         result = await self._screen_navigator.click_absolute(x, y, button=button, clicks=n_clicks)
-        result["grounded_by"] = "computer_use"
+        result["grounded_by"] = "computer_use_official_api"
         result["found_at"] = {"x": x, "y": y}
+        if "normalized" in ground:
+            result["normalized_coords"] = ground["normalized"]
         result["target"] = target
         return result
 

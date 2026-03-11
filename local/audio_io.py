@@ -412,12 +412,48 @@ class AudioPlayback:
         self.clear()
         if self._stream is not None:
             try:
-                self._stream.stop_stream()
+                if self._stream.is_active():
+                    self._stream.stop_stream()
                 self._stream.start_stream()
             except Exception:
-                log.exception("playback.interrupt.stream_reset_error")
+                log.warning("playback.interrupt.stream_reset_failed, recreating stream")
+                self._recreate_stream()
         self._interrupted = False
         log.info("playback.interrupted")
+
+    def _recreate_stream(self) -> None:
+        """Close the broken stream and open a fresh one with the same settings."""
+        import pyaudio
+
+        old = self._stream
+        self._stream = None
+        if old is not None:
+            try:
+                old.stop_stream()
+            except Exception:
+                pass
+            try:
+                old.close()
+            except Exception:
+                pass
+
+        if self._pa is None:
+            return
+
+        try:
+            self._stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=self._channels,
+                rate=self._output_sample_rate,
+                output=True,
+                output_device_index=(
+                    int(self._output_device) if self._output_device is not None else None
+                ),
+                frames_per_buffer=1024,
+            )
+            log.info("playback.stream_recreated")
+        except Exception:
+            log.exception("playback.stream_recreate_failed")
 
     # ------------------------------------------------------------------
     # Resampling (scipy polyphase filter)

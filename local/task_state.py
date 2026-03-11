@@ -343,10 +343,18 @@ class TaskStore:
 class SessionMemory:
     """Persistent key-value notes that survive across sessions.
 
-    Stores session notes in SQLite alongside tasks. This enables
-    openclaw-style show-and-tell: "What are you working on?",
-    "What's left to do?", "What happened last session?"
+    Features (OpenClaw-inspired):
+    - Key-value storage with SQLite persistence
+    - Keyword search across all notes
+    - Automatic compaction when notes exceed threshold
+    - Context file export for compact reference
+    - Recall-before-respond: search relevant notes before starting work
     """
+
+    # Compact when total note content exceeds this many characters
+    COMPACT_THRESHOLD = 50_000
+    # Maximum notes before forcing compaction
+    MAX_NOTES = 100
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
         self.db_path = os.path.abspath(db_path)
@@ -363,15 +371,25 @@ class SessionMemory:
                 updated_at REAL NOT NULL
             )
         """)
+        # Add category column if it doesn't exist (migration)
+        try:
+            self._conn.execute(
+                "ALTER TABLE session_notes ADD COLUMN category TEXT DEFAULT 'general'"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self._conn.commit()
 
-    def set(self, key: str, value: str) -> None:
+    def set(self, key: str, value: str, category: str = "general") -> None:
         """Store or update a note."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO session_notes (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, value, time.time()),
+            "INSERT OR REPLACE INTO session_notes (key, value, updated_at, category) "
+            "VALUES (?, ?, ?, ?)",
+            (key, value, time.time(), category),
         )
         self._conn.commit()
+        # Check if compaction is needed
+        self._maybe_compact()
 
     def get(self, key: str, default: str = "") -> str:
         """Retrieve a note by key."""
@@ -386,6 +404,56 @@ class SessionMemory:
             "SELECT key, value FROM session_notes ORDER BY updated_at DESC"
         ).fetchall()
         return {k: v for k, v in rows}
+
+    def search(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+        """Search notes by keyword (case-insensitive substring match).
+
+        Returns a list of matching notes with key, value, and relevance score.
+        """
+        if not query.strip():
+            return []
+
+        keywords = query.lower().split()
+        rows = self._conn.execute(
+            "SELECT key, value, updated_at FROM session_notes "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+
+        results = []
+        for key, value, updated_at in rows:
+            text = f"{key} {value}".lower()
+            # Score: how many keywords match
+            score = sum(1 for kw in keywords if kw in text)
+            if score > 0:
+                results.append({
+                    "key": key,
+                    "value": value[:500],  # Truncate for search results
+                    "score": score,
+                    "updated_at": updated_at,
+                })
+
+        # Sort by score desc, then recency
+        results.sort(key=lambda r: (-r["score"], -r["updated_at"]))
+        return results[:limit]
+
+    def recall(self, context: str, limit: int = 5) -> str:
+        """Recall relevant notes for a given context (recall-before-respond).
+
+        Searches the context string against all notes and returns a formatted
+        block of the most relevant ones for injection into the prompt.
+        """
+        if not context.strip():
+            return ""
+
+        results = self.search(context, limit=limit)
+        if not results:
+            return ""
+
+        lines = ["=== RECALLED MEMORY ==="]
+        for r in results:
+            lines.append(f"[{r['key']}]: {r['value']}")
+        lines.append("=== END RECALLED MEMORY ===")
+        return "\n".join(lines)
 
     def delete(self, key: str) -> bool:
         """Delete a note. Returns True if it existed."""
@@ -404,6 +472,99 @@ class SessionMemory:
             lines.append(value)
             lines.append("")
         return "\n".join(lines)
+
+    def get_stats(self) -> dict:
+        """Return memory statistics."""
+        rows = self._conn.execute(
+            "SELECT COUNT(*), SUM(LENGTH(value)) FROM session_notes"
+        ).fetchone()
+        return {
+            "note_count": rows[0] or 0,
+            "total_chars": rows[1] or 0,
+            "needs_compaction": (rows[1] or 0) > self.COMPACT_THRESHOLD,
+        }
+
+    def _maybe_compact(self) -> None:
+        """Compact old notes if memory exceeds threshold.
+
+        Compaction strategy:
+        - Keep the most recent MAX_NOTES/2 notes as-is
+        - Summarize older notes into a single 'compacted_history' entry
+        """
+        stats = self.get_stats()
+        if stats["note_count"] <= self.MAX_NOTES and stats["total_chars"] <= self.COMPACT_THRESHOLD:
+            return
+
+        rows = self._conn.execute(
+            "SELECT key, value, updated_at FROM session_notes "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+
+        keep_count = self.MAX_NOTES // 2
+        if len(rows) <= keep_count:
+            return
+
+        # Notes to compact (oldest)
+        to_compact = rows[keep_count:]
+
+        # Build compact summary
+        compact_lines = []
+        for key, value, _ in to_compact:
+            if key == "_compacted_history":
+                compact_lines.append(value)
+            else:
+                # Summarize: keep first 200 chars of each note
+                compact_lines.append(f"[{key}]: {value[:200]}")
+
+        compact_text = "\n".join(compact_lines)
+        # Truncate if still too large
+        if len(compact_text) > 10_000:
+            compact_text = compact_text[:10_000] + "\n... (truncated)"
+
+        # Delete compacted notes
+        for key, _, _ in to_compact:
+            self._conn.execute("DELETE FROM session_notes WHERE key = ?", (key,))
+
+        # Save compacted history
+        self._conn.execute(
+            "INSERT OR REPLACE INTO session_notes (key, value, updated_at, category) "
+            "VALUES (?, ?, ?, ?)",
+            ("_compacted_history", compact_text, time.time(), "system"),
+        )
+        self._conn.commit()
+        log.info(
+            "session_memory.compacted",
+            removed=len(to_compact),
+            kept=keep_count,
+        )
+
+    def export_context(self, filepath: str | None = None) -> str:
+        """Export all memory to a compact context.txt file.
+
+        Returns the content and optionally writes to filepath.
+        """
+        notes = self.get_all()
+        stats = self.get_stats()
+
+        lines = [
+            "# Rio Agent Context",
+            f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Notes: {stats['note_count']} | Size: {stats['total_chars']} chars",
+            "",
+        ]
+
+        for key, value in notes.items():
+            lines.append(f"## {key}")
+            lines.append(value)
+            lines.append("")
+
+        content = "\n".join(lines)
+        if filepath:
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        return content
 
     def close(self) -> None:
         try:

@@ -7,7 +7,14 @@ click, type, scroll, hotkey, drag, move, and window management.
 Uses pyautogui for cross-platform mouse/keyboard control.
 CoordinateMapper handles resize_factor mapping and DPI scaling.
 
-Dependencies: pyautogui, pygetwindow (Windows)
+Comprehensive Windows control via:
+  - pyautogui: mouse/keyboard automation
+  - pygetwindow: window enumeration and management
+  - subprocess: application launching
+  - psutil: process management
+  - win32gui / win32com.client: deep Windows integration (optional)
+
+Dependencies: pyautogui, pygetwindow (Windows), psutil
 
 Usage::
 
@@ -15,12 +22,16 @@ Usage::
     result = await nav.click(450, 320)            # screenshot coords
     result = await nav.type_text("hello world")
     result = await nav.hotkey("ctrl+s")
+    result = await nav.open_application("notepad")
+    result = await nav.list_all_windows()
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -85,6 +96,47 @@ def _ensure_pygetwindow() -> bool:
         return True
     except ImportError:
         return False
+
+
+# -- psutil (process management) --
+
+_psutil = None
+
+
+def _ensure_psutil() -> bool:
+    global _psutil
+    if _psutil is not None:
+        return True
+    try:
+        import psutil as _ps
+        _psutil = _ps
+        return True
+    except ImportError:
+        return False
+
+
+# -- win32gui / win32com (deep Windows integration, optional) --
+
+_win32gui = None
+_win32com_client = None
+
+
+def _ensure_win32() -> bool:
+    """Attempt to load pywin32 modules. Returns True if win32gui loaded."""
+    global _win32gui, _win32com_client
+    if _win32gui is not None:
+        return True
+    try:
+        import win32gui as _wg
+        _win32gui = _wg
+    except ImportError:
+        pass
+    try:
+        import win32com.client as _wc
+        _win32com_client = _wc
+    except ImportError:
+        pass
+    return _win32gui is not None
 
 
 # ---------------------------------------------------------------------------
@@ -668,3 +720,667 @@ class ScreenNavigator:
             "action": "focus_window",
             "title": title,
         }
+
+    # ------------------------------------------------------------------
+    # Actions — Phase 4: Comprehensive Windows Control
+    # ------------------------------------------------------------------
+
+    async def open_application(
+        self,
+        name_or_path: str,
+    ) -> dict[str, Any]:
+        """Open an application by name or executable path.
+
+        Supports:
+          - Common app names: "notepad", "chrome", "firefox", "explorer",
+            "cmd", "powershell", "code" (VS Code), "calc", "paint"
+          - Full executable paths: "C:\\\\Program Files\\\\...\\\\app.exe"
+          - File associations via os.startfile: "document.pdf", "image.png"
+          - URLs: "https://google.com" (opens in default browser)
+
+        Args:
+            name_or_path: Application name, path, file, or URL.
+        """
+        loop = asyncio.get_running_loop()
+
+        # Well-known app aliases (Windows)
+        _APP_ALIASES = {
+            "notepad": "notepad.exe",
+            "calculator": "calc.exe",
+            "calc": "calc.exe",
+            "paint": "mspaint.exe",
+            "explorer": "explorer.exe",
+            "file explorer": "explorer.exe",
+            "cmd": "cmd.exe",
+            "command prompt": "cmd.exe",
+            "terminal": "wt.exe",
+            "powershell": "powershell.exe",
+            "task manager": "taskmgr.exe",
+            "taskmgr": "taskmgr.exe",
+            "control panel": "control.exe",
+            "settings": "ms-settings:",
+            "snipping tool": "snippingtool.exe",
+            "snip": "snippingtool.exe",
+            "chrome": "chrome.exe",
+            "google chrome": "chrome.exe",
+            "firefox": "firefox.exe",
+            "edge": "msedge.exe",
+            "microsoft edge": "msedge.exe",
+            "code": "code.exe",
+            "vscode": "code.exe",
+            "vs code": "code.exe",
+            "word": "winword.exe",
+            "excel": "excel.exe",
+            "powerpoint": "powerpnt.exe",
+            "outlook": "outlook.exe",
+            "teams": "ms-teams:",
+            "discord": "discord.exe",
+            "slack": "slack.exe",
+            # UWP / Microsoft Store apps — use URI protocol handlers
+            "whatsapp": "whatsapp:",
+            "spotify": "spotify:",
+            "xbox": "xbox:",
+            "xbox game bar": "xbox:",
+            "store": "ms-windows-store:",
+            "microsoft store": "ms-windows-store:",
+            "mail": "outlookmail:",
+            "calendar": "outlookcal:",
+            "maps": "bingmaps:",
+            "photos": "ms-photos:",
+            "camera": "microsoft.windows.camera:",
+            "clock": "ms-clock:",
+            "alarms": "ms-clock:",
+            "weather": "msnweather:",
+            "news": "msn-news:",
+            "voice recorder": "ms-callrecording:",
+            "feedback hub": "feedback-hub:",
+            "tips": "ms-get-started:",
+        }
+
+        def _open():
+            target = name_or_path.strip()
+            resolved = _APP_ALIASES.get(target.lower(), target)
+
+            # URLs or ms-* protocol links: use os.startfile on Windows
+            if resolved.startswith(("http://", "https://", "ms-")):
+                if platform.system() == "Windows":
+                    os.startfile(resolved)
+                else:
+                    subprocess.Popen(["xdg-open", resolved])
+                return resolved, "url", None
+
+            # If it looks like a file path with extension (not .exe), use startfile
+            if (
+                os.path.splitext(resolved)[1]
+                and os.path.splitext(resolved)[1].lower() != ".exe"
+                and os.path.exists(resolved)
+            ):
+                if platform.system() == "Windows":
+                    os.startfile(resolved)
+                else:
+                    subprocess.Popen(["xdg-open", resolved])
+                return resolved, "file", None
+
+            # Launch as executable — capture stderr for error detection
+            try:
+                proc = subprocess.Popen(
+                    resolved,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                # Quick check: did cmd.exe fail immediately?
+                import time as _time
+                _time.sleep(0.3)
+                rc = proc.poll()
+                if rc is not None and rc != 0:
+                    # Direct exe failed — try Windows Start Menu search
+                    if platform.system() == "Windows":
+                        proc2 = subprocess.Popen(
+                            f'start "" "{resolved}"',
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        _time.sleep(0.3)
+                        rc2 = proc2.poll()
+                        if rc2 is None or rc2 == 0:
+                            return resolved, "start", proc2
+                        # Start also failed — try PowerShell UWP lookup
+                        ps_cmd = (
+                            f'powershell -NoProfile -Command "'
+                            f'$pkg = Get-AppxPackage | Where-Object {{$_.Name -like \"*{target}*\"}} | Select-Object -First 1; '
+                            f'if ($pkg) {{ Start-Process \"shell:AppsFolder\\$($pkg.PackageFamilyName)!App\" }}'
+                            f' else {{ exit 1 }}"'
+                        )
+                        proc3 = subprocess.Popen(
+                            ps_cmd,
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        return resolved, "uwp", proc3
+                return resolved, "exe", proc
+            except FileNotFoundError:
+                if platform.system() == "Windows":
+                    proc = subprocess.Popen(
+                        f'start "" "{resolved}"',
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    return resolved, "start", proc
+                raise
+
+        def _verify_launch(proc, resolved, method):
+            """Verify the process actually launched successfully."""
+            verification = {"verified": False}
+
+            # For URL/file launches via os.startfile, we can't easily verify
+            if proc is None:
+                verification["method"] = "startfile"
+                verification["note"] = "Launched via OS handler — cannot verify process directly."
+                return verification
+
+            # Wait briefly for the process to either start or fail
+            import time
+            time.sleep(1.0)
+
+            exit_code = proc.poll()
+            if exit_code is not None and exit_code != 0:
+                # Process exited with error
+                stderr_output = ""
+                try:
+                    stderr_output = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                verification["failed"] = True
+                verification["exit_code"] = exit_code
+                if stderr_output:
+                    verification["stderr"] = stderr_output[:500]
+                return verification
+
+            # Check if a new window appeared (best-effort)
+            if _ensure_pygetwindow():
+                try:
+                    # Look for windows matching the resolved app name
+                    app_base = os.path.splitext(os.path.basename(resolved))[0].lower()
+                    all_windows = _pygetwindow.getAllWindows()
+                    matching = [
+                        w for w in all_windows
+                        if w.title and w.visible and app_base in w.title.lower()
+                    ]
+                    if matching:
+                        verification["verified"] = True
+                        verification["window_title"] = matching[0].title
+                    else:
+                        verification["note"] = (
+                            "Process started but no matching window found yet. "
+                            "App may still be loading."
+                        )
+                except Exception:
+                    pass
+
+            # If process is still running, that's a good sign
+            if exit_code is None:
+                verification["process_running"] = True
+                if not verification.get("verified"):
+                    verification["verified"] = True
+                    verification["note"] = "Process is running."
+
+            return verification
+
+        try:
+            resolved_name, method, proc = await loop.run_in_executor(None, _open)
+            verification = await loop.run_in_executor(
+                None, _verify_launch, proc, resolved_name, method,
+            )
+
+            # Check if launch actually failed
+            if verification.get("failed"):
+                self._log_action("open_application", details={
+                    "target": name_or_path, "resolved": resolved_name,
+                    "method": method, "verification": verification,
+                })
+                error_msg = f"Application '{name_or_path}' failed to launch"
+                if verification.get("stderr"):
+                    error_msg += f": {verification['stderr']}"
+                if verification.get("exit_code") is not None:
+                    error_msg += f" (exit code {verification['exit_code']})"
+                return {"success": False, "error": error_msg}
+
+            self._log_action("open_application", details={
+                "target": name_or_path, "resolved": resolved_name,
+                "method": method, "verification": verification,
+            })
+            return {
+                "success": True,
+                "action": "open_application",
+                "target": name_or_path,
+                "resolved": resolved_name,
+                "method": method,
+                "verified": verification.get("verified", False),
+                "window_title": verification.get("window_title"),
+                "note": verification.get("note", "Application launched and verified."),
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"Failed to open '{name_or_path}': {exc}"}
+
+    async def list_all_windows(self) -> dict[str, Any]:
+        """List all visible windows on the desktop.
+
+        Returns a list of window info dicts with title, position, size,
+        and state. Uses pygetwindow with win32gui fallback for more detail.
+        """
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _list():
+            all_windows = _pygetwindow.getAllWindows()
+            results = []
+            for w in all_windows:
+                # Skip invisible/untitled windows
+                if not w.title or not w.title.strip():
+                    continue
+                if not w.visible:
+                    continue
+                results.append({
+                    "title": w.title,
+                    "position": [w.left, w.top],
+                    "size": [w.width, w.height],
+                    "minimized": w.isMinimized,
+                    "maximized": w.isMaximized,
+                    "active": w.isActive,
+                })
+            return results
+
+        windows = await loop.run_in_executor(None, _list)
+        self._log_action("list_all_windows", details={"count": len(windows)})
+        return {
+            "success": True,
+            "action": "list_all_windows",
+            "windows": windows,
+            "count": len(windows),
+        }
+
+    async def get_active_window(self) -> dict[str, Any]:
+        """Get information about the currently active (foreground) window."""
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _get():
+            w = _pygetwindow.getActiveWindow()
+            if w is None:
+                return None
+            return {
+                "title": w.title,
+                "position": [w.left, w.top],
+                "size": [w.width, w.height],
+                "minimized": w.isMinimized,
+                "maximized": w.isMaximized,
+            }
+
+        info = await loop.run_in_executor(None, _get)
+        if info is None:
+            return {"success": False, "error": "No active window detected"}
+
+        self._log_action("get_active_window", details={"title": info["title"]})
+        return {"success": True, "action": "get_active_window", **info}
+
+    async def minimize_window(self, title_contains: str) -> dict[str, Any]:
+        """Minimize a window by title substring."""
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _minimize():
+            windows = _pygetwindow.getWindowsWithTitle(title_contains)
+            if not windows:
+                return None
+            w = windows[0]
+            w.minimize()
+            return w.title
+
+        title = await loop.run_in_executor(None, _minimize)
+        if title is None:
+            return {"success": False, "error": f"No window found matching '{title_contains}'"}
+
+        self._log_action("minimize_window", details={"title": title})
+        return {"success": True, "action": "minimize_window", "title": title}
+
+    async def maximize_window(self, title_contains: str) -> dict[str, Any]:
+        """Maximize a window by title substring."""
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _maximize():
+            windows = _pygetwindow.getWindowsWithTitle(title_contains)
+            if not windows:
+                return None
+            w = windows[0]
+            w.maximize()
+            return w.title
+
+        title = await loop.run_in_executor(None, _maximize)
+        if title is None:
+            return {"success": False, "error": f"No window found matching '{title_contains}'"}
+
+        self._log_action("maximize_window", details={"title": title})
+        return {"success": True, "action": "maximize_window", "title": title}
+
+    async def close_window(self, title_contains: str) -> dict[str, Any]:
+        """Close a window by title substring."""
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _close():
+            windows = _pygetwindow.getWindowsWithTitle(title_contains)
+            if not windows:
+                return None
+            w = windows[0]
+            title = w.title
+            w.close()
+            return title
+
+        title = await loop.run_in_executor(None, _close)
+        if title is None:
+            return {"success": False, "error": f"No window found matching '{title_contains}'"}
+
+        self._log_action("close_window", details={"title": title})
+        return {"success": True, "action": "close_window", "title": title}
+
+    async def resize_window(
+        self, title_contains: str, width: int, height: int,
+    ) -> dict[str, Any]:
+        """Resize a window by title substring.
+
+        Args:
+            title_contains: Substring of the window title.
+            width: New width in pixels.
+            height: New height in pixels.
+        """
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _resize():
+            windows = _pygetwindow.getWindowsWithTitle(title_contains)
+            if not windows:
+                return None
+            w = windows[0]
+            w.resizeTo(width, height)
+            return w.title
+
+        title = await loop.run_in_executor(None, _resize)
+        if title is None:
+            return {"success": False, "error": f"No window found matching '{title_contains}'"}
+
+        self._log_action("resize_window", details={"title": title, "width": width, "height": height})
+        return {"success": True, "action": "resize_window", "title": title, "width": width, "height": height}
+
+    async def move_window(
+        self, title_contains: str, x: int, y: int,
+    ) -> dict[str, Any]:
+        """Move a window to a specific position on screen.
+
+        Args:
+            title_contains: Substring of the window title.
+            x: New X position.
+            y: New Y position.
+        """
+        if not _ensure_pygetwindow():
+            return {"success": False, "error": "Window management unavailable — install pygetwindow"}
+
+        loop = asyncio.get_running_loop()
+
+        def _move():
+            windows = _pygetwindow.getWindowsWithTitle(title_contains)
+            if not windows:
+                return None
+            w = windows[0]
+            w.moveTo(x, y)
+            return w.title
+
+        title = await loop.run_in_executor(None, _move)
+        if title is None:
+            return {"success": False, "error": f"No window found matching '{title_contains}'"}
+
+        self._log_action("move_window", details={"title": title, "x": x, "y": y})
+        return {"success": True, "action": "move_window", "title": title, "x": x, "y": y}
+
+    # ------------------------------------------------------------------
+    # Actions — Phase 5: Process Management (psutil)
+    # ------------------------------------------------------------------
+
+    async def list_processes(self, name_filter: str = "") -> dict[str, Any]:
+        """List running processes, optionally filtered by name.
+
+        Args:
+            name_filter: Only show processes containing this string (case-insensitive).
+        """
+        if not _ensure_psutil():
+            return {"success": False, "error": "Process management unavailable — install psutil"}
+
+        loop = asyncio.get_running_loop()
+
+        def _list():
+            results = []
+            for proc in _psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
+                try:
+                    info = proc.info
+                    pname = info.get("name", "")
+                    if name_filter and name_filter.lower() not in pname.lower():
+                        continue
+                    mem = info.get("memory_info")
+                    results.append({
+                        "pid": info["pid"],
+                        "name": pname,
+                        "memory_mb": round(mem.rss / (1024 * 1024), 1) if mem else 0,
+                    })
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                    continue
+            # Sort by memory descending, limit to top 50
+            results.sort(key=lambda p: p["memory_mb"], reverse=True)
+            return results[:50]
+
+        processes = await loop.run_in_executor(None, _list)
+        self._log_action("list_processes", details={"filter": name_filter, "count": len(processes)})
+        return {
+            "success": True,
+            "action": "list_processes",
+            "processes": processes,
+            "count": len(processes),
+        }
+
+    async def kill_process(
+        self, name_or_pid: str,
+    ) -> dict[str, Any]:
+        """Kill a process by name or PID.
+
+        Safety: Will not kill critical system processes (csrss, lsass, svchost, etc.)
+
+        Args:
+            name_or_pid: Process name (e.g. "chrome") or PID as string.
+        """
+        if not _ensure_psutil():
+            return {"success": False, "error": "Process management unavailable — install psutil"}
+
+        # Protected system processes
+        PROTECTED = frozenset({
+            "system", "csrss.exe", "lsass.exe", "smss.exe", "svchost.exe",
+            "winlogon.exe", "services.exe", "wininit.exe", "dwm.exe",
+            "explorer.exe",  # Don't kill Windows shell
+        })
+
+        loop = asyncio.get_running_loop()
+
+        def _kill():
+            target = name_or_pid.strip()
+            killed = []
+
+            # Try as PID first
+            try:
+                pid = int(target)
+                proc = _psutil.Process(pid)
+                pname = proc.name()
+                if pname.lower() in PROTECTED:
+                    return None, f"Cannot kill protected system process: {pname}"
+                proc.terminate()
+                return [{"pid": pid, "name": pname}], None
+            except (ValueError, _psutil.NoSuchProcess):
+                pass
+
+            # Kill by name
+            for proc in _psutil.process_iter(["pid", "name"]):
+                try:
+                    pname = proc.info["name"] or ""
+                    if target.lower() in pname.lower():
+                        if pname.lower() in PROTECTED:
+                            continue
+                        proc.terminate()
+                        killed.append({"pid": proc.info["pid"], "name": pname})
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                    continue
+
+            if not killed:
+                return None, f"No process found matching '{target}'"
+            return killed, None
+
+        killed, error = await loop.run_in_executor(None, _kill)
+        if error:
+            return {"success": False, "error": error}
+
+        self._log_action("kill_process", details={"target": name_or_pid, "killed": len(killed)})
+        return {
+            "success": True,
+            "action": "kill_process",
+            "killed": killed,
+            "count": len(killed),
+        }
+
+    # ------------------------------------------------------------------
+    # Actions — Phase 6: Clipboard Operations
+    # ------------------------------------------------------------------
+
+    async def get_clipboard(self) -> dict[str, Any]:
+        """Get the current clipboard text content."""
+        loop = asyncio.get_running_loop()
+
+        def _get():
+            try:
+                import pyperclip
+                return pyperclip.paste()
+            except ImportError:
+                # Fallback: use PowerShell on Windows
+                if platform.system() == "Windows":
+                    result = subprocess.run(
+                        ["powershell", "-command", "Get-Clipboard"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    return result.stdout.strip()
+                return None
+
+        text = await loop.run_in_executor(None, _get)
+        if text is None:
+            return {"success": False, "error": "Clipboard access unavailable — install pyperclip"}
+
+        self._log_action("get_clipboard", details={"length": len(text)})
+        return {
+            "success": True,
+            "action": "get_clipboard",
+            "text": text[:10000],  # Limit to 10K chars
+            "length": len(text),
+        }
+
+    async def set_clipboard(self, text: str) -> dict[str, Any]:
+        """Set the clipboard text content.
+
+        Args:
+            text: Text to copy to the clipboard.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _set():
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+                return True
+            except ImportError:
+                # Fallback: use PowerShell on Windows
+                if platform.system() == "Windows":
+                    # Use stdin pipe to avoid shell injection
+                    proc = subprocess.run(
+                        ["powershell", "-command", "Set-Clipboard -Value $input"],
+                        input=text, capture_output=True, text=True, timeout=5,
+                    )
+                    return proc.returncode == 0
+                return False
+
+        success = await loop.run_in_executor(None, _set)
+        if not success:
+            return {"success": False, "error": "Clipboard access unavailable — install pyperclip"}
+
+        self._log_action("set_clipboard", details={"length": len(text)})
+        return {
+            "success": True,
+            "action": "set_clipboard",
+            "length": len(text),
+        }
+
+    # ------------------------------------------------------------------
+    # Actions — Phase 7: Screen Info
+    # ------------------------------------------------------------------
+
+    async def get_screen_info(self) -> dict[str, Any]:
+        """Get information about all monitors: resolution, DPI, bounds."""
+        loop = asyncio.get_running_loop()
+
+        def _info():
+            monitors = []
+            try:
+                import mss
+                with mss.mss() as sct:
+                    for i, m in enumerate(sct.monitors):
+                        if i == 0:
+                            continue  # Skip the "all monitors" entry
+                        monitors.append({
+                            "index": i,
+                            "left": m["left"],
+                            "top": m["top"],
+                            "width": m["width"],
+                            "height": m["height"],
+                        })
+            except ImportError:
+                pass
+
+            # DPI info on Windows
+            dpi = None
+            if platform.system() == "Windows":
+                try:
+                    import ctypes
+                    hdc = ctypes.windll.user32.GetDC(0)
+                    dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+                    ctypes.windll.user32.ReleaseDC(0, hdc)
+                except Exception:
+                    pass
+
+            return {
+                "monitors": monitors,
+                "monitor_count": len(monitors),
+                "dpi": dpi,
+                "platform": platform.system(),
+            }
+
+        info = await loop.run_in_executor(None, _info)
+        self._log_action("get_screen_info", details=info)
+        return {"success": True, "action": "get_screen_info", **info}
