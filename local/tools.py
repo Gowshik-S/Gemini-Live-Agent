@@ -104,6 +104,22 @@ COMMAND_TIMEOUT = 30  # seconds
 MAX_OUTPUT_SIZE = 100_000  # bytes — truncate large outputs
 MAX_FILE_READ = 100_000  # chars — truncate large file reads
 
+# Tool output truncation (B3) — prevent single tool calls from
+# consuming the entire model context window.
+MAX_TOOL_OUTPUT_CHARS = 8000
+
+
+def _truncate_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Truncate tool output preserving head and tail with informative trailer."""
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2 - 50
+    return (
+        text[:half]
+        + f"\n\n... [{len(text)} chars total, middle truncated] ...\n\n"
+        + text[-half:]
+    )
+
 
 class ToolExecutor:
     """Executes tool calls locally with safety checks.
@@ -370,6 +386,22 @@ class ToolExecutor:
             # GenMedia (Imagen 3 + Veo 2)
             "generate_image": self._generate_image,
             "generate_video": self._generate_video,
+            # Web tools (E3)
+            "web_search": self._web_search,
+            "web_fetch": self._web_fetch,
+            "web_cache_get": self._web_cache_get,
+            # Long-running processes (E2)
+            "start_process": self._start_process,
+            "check_process": self._check_process,
+            "stop_process": self._stop_process,
+            # Browser automation (E1: Playwright CDP)
+            "browser_connect": self._browser_connect,
+            "browser_evaluate": self._browser_evaluate,
+            "browser_fill_form": self._browser_fill_form,
+            "browser_click_element": self._browser_click_element,
+            "browser_extract_text": self._browser_extract_text,
+            "browser_wait_for": self._browser_wait_for,
+            "browser_navigate": self._browser_navigate,
         }
 
         handler = handlers.get(name)
@@ -439,6 +471,8 @@ class ToolExecutor:
             if len(content) > MAX_FILE_READ:
                 content = content[:MAX_FILE_READ] + "\n... [truncated at 100K chars]"
                 truncated = True
+            # B3: Truncate for model context window
+            content = _truncate_output(content)
             return {
                 "success": True,
                 "content": content,
@@ -553,6 +587,8 @@ class ToolExecutor:
             # Truncate large outputs
             if len(output) > MAX_OUTPUT_SIZE:
                 output = output[:MAX_OUTPUT_SIZE] + "\n... [truncated]"
+            # B3: Truncate for model context window
+            output = _truncate_output(output)
 
             return {
                 "success": proc.returncode == 0,
@@ -1670,3 +1706,185 @@ class ToolExecutor:
         return await agent.generate_video(
             prompt, duration_seconds=duration_seconds, aspect_ratio=aspect_ratio,
         )
+
+    # ------------------------------------------------------------------
+    # Web tools (E3)
+    # ------------------------------------------------------------------
+
+    async def _web_search(self, query: str, max_results: int = 5) -> dict[str, Any]:
+        """Search the web via DuckDuckGo."""
+        from web_tools import web_search
+        return web_search(query, max_results=max_results)
+
+    async def _web_fetch(self, url: str, max_chars: int = 8000) -> dict[str, Any]:
+        """Fetch a web page and return text content."""
+        from web_tools import web_fetch
+        return web_fetch(url, max_chars=max_chars)
+
+    async def _web_cache_get(self, url: str) -> dict[str, Any]:
+        """Get a cached web page or fetch and cache it."""
+        from web_tools import web_cache_get
+        return web_cache_get(url)
+
+    # ------------------------------------------------------------------
+    # Long-running process management (E2)
+    # ------------------------------------------------------------------
+
+    _background_procs: dict[str, subprocess.Popen] = {}
+
+    async def _start_process(self, command: str, label: str = "") -> dict[str, Any]:
+        """Start a long-running process in the background (servers, watchers).
+        Returns a process ID for status checks and cleanup."""
+        # Safety: apply command blocklist
+        for pattern in COMMAND_BLOCKLIST:
+            if re.search(pattern, command, re.IGNORECASE):
+                return {"success": False, "error": f"Blocked command pattern: {pattern}"}
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            pid = str(proc.pid)
+            ToolExecutor._background_procs[pid] = proc
+            log.info("process.started", pid=pid, command=command[:80], label=label)
+            return {
+                "success": True,
+                "pid": pid,
+                "label": label or command[:40],
+                "message": f"Process started with PID {pid}",
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"Failed to start: {exc}"}
+
+    async def _check_process(self, pid: str) -> dict[str, Any]:
+        """Check the status of a background process."""
+        proc = ToolExecutor._background_procs.get(pid)
+        if proc is None:
+            return {"success": False, "error": f"No tracked process with PID {pid}"}
+
+        poll = proc.poll()
+        if poll is None:
+            return {"success": True, "pid": pid, "status": "running"}
+        else:
+            # Process has finished — read output
+            stdout, stderr = "", ""
+            try:
+                stdout = proc.stdout.read()[:4000] if proc.stdout else ""
+                stderr = proc.stderr.read()[:2000] if proc.stderr else ""
+            except Exception:
+                pass
+            ToolExecutor._background_procs.pop(pid, None)
+            return {
+                "success": True,
+                "pid": pid,
+                "status": "exited",
+                "exit_code": poll,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+
+    async def _stop_process(self, pid: str) -> dict[str, Any]:
+        """Stop a background process by PID."""
+        proc = ToolExecutor._background_procs.get(pid)
+        if proc is None:
+            return {"success": False, "error": f"No tracked process with PID {pid}"}
+
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            ToolExecutor._background_procs.pop(pid, None)
+            log.info("process.stopped", pid=pid)
+            return {"success": True, "pid": pid, "message": f"Process {pid} stopped"}
+        except Exception as exc:
+            return {"success": False, "error": f"Failed to stop: {exc}"}
+
+    def cleanup_processes(self) -> None:
+        """Kill all tracked background processes (call on session disconnect)."""
+        for pid, proc in list(ToolExecutor._background_procs.items()):
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            log.info("process.cleanup", pid=pid)
+        ToolExecutor._background_procs.clear()
+
+    # ------------------------------------------------------------------
+    # Browser automation tools (E1: Playwright CDP)
+    # ------------------------------------------------------------------
+
+    def _get_browser_mod(self):
+        """Lazy-import browser_tools module."""
+        if not hasattr(self, "_browser_mod"):
+            try:
+                from browser_tools import (
+                    browser_connect, browser_evaluate, browser_fill_form,
+                    browser_click_element, browser_extract_text,
+                    browser_wait_for, browser_screenshot, browser_navigate,
+                )
+                self._browser_mod = {
+                    "connect": browser_connect,
+                    "evaluate": browser_evaluate,
+                    "fill_form": browser_fill_form,
+                    "click_element": browser_click_element,
+                    "extract_text": browser_extract_text,
+                    "wait_for": browser_wait_for,
+                    "screenshot": browser_screenshot,
+                    "navigate": browser_navigate,
+                }
+            except ImportError:
+                self._browser_mod = None
+                log.info("browser_tools.unavailable", note="Install playwright for browser automation")
+        return self._browser_mod
+
+    async def _browser_connect(self, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"}
+        return await mod["connect"](cdp_url)
+
+    async def _browser_evaluate(self, javascript: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["evaluate"](javascript, cdp_url)
+
+    async def _browser_fill_form(self, selector: str, value: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["fill_form"](selector, value, cdp_url)
+
+    async def _browser_click_element(self, selector: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["click_element"](selector, cdp_url)
+
+    async def _browser_extract_text(self, selector: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["extract_text"](selector, cdp_url)
+
+    async def _browser_wait_for(self, selector: str, timeout: int = 30000, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["wait_for"](selector, timeout, cdp_url)
+
+    async def _browser_navigate(self, url: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+        mod = self._get_browser_mod()
+        if mod is None:
+            return {"success": False, "error": "Playwright not installed"}
+        return await mod["navigate"](url, cdp_url)

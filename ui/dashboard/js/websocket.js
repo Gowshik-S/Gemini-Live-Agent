@@ -73,6 +73,10 @@ const RioSocket = (() => {
       _lastPong = Date.now();
       console.log('[rio-ws] connected');
       _updateConnectionUI('connected');
+      // Flush queued messages
+      while (_sendQueue.length > 0) {
+        _ws.send(_sendQueue.shift());
+      }
       _emit('open', {});
       _startPing();
     };
@@ -145,10 +149,16 @@ const RioSocket = (() => {
     _connected = false;
   }
 
-  /** Send a text message (for keep-alive pings). */
+  // Queue for messages sent while connecting
+  const _sendQueue = [];
+
+  /** Send a text message. Queues if connecting, drops if disconnected. */
   function send(msg) {
+    const payload = typeof msg === 'string' ? msg : JSON.stringify(msg);
     if (_ws && _ws.readyState === WebSocket.OPEN) {
-      _ws.send(typeof msg === 'string' ? msg : JSON.stringify(msg));
+      _ws.send(payload);
+    } else if (_ws && _ws.readyState === WebSocket.CONNECTING) {
+      if (_sendQueue.length < 50) _sendQueue.push(payload);
     }
   }
 

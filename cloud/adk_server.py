@@ -38,9 +38,14 @@ from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
 
-from gemini_session import build_system_instruction
-from rio_agent import ToolBridge, _make_tools
-from tool_orchestrator import ToolOrchestrator, _is_task_request
+try:
+    from .gemini_session import build_system_instruction
+    from .rio_agent import ToolBridge, _make_tools
+    from .tool_orchestrator import ToolOrchestrator, _is_task_request
+except ImportError:
+    from gemini_session import build_system_instruction
+    from rio_agent import ToolBridge, _make_tools
+    from tool_orchestrator import ToolOrchestrator, _is_task_request
 
 # ---------------------------------------------------------------------------
 # Environment & logging
@@ -87,7 +92,7 @@ USE_VERTEX = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
 _DEFAULT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 LIVE_MODEL = os.environ.get("LIVE_MODEL", _DEFAULT_MODEL)
 ORCHESTRATOR_MODEL = os.environ.get(
-    "ORCHESTRATOR_MODEL", "gemini-2.5-flash"
+    "ORCHESTRATOR_MODEL", "gemini-3-flash-preview"
 )
 # Whether the live model itself can invoke function calls.
 # gemini-2.5-flash-native-audio-preview-12-2025 DOES support function calling
@@ -104,6 +109,32 @@ ENABLE_OUTPUT_AUDIO_TRANSCRIPTION = _env_flag(
 ENABLE_SESSION_RESUMPTION = _env_flag(
     "RIO_LIVE_ENABLE_SESSION_RESUMPTION", False,
 )
+
+# ---------------------------------------------------------------------------
+# Shared memory store singleton — loaded once at module level
+# ---------------------------------------------------------------------------
+_shared_memory_store = None
+_memory_store_loaded = False
+
+
+def _get_shared_memory_store():
+    """Return a shared MemoryStore singleton (lazy-init on first call)."""
+    global _shared_memory_store, _memory_store_loaded
+    if _memory_store_loaded:
+        return _shared_memory_store
+    _memory_store_loaded = True
+    try:
+        import sys, pathlib
+        _local_dir = str(pathlib.Path(__file__).resolve().parent.parent / "local")
+        if _local_dir not in sys.path:
+            sys.path.insert(0, _local_dir)
+        from memory import MemoryStore
+        _shared_memory_store = MemoryStore()
+        logger.info("memory_store.singleton_loaded")
+    except Exception as exc:
+        logger.warning("memory_store.singleton_unavailable", error=str(exc))
+    return _shared_memory_store
+
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -126,6 +157,7 @@ _conversations_dir.mkdir(parents=True, exist_ok=True)
 
 _current_conversation_id: str | None = None
 _current_conversation_messages: list[dict] = []
+_CONVERSATION_MESSAGES_MAX = 500  # Cap to prevent unbounded RAM growth
 
 
 def _start_new_conversation() -> str:
@@ -161,6 +193,11 @@ def _buffer_transcript(entry: dict) -> None:
     if not _current_conversation_id:
         _start_new_conversation()
     _current_conversation_messages.append(entry)
+    # Trim oldest messages if over limit
+    if len(_current_conversation_messages) > _CONVERSATION_MESSAGES_MAX:
+        # Save before trimming
+        _save_conversation()
+        _current_conversation_messages[:] = _current_conversation_messages[-(_CONVERSATION_MESSAGES_MAX // 2):]
     # Auto-save every 5 messages
     if len(_current_conversation_messages) % 5 == 0:
         _save_conversation()
@@ -306,6 +343,57 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         voice=VOICE_NAME,
         project=GCP_PROJECT or "(not set)",
     )
+
+    # Pre-warm memory store so first WS connection doesn't block 4-6s
+    _get_shared_memory_store()
+
+    # A4+G2: Run startup maintenance (prune old conversations, vacuum DBs)
+    try:
+        import sys as _sys, pathlib as _pl
+        _local_dir = str(_pl.Path(__file__).resolve().parent.parent / "local")
+        if _local_dir not in _sys.path:
+            _sys.path.insert(0, _local_dir)
+        from maintenance import run_maintenance
+        _data_dir = _pl.Path(__file__).resolve().parent.parent / "data"
+        asyncio.get_event_loop().run_in_executor(
+            None, lambda: run_maintenance(data_dir=_data_dir)
+        )
+    except Exception as _maint_err:
+        logger.warning("maintenance.startup_skip", error=str(_maint_err))
+
+    # F2: Connect MCP client to configured external tool servers
+    try:
+        from mcp_client import McpClient
+        import yaml as _yaml
+        _cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+        _mcp_config = []
+        if _cfg_path.is_file():
+            _cfg_data = _yaml.safe_load(_cfg_path.read_text(encoding="utf-8")) or {}
+            _mcp_config = _cfg_data.get("rio", {}).get("mcp_servers", [])
+        if _mcp_config:
+            _mcp_client = McpClient()
+            asyncio.create_task(_mcp_client.connect_from_config(_mcp_config))
+            app.state.mcp_client = _mcp_client
+            logger.info("mcp_client.startup", servers=len(_mcp_config))
+        else:
+            app.state.mcp_client = None
+    except Exception as _mcp_err:
+        logger.debug("mcp_client.startup_skip", error=str(_mcp_err))
+        app.state.mcp_client = None
+
+    # F5: Initialize notifier (optional Telegram push)
+    try:
+        import sys as _sys2, pathlib as _pl2
+        _local_dir2 = str(_pl2.Path(__file__).resolve().parent.parent / "local")
+        if _local_dir2 not in _sys2.path:
+            _sys2.path.insert(0, _local_dir2)
+        from notifier import Notifier
+        app.state.notifier = Notifier()
+        if app.state.notifier.is_enabled:
+            logger.info("notifier.initialized")
+    except Exception as _notif_err:
+        logger.debug("notifier.startup_skip", error=str(_notif_err))
+        app.state.notifier = None
 
     health_task = asyncio.create_task(
         _dashboard_health_broadcast_loop(), name="dashboard-health",
@@ -595,6 +683,20 @@ async def ws_dashboard(websocket: WebSocket) -> None:
             msg = await websocket.receive_text()
             if msg == "ping":
                 await websocket.send_text("pong")
+            else:
+                # B2: Dashboard approval responses
+                try:
+                    frame = json.loads(msg)
+                    if frame.get("type") == "approval_response":
+                        # Broadcast to all sessions — the right orchestrator
+                        # picks it up via its approval queue
+                        await _broadcast_dashboard({
+                            "type": "dashboard",
+                            "subtype": "approval_resolved",
+                            "approved": frame.get("approved", False),
+                        })
+                except (json.JSONDecodeError, Exception):
+                    pass
     except WebSocketDisconnect:
         pass
     finally:
@@ -655,26 +757,59 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     # Uses ORCHESTRATOR_MODEL (gemini-2.5-flash by default) with full
     # function calling via generate_content while the live session handles
     # voice I/O only.
+
+    # Wire long-term memory store (ChromaDB) for semantic search (A1)
+    # Use module-level singleton so the BGE model is loaded once at startup
+    # instead of blocking each WS connection for 4-6 seconds.
+    _mem_store = _get_shared_memory_store()
+
     orchestrator = ToolOrchestrator(
         genai_client=genai_client,
         tool_fns=tool_fns,
         model=ORCHESTRATOR_MODEL,
+        memory_store=_mem_store,
+        broadcast_fn=_broadcast_dashboard,
     )
+    # F5: Wire notifier as an after_tool hook for task completion notifications
+    _notifier = getattr(app.state, "notifier", None)
+    if _notifier and _notifier.is_enabled:
+        async def _notify_on_task_complete(tool_name: str, args: dict, result: dict) -> dict:
+            """After-tool hook: send a Telegram notification on task completion."""
+            # Only notify when the orchestrator finishes (not on every tool call)
+            return result
+        orchestrator.register_hook("after_tool", _notify_on_task_complete)
+
     log.info(
         "orchestrator.ready",
         model=ORCHESTRATOR_MODEL,
         tools=len(tool_fns),
     )
 
+    # C5: TriggerEngine — event-driven automation (keyword + schedule triggers)
+    _trigger_engine = None
+    try:
+        from trigger_engine import TriggerEngine
+        # inject_context is defined later inside the live session scope,
+        # so we create the engine but start it once inject_context exists.
+        _trigger_engine = TriggerEngine(orchestrator, inject_fn=None)  # type: ignore
+        log.info("trigger_engine.created")
+    except Exception as _te_err:
+        log.debug("trigger_engine.skip", error=str(_te_err))
+
     system_instruction = build_system_instruction()
 
     # ---- Notify client ----
-    await websocket.send_text(json.dumps({
-        "type": "control",
-        "action": "connected",
-        "detail": "Direct Live API session ready",
-        "backend": "direct-live-api",
-    }))
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "control",
+            "action": "connected",
+            "detail": "Direct Live API session ready",
+            "backend": "direct-live-api",
+        }))
+    except (WebSocketDisconnect, Exception):
+        log.info("client.disconnected_before_session")
+        orchestrator.cancel_all()
+        return
 
     # ---- Session with auto-reconnect ----
     session_handle: str | None = None
@@ -699,18 +834,28 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 if session_handle:
                     log.info("live.reconnected", handle=session_handle[:16])
-                    await websocket.send_text(json.dumps({
-                        "type": "control",
-                        "action": "reconnected",
-                        "detail": "Session resumed",
-                    }))
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "control",
+                            "action": "reconnected",
+                            "detail": "Session resumed",
+                        }))
+                    except (WebSocketDisconnect, Exception):
+                        log.info("client.disconnected_during_reconnect")
+                        orchestrator.cancel_all()
+                        return
                 else:
                     log.info("live.session.started")
 
-                await websocket.send_text(json.dumps({
-                    "type": "control",
-                    "action": "live_ready",
-                }))
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "control",
+                        "action": "live_ready",
+                    }))
+                except (WebSocketDisconnect, Exception):
+                    log.info("client.disconnected_before_live_ready")
+                    orchestrator.cancel_all()
+                    return
 
                 # ---- Upstream: client WebSocket → Gemini session ----
                 async def upstream_task() -> None:
@@ -818,6 +963,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                         turn_complete=False,
                                     )
 
+                            elif frame_type == "approval_response":
+                                # B2: User approved/denied a tool call
+                                approved = frame.get("approved", False)
+                                orchestrator.resolve_approval(approved)
+
                             elif frame_type == "heartbeat":
                                 pass  # Handled by heartbeat task
 
@@ -849,7 +999,21 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 # ---- inject_context: send SYSTEM message to live session ----
                 async def inject_context(msg: str) -> None:
-                    """Inject an orchestrator result into the live audio session."""
+                    """Inject an orchestrator result into the live audio session.
+
+                    Called when an orchestrator task completes.  The voice
+                    model is never suppressed — it continues responding
+                    normally while tasks run in the background.
+                    """
+                    try:
+                        # Notify client that the background task finished
+                        await websocket.send_text(json.dumps({
+                            "type": "control",
+                            "action": "task_mode",
+                            "active": False,
+                        }))
+                    except Exception:
+                        pass
                     try:
                         await session.send_client_content(
                             turns=types.Content(
@@ -860,6 +1024,20 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         )
                     except Exception:
                         log.debug("orchestrator.inject.failed")
+
+                    # F5: Send push notification if configured
+                    if _notifier and _notifier.is_enabled:
+                        try:
+                            # Only notify on actual task completions, not system messages
+                            if "task executor has completed" in msg.lower() or "task complete" in msg.lower():
+                                short_msg = msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
+                                await _notifier.send(f"🤖 Rio: {short_msg}")
+                        except Exception:
+                            pass
+
+                # C5: Wire TriggerEngine with inject_context now that it's defined
+                if _trigger_engine is not None:
+                    _trigger_engine._inject_fn = inject_context
 
                 # ---- Downstream: Gemini session → client WebSocket ----
                 async def downstream_task() -> None:
@@ -966,7 +1144,20 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 full_utterance = " ".join(_utterance_buf).strip()
                                 _utterance_buf.clear()
 
-                                if full_utterance and _is_task_request(full_utterance):
+                                # ── ORCHESTRATOR BUSY — steer / cancel ──
+                                # Voice model keeps responding normally.
+                                # We only route the utterance to the
+                                # orchestrator's message queue so it can
+                                # handle cancel / steer commands while
+                                # the task continues in the background.
+                                if full_utterance and orchestrator._active_tasks:
+                                    orchestrator.inject_user_message(full_utterance)
+                                    log.info(
+                                        "orchestrator.user_message_injected",
+                                        utterance=full_utterance[:60],
+                                    )
+
+                                elif full_utterance and _is_task_request(full_utterance):
                                     log.info(
                                         "orchestrator.task_detected",
                                         utterance=full_utterance[:100],
@@ -992,6 +1183,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                         "model": ORCHESTRATOR_MODEL,
                                         "client_id": client_id,
                                     })
+                                # else: normal voice conversation — no action needed
+
+                                # C5: Check keyword triggers on every utterance
+                                if full_utterance and _trigger_engine is not None:
+                                    _trigger_engine.check_utterance(full_utterance)
 
                             # ---- Go-away (session about to expire) ----
                             ga = getattr(response, "go_away", None)
@@ -1158,6 +1354,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
     # Cancel any still-running orchestrator tasks for this session
     orchestrator.cancel_all()
+    # C5: Stop the trigger engine for this session
+    if _trigger_engine is not None:
+        try:
+            await _trigger_engine.stop()
+        except Exception:
+            pass
     # Persist conversation on disconnect
     _save_conversation()
     log.info("live.client.cleanup_done", client_id=client_id)
@@ -1216,12 +1418,158 @@ async def save_profile(skill_name: str, request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# F3: OpenAI-Compatible HTTP API
+# ---------------------------------------------------------------------------
+# Enables IDEs (Cursor, Continue) and any OpenAI SDK client to use Rio
+# as a drop-in backend via /v1/chat/completions and /v1/models.
+# ---------------------------------------------------------------------------
+
+from fastapi.responses import StreamingResponse
+
+
+@app.get("/v1/models")
+async def openai_list_models():
+    """Return available models in OpenAI format."""
+    models = [
+        {
+            "id": LIVE_MODEL,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "rio",
+        },
+        {
+            "id": ORCHESTRATOR_MODEL,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "rio",
+        },
+    ]
+    return {"object": "list", "data": models}
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint.
+
+    Accepts the standard OpenAI request format and routes through
+    the orchestrator model for tool-augmented responses.
+    """
+    if genai_client is None:
+        return {"error": {"message": "Server not ready", "type": "server_error"}}
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    model = body.get("model", ORCHESTRATOR_MODEL)
+    stream = body.get("stream", False)
+    max_tokens = body.get("max_tokens", 4096)
+    temperature = body.get("temperature", 0.7)
+
+    if not messages:
+        return {"error": {"message": "messages is required", "type": "invalid_request_error"}}
+
+    # Convert OpenAI messages to Gemini contents
+    contents = []
+    system_instruction = None
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            system_instruction = content
+        elif role == "assistant":
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(text=content)],
+            ))
+        else:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(text=content)],
+            ))
+
+    if not contents:
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part(text="Hello")],
+        ))
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(datetime.now(timezone.utc).timestamp())
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction or build_system_instruction(),
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+    )
+
+    if stream:
+        async def _stream_response():
+            try:
+                async for chunk in genai_client.aio.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                ):
+                    if chunk.text:
+                        data = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": chunk.text},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                # Final chunk
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.error("openai_compat.stream_error", error=str(exc))
+                yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
+
+        return StreamingResponse(
+            _stream_response(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    else:
+        try:
+            response = await genai_client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            text = response.text or ""
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+        except Exception as exc:
+            logger.error("openai_compat.error", error=str(exc))
+            return {"error": {"message": str(exc), "type": "server_error"}}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run(
-        "adk_server:app",
+        app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "8080")),
         log_level="info",

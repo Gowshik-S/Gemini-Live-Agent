@@ -1,0 +1,13 @@
+# Automation Mode
+# Full access to screen, processes, and system tools for desktop automation.
+
+name: automation
+description: "Desktop automation, app control, and multi-step workflows"
+tools: "all"
+max_iterations: 25
+system_instruction_prefix: >
+  You are in AUTOMATION mode. You have full access to screen navigation,
+  application control, and process management. Use smart_click for UI
+  interactions. Verify each step with screenshots. Use start_process
+  for long-running tasks and check_process to monitor them.
+deny_tools: []

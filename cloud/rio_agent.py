@@ -17,7 +17,10 @@ from typing import Any, Optional
 
 import structlog
 
-from gemini_session import build_system_instruction
+try:
+    from .gemini_session import build_system_instruction
+except ImportError:
+    from gemini_session import build_system_instruction
 
 # ADK Agent is only needed for the legacy create_rio_agent() factory.
 # Optional import so the module works even when google-adk is not installed
@@ -412,6 +415,81 @@ def _make_tools(bridge: ToolBridge) -> list:
         and whether compaction is needed."""
         return await bridge.dispatch("memory_stats", {})
 
+    # -- Web tools (E3) --
+
+    async def web_search(query: str, max_results: int = 5) -> dict:
+        """Search the web using DuckDuckGo. No API key required.
+        Returns top results with title, url, and snippet.
+        Use this for quick factual lookups or research without opening a browser."""
+        return await bridge.dispatch(
+            "web_search", {"query": query, "max_results": max_results}
+        )
+
+    async def web_fetch(url: str, max_chars: int = 8000) -> dict:
+        """Fetch a web page and return its text content.
+        HTML is automatically converted to plain text.
+        Use this to read documentation, articles, or API references."""
+        return await bridge.dispatch(
+            "web_fetch", {"url": url, "max_chars": max_chars}
+        )
+
+    async def web_cache_get(url: str) -> dict:
+        """Get a cached web page, or fetch and cache it if not cached.
+        Cached pages expire after 1 hour."""
+        return await bridge.dispatch("web_cache_get", {"url": url})
+
+    # -- Long-running process management (E2) --
+
+    async def start_process(command: str, label: str = "") -> dict:
+        """Start a long-running background process (server, watcher, etc.).
+        Returns a PID for later status checks or stopping.
+        Use this instead of run_command for commands that run indefinitely."""
+        return await bridge.dispatch(
+            "start_process", {"command": command, "label": label}
+        )
+
+    async def check_process(pid: str) -> dict:
+        """Check the status of a background process by PID.
+        Returns running/exited status with any output."""
+        return await bridge.dispatch("check_process", {"pid": pid})
+
+    async def stop_process(pid: str) -> dict:
+        """Stop a background process by PID."""
+        return await bridge.dispatch("stop_process", {"pid": pid})
+
+    # -- Browser automation (E1: Playwright CDP) --
+
+    async def browser_connect(cdp_url: str = "http://localhost:9222") -> dict:
+        """Connect to a running Chromium browser via Chrome DevTools Protocol.
+        The browser must be launched with --remote-debugging-port=9222."""
+        return await bridge.dispatch("browser_connect", {"cdp_url": cdp_url})
+
+    async def browser_evaluate(javascript: str) -> dict:
+        """Execute JavaScript in the browser page and return the result.
+        Use for reading DOM values, page state, or running scripts."""
+        return await bridge.dispatch("browser_evaluate", {"javascript": javascript})
+
+    async def browser_fill_form(selector: str, value: str) -> dict:
+        """Fill a form field identified by CSS selector."""
+        return await bridge.dispatch("browser_fill_form", {"selector": selector, "value": value})
+
+    async def browser_click_element(selector: str) -> dict:
+        """Click an element identified by CSS selector. More precise than
+        screen_click for web pages — uses the actual DOM element."""
+        return await bridge.dispatch("browser_click_element", {"selector": selector})
+
+    async def browser_extract_text(selector: str) -> dict:
+        """Extract text content from an element by CSS selector."""
+        return await bridge.dispatch("browser_extract_text", {"selector": selector})
+
+    async def browser_wait_for(selector: str, timeout: int = 30000) -> dict:
+        """Wait for a CSS selector to appear on the page."""
+        return await bridge.dispatch("browser_wait_for", {"selector": selector, "timeout": timeout})
+
+    async def browser_navigate(url: str) -> dict:
+        """Navigate the browser to a URL."""
+        return await bridge.dispatch("browser_navigate", {"url": url})
+
     return [
         # Core dev tools
         read_file, write_file, patch_file, run_command, capture_screen,
@@ -428,6 +506,14 @@ def _make_tools(bridge: ToolBridge) -> list:
         get_clipboard, set_clipboard, get_screen_info,
         # Persistent memory (enhanced)
         search_notes, export_context, memory_stats,
+        # Web tools (E3)
+        web_search, web_fetch, web_cache_get,
+        # Long-running processes (E2)
+        start_process, check_process, stop_process,
+        # Browser automation (E1: Playwright CDP)
+        browser_connect, browser_evaluate, browser_fill_form,
+        browser_click_element, browser_extract_text,
+        browser_wait_for, browser_navigate,
         # Customer care
         create_ticket, update_ticket,
         # Tutor

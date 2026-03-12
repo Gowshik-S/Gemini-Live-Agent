@@ -26,9 +26,14 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from model_router import ModelRouter
-from rate_limiter import DegradationLevel, Priority, RateLimiter
-from session_manager import SessionManager
+try:
+    from .model_router import ModelRouter
+    from .rate_limiter import DegradationLevel, Priority, RateLimiter
+    from .session_manager import SessionManager
+except ImportError:
+    from model_router import ModelRouter
+    from rate_limiter import DegradationLevel, Priority, RateLimiter
+    from session_manager import SessionManager
 
 # ---------------------------------------------------------------------------
 # Environment & logging
@@ -1247,7 +1252,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "8080")),
         log_level="info",

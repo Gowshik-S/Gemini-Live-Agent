@@ -13,7 +13,10 @@ from typing import Dict, Optional
 
 import structlog
 
-from gemini_session import GeminiSession
+try:
+    from .gemini_session import GeminiSession
+except ImportError:
+    from gemini_session import GeminiSession
 
 logger = structlog.get_logger(__name__)
 

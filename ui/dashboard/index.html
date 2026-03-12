@@ -46,16 +46,16 @@
       </a>
 
       <!-- Connection indicator -->
-      <div class="status-pill" id="connection-pill">
-        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+      <div class="status-pill" id="connection-pill" role="status" aria-live="polite" aria-label="Connection status">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <circle cx="8" cy="8" r="5" fill="currentColor"/>
         </svg>
         <span id="connection-label">Connecting</span>
       </div>
 
       <!-- Latency -->
-      <div class="status-pill status-pill--muted" id="latency-pill">
-        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+      <div class="status-pill status-pill--muted" id="latency-pill" role="status" aria-label="Network latency">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <path d="M8 3v5l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
           <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
         </svg>

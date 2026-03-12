@@ -11,7 +11,7 @@ const RioToolLog = (() => {
   let _container = null;
   let _emptyEl = null;
   let _countEl = null;
-  let _pendingTools = {}; // name -> DOM element (for matching results)
+  let _pendingTools = {}; // toolId -> DOM element (for matching results)
   let _toolCount = 0;
 
   // SVG icons for each tool
@@ -63,15 +63,15 @@ const RioToolLog = (() => {
 
     // Listen for tool events
     RioSocket.on('tool_call', (data) => {
-      addToolCall(data.name, data.args || {});
+      addToolCall(data.name, data.args || {}, data.tool_id);
     });
 
     RioSocket.on('tool_result', (data) => {
-      resolveToolResult(data.name, data.success);
+      resolveToolResult(data.tool_id || data.name, data.success);
     });
   }
 
-  function addToolCall(name, args) {
+  function addToolCall(name, args, toolId) {
     if (!_container) return;
 
     // Hide empty state
@@ -80,6 +80,9 @@ const RioToolLog = (() => {
     _toolCount++;
     if (_countEl) _countEl.textContent = _toolCount;
 
+    // Use server-provided tool_id, or generate a unique local one
+    const id = toolId || `local_${_toolCount}`;
+
     const toolIcon = TOOL_ICONS[name] || TOOL_ICONS._default;
     const detail = _formatArgs(name, args);
     const timeStr = _now();
@@ -87,7 +90,7 @@ const RioToolLog = (() => {
     const el = document.createElement('div');
     el.className = 'tool-entry';
     el.dataset.toolName = name;
-    el.dataset.toolId = _toolCount;
+    el.dataset.toolId = id;
     el.innerHTML = `
       <div class="tool-entry__icon tool-entry__icon--pending">
         ${toolIcon}
@@ -101,8 +104,8 @@ const RioToolLog = (() => {
 
     _container.appendChild(el);
 
-    // Track as pending
-    _pendingTools[name] = el;
+    // Track as pending using unique ID (not name — prevents collision for concurrent same-tool calls)
+    _pendingTools[id] = el;
 
     // Prune old
     while (_container.querySelectorAll('.tool-entry').length > MAX_ENTRIES) {
@@ -114,11 +117,12 @@ const RioToolLog = (() => {
     _container.scrollTop = _container.scrollHeight;
   }
 
-  function resolveToolResult(name, success) {
-    const el = _pendingTools[name];
+  function resolveToolResult(toolId, success) {
+    const el = _pendingTools[toolId];
     if (!el) return;
-    delete _pendingTools[name];
+    delete _pendingTools[toolId];
 
+    const name = el.dataset.toolName;
     const iconEl = el.querySelector('.tool-entry__icon');
     if (iconEl) {
       iconEl.classList.remove('tool-entry__icon--pending');

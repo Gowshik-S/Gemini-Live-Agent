@@ -1,0 +1,18 @@
+# Customer Care Skill
+# Provides ticket management and customer support tools.
+
+name: customer_care
+description: "Customer support ticket management and issue tracking"
+tools:
+  - create_ticket
+  - update_ticket
+  - search_notes
+  - save_note
+  - get_notes
+system_instruction_append: >
+  You have customer care tools available. When a user reports an issue,
+  create a ticket with appropriate priority and category. Track ticket
+  status and escalate when needed. Always save key details as notes.
+config:
+  auto_escalate_after: 300
+  default_priority: "medium"

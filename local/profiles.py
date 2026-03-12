@@ -193,7 +193,7 @@ def load_customer_care_profile(base_dir: str = DEFAULT_PROFILES_DIR) -> Customer
     """Load customer care profile from JSON, or return defaults."""
     path = Path(base_dir) / "customer_care_profile.json"
     if not path.exists():
-        log.info("profile.not_found.using_defaults", type="customer_care")
+        log.debug("profile.not_found.using_defaults", type="customer_care")
         return CustomerCareProfile()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -207,7 +207,7 @@ def load_tutor_profile(base_dir: str = DEFAULT_PROFILES_DIR) -> TutorProfile:
     """Load tutor profile from JSON, or return defaults."""
     path = Path(base_dir) / "tutor_profile.json"
     if not path.exists():
-        log.info("profile.not_found.using_defaults", type="tutor")
+        log.debug("profile.not_found.using_defaults", type="tutor")
         return TutorProfile()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

@@ -1,0 +1,16 @@
+# Developer Mode
+# Tools, model, and instruction prefix tuned for software development.
+
+name: developer
+description: "Code analysis, debugging, file operations, and shell commands"
+tools: "dev"
+max_iterations: 20
+system_instruction_prefix: >
+  You are in DEVELOPER mode. Focus on code quality, debugging efficiency,
+  and precise file operations. Prefer reading files before modifying them.
+  Use run_command for builds, tests, and git operations. Use web_search
+  and web_fetch for API documentation lookups.
+deny_tools:
+  - generate_image
+  - generate_video
+  - smart_click

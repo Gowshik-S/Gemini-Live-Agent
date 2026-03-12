@@ -78,11 +78,11 @@ rio:
 
   # Model selection & fallback
   models:
-    primary: "gemini-2.5-flash"
+    primary: "gemini-3-flash-preview"
     live: "gemini-2.5-flash-native-audio-latest"
-    secondary: "gemini-2.5-pro-preview-03-25"
-    computer_use: "gemini-2.5-computer-use-preview-10-2025"
-    imagen: "imagen-3"
+    secondary: "gemini-3-pro-preview"
+    computer_use: "gemini-computer-use-preview"
+    imagen: "imagen-4"
     pro_rpm_budget: 5
     fallback_chain:                   # models tried after primary fails
       - "gemini-2.5-flash"
@@ -108,31 +108,81 @@ rio:
       quiz_num_questions: 5                 # default number of quiz questions
       socratic_mode: true                   # use Socratic method (questions, not answers)
 
+  # Global deny list — tools here are blocked for ALL agents regardless of
+  # per-agent config.  Deny-wins: if a tool appears here, no agent can use it.
+  # Session-level overrides can further restrict (never relax) this list.
+  global_deny_tools: []
+  # Example: global_deny_tools: ["kill_process", "close_window"]
+
   # Multi-agent orchestration
   # Each agent specializes in a task type and uses the best model for it.
   # The orchestrator auto-selects the right agent based on task content.
   agents:
     task_executor:
       enabled: true
-      model: "gemini-2.5-flash"             # Fast, tool-capable model for computer tasks
+      model: "gemini-3-flash-preview"
       description: "Executes computer tasks: opening apps, clicking, typing, file operations"
-      tools: "all"                           # all | screen | dev | memory
+      tools: "all"
       max_iterations: 25
+      deny_tools: []
+      system_instruction: "You are a precise computer task executor. Always verify actions completed successfully before reporting done."
+      capabilities: ["screen", "keyboard", "mouse", "file_system", "process"]
+      tags: ["computer_use", "automation"]
+      schedule: null
     code_agent:
       enabled: true
-      model: "gemini-2.5-flash"             # Strong coding model
+      model: "gemini-3-flash-preview"
       description: "Code analysis, debugging, file reading/writing, refactoring"
-      tools: "dev"                           # read_file, write_file, patch_file, run_command
+      tools: "dev"
       max_iterations: 15
+      deny_tools:
+        - "kill_process"
+        - "close_window"
+      system_instruction: "You are a senior developer. Write clean, tested code. Read existing code before modifying."
+      capabilities: ["read_file", "write_file", "run_command", "patch_file"]
+      tags: ["coding", "analysis"]
+      schedule: null
     research_agent:
       enabled: true
-      model: "gemini-2.5-flash"             # Good reasoning model
+      model: "gemini-3-pro-preview"
       description: "Research, analysis, explanations, complex reasoning"
-      tools: "memory"                        # search_notes, save_note, get_notes
+      tools: "memory"
       max_iterations: 10
+      deny_tools:
+        - "run_command"
+        - "kill_process"
+      system_instruction: "You are a research analyst. Provide thorough, well-sourced answers. Use memory tools to recall and save key findings."
+      capabilities: ["search_notes", "save_note", "reasoning"]
+      tags: ["research", "reasoning"]
+      schedule: null
     creative_agent:
-      enabled: false
-      model: "gemini-2.5-flash"             # Model for image/video generation
+      enabled: true
+      model: "gemini-3-pro-image-preview"
       description: "Image and video generation using Imagen 3 and Veo 2"
-      tools: "creative"                      # generate_image, generate_video
+      tools: "creative"
       max_iterations: 5
+      deny_tools:
+        - "run_command"
+        - "kill_process"
+        - "close_window"
+      system_instruction: "You are a creative assistant specializing in visual content generation."
+      capabilities: ["generate_image", "generate_video"]
+      tags: ["creative", "visual"]
+      schedule: null
+
+  # MCP (Model Context Protocol) external tool servers (F2)
+  # Connect to external MCP servers to extend Rio's tool capabilities.
+  # Each entry needs a name and a shell command that starts the server.
+  mcp_servers: []
+  # Example:
+  # mcp_servers:
+  #   - name: "github"
+  #     command: "npx @modelcontextprotocol/server-github"
+  #   - name: "filesystem"
+  #     command: "npx @modelcontextprotocol/server-filesystem ./data"
+
+  # Notifications (F5) — push alerts when user is away
+  notifications:
+    telegram:
+      bot_token: ""     # Set via RIO_TELEGRAM_BOT_TOKEN env var
+      chat_id: ""       # Set via RIO_TELEGRAM_CHAT_ID env var

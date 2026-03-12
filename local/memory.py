@@ -90,11 +90,14 @@ class MemoryStore:
         self.db_path = os.path.abspath(db_path)
         self.collection_name = collection_name
         self.max_recall = max_recall
+        self._model_name = model_name
 
-        # ── Initialize embedding model ────────────────────────────
-        log.info("memory.loading_model", model=model_name)
-        self._embedder = SentenceTransformer(model_name)
-        log.info("memory.model_loaded", model=model_name)
+        # ── Lazy-load embedding model (deferred to first use) ─────
+        # The SentenceTransformer model is ~130 MB in RAM.  Loading at
+        # startup delays readiness.  We defer to the first add/query call
+        # so the process starts faster and uses less RAM when memory
+        # features aren't immediately needed.
+        self._embedder = None  # type: ignore[assignment]
 
         # ── Initialize ChromaDB ───────────────────────────────────
         os.makedirs(self.db_path, exist_ok=True)
@@ -103,8 +106,30 @@ class MemoryStore:
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},  # cosine similarity
         )
+
+        # ── A2: FTS5 keyword index for hybrid search ─────────────
+        import sqlite3
+        self._fts_db_path = os.path.join(self.db_path, "fts_index.db")
+        self._fts_conn = sqlite3.connect(self._fts_db_path, check_same_thread=False)
+        self._fts_conn.execute("PRAGMA journal_mode=WAL")
+        self._fts_conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5"
+            "(entry_id, content, entry_type, tokenize='porter unicode61')"
+        )
+        self._fts_conn.commit()
+
         count = self._collection.count()
         log.info("memory.ready", db_path=self.db_path, entries=count)
+
+    # ── Lazy embedding model loader ───────────────────────────────
+
+    def _get_embedder(self):
+        """Load the SentenceTransformer model on first use."""
+        if self._embedder is None:
+            log.info("memory.loading_model", model=self._model_name)
+            self._embedder = SentenceTransformer(self._model_name)
+            log.info("memory.model_loaded", model=self._model_name)
+        return self._embedder
 
     # ── Store ─────────────────────────────────────────────────────
 
@@ -165,7 +190,7 @@ class MemoryStore:
             pass  # If where filter fails, just proceed
 
         # Embed
-        embedding = self._embedder.encode(content).tolist()
+        embedding = self._get_embedder().encode(content).tolist()
 
         # Store
         self._collection.add(
@@ -174,6 +199,16 @@ class MemoryStore:
             documents=[content],
             metadatas=[meta],
         )
+
+        # A2: Also index in FTS5 for keyword search
+        try:
+            self._fts_conn.execute(
+                "INSERT OR IGNORE INTO memory_fts(entry_id, content, entry_type) VALUES (?, ?, ?)",
+                (entry_id, content, entry_type),
+            )
+            self._fts_conn.commit()
+        except Exception:
+            pass  # Non-critical
 
         log.info("memory.stored",
                  id=entry_id,
@@ -212,7 +247,7 @@ class MemoryStore:
         k = min(k, count)
 
         # Embed query
-        query_embedding = self._embedder.encode(query_text.strip()).tolist()
+        query_embedding = self._get_embedder().encode(query_text.strip()).tolist()
 
         # Build where filter
         where_filter = None
@@ -254,6 +289,87 @@ class MemoryStore:
         return entries
 
     # ── Utility ───────────────────────────────────────────────────
+
+    def keyword_search(self, query_text: str, top_k: int = 5) -> list[MemoryEntry]:
+        """A2: BM25 keyword search via FTS5."""
+        if not query_text or not query_text.strip():
+            return []
+        try:
+            cursor = self._fts_conn.execute(
+                "SELECT entry_id, content, entry_type, rank "
+                "FROM memory_fts WHERE memory_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (query_text.strip(), top_k),
+            )
+            entries = []
+            for row in cursor.fetchall():
+                entries.append(MemoryEntry(
+                    id=row[0],
+                    content=row[1],
+                    timestamp=0.0,
+                    entry_type=row[2],
+                    distance=abs(row[3]),  # FTS5 rank is negative
+                ))
+            return entries
+        except Exception:
+            return []
+
+    def hybrid_query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
+    ) -> list[MemoryEntry]:
+        """A2: Hybrid search combining vector similarity + BM25 keyword.
+
+        Scores are normalised 0-1 (higher=better) then weighted-averaged.
+        """
+        if not query_text or not query_text.strip():
+            return []
+
+        # Vector results
+        vector_results = self.query(query_text, top_k=top_k * 2)
+        # Keyword results
+        keyword_results = self.keyword_search(query_text, top_k=top_k * 2)
+
+        # Build score maps (normalised 0-1, higher=better)
+        scores: dict[str, dict] = {}
+
+        for entry in vector_results:
+            # ChromaDB cosine distance: 0 = identical, 2 = opposite
+            vec_score = max(0.0, 1.0 - entry.distance)
+            scores[entry.id] = {
+                "entry": entry,
+                "vector": vec_score,
+                "keyword": 0.0,
+            }
+
+        for entry in keyword_results:
+            # FTS5 rank: lower abs = better match; normalise loosely
+            kw_score = 1.0 / (1.0 + entry.distance)
+            if entry.id in scores:
+                scores[entry.id]["keyword"] = kw_score
+            else:
+                scores[entry.id] = {
+                    "entry": entry,
+                    "vector": 0.0,
+                    "keyword": kw_score,
+                }
+
+        # Weighted combination
+        ranked: list[tuple[float, MemoryEntry]] = []
+        for sid, data in scores.items():
+            combined = (
+                vector_weight * data["vector"]
+                + keyword_weight * data["keyword"]
+            )
+            entry = data["entry"]
+            entry.distance = 1.0 - combined  # Store as distance for compatibility
+            ranked.append((combined, entry))
+
+        ranked.sort(key=lambda x: -x[0])
+        return [entry for _, entry in ranked[:top_k]]
 
     def count(self) -> int:
         """Return total number of stored entries."""

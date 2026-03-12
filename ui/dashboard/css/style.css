@@ -77,7 +77,12 @@ body {
   overflow: hidden;
 }
 
-/* Scrollbar */
+/* Scrollbar — Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+/* Scrollbar — Chrome/Safari/Edge */
 ::-webkit-scrollbar {
   width: 5px;
 }

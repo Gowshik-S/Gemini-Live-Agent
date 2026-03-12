@@ -98,7 +98,7 @@ class AudioCapture:
         sample_rate: int = 16_000,
         block_size: int = 320,
         input_device: Optional[str | int] = None,
-        max_queue_size: int = 200,
+        max_queue_size: int = 100,
         use_wasapi: bool = True,
     ) -> None:
         self._sample_rate = sample_rate
@@ -304,7 +304,7 @@ class AudioPlayback:
         sample_rate: int = 24_000,
         channels: int = 1,
         output_device: Optional[str | int] = None,
-        max_queue_size: int = 600,
+        max_queue_size: int = 300,
         use_wasapi: bool = True,  # kept for API compat, not used by PyAudio path
     ) -> None:
         self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
@@ -409,7 +409,7 @@ class AudioPlayback:
         model response can play immediately.
         """
         self._interrupted = True
-        self.clear()
+        self.clear()  # Flush all queued audio first
         if self._stream is not None:
             try:
                 if self._stream.is_active():
@@ -418,6 +418,8 @@ class AudioPlayback:
             except Exception:
                 log.warning("playback.interrupt.stream_reset_failed, recreating stream")
                 self._recreate_stream()
+        # Reset AFTER clearing & resetting so drain_loop doesn't skip
+        # new audio that arrives after the interrupt is handled.
         self._interrupted = False
         log.info("playback.interrupted")
 

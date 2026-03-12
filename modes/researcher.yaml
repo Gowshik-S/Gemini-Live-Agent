@@ -1,0 +1,17 @@
+# Researcher Mode
+# Optimised for information gathering, analysis, and note-taking.
+
+name: researcher
+description: "Research, analysis, web search, and structured note-taking"
+tools: "memory"
+max_iterations: 15
+system_instruction_prefix: >
+  You are in RESEARCHER mode. Focus on gathering accurate information,
+  synthesizing findings, and saving structured notes. Use web_search and
+  web_fetch to find information. Use save_note to record key findings.
+  Provide citations and sources when possible.
+deny_tools:
+  - screen_click
+  - screen_type
+  - kill_process
+  - run_command
