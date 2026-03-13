@@ -404,22 +404,17 @@ class AudioPlayback:
     def interrupt(self) -> None:
         """Immediately silence playback but keep the stream open for future audio.
 
-        Clears the queue and resets the OS audio buffer so the speaker
-        goes silent within ~20ms.  The stream stays open so the next
-        model response can play immediately.
+        Clears the queue so the drain_loop stops feeding the hardware buffer.
+        The stream itself is intentionally left running — calling stop_stream()
+        while drain_loop's stream.write() is blocking in an asyncio.to_thread
+        task raises an OSError on Windows (the write and the stop race).
+        Leaving the stream open is safe: it drains the OS buffer in ~20 ms,
+        and the next model response plays immediately with no re-open overhead.
         """
         self._interrupted = True
-        self.clear()  # Flush all queued audio first
-        if self._stream is not None:
-            try:
-                if self._stream.is_active():
-                    self._stream.stop_stream()
-                self._stream.start_stream()
-            except Exception:
-                log.warning("playback.interrupt.stream_reset_failed, recreating stream")
-                self._recreate_stream()
-        # Reset AFTER clearing & resetting so drain_loop doesn't skip
-        # new audio that arrives after the interrupt is handled.
+        self.clear()  # Flush all queued audio — drain_loop skips any in-flight chunk
+        # Reset AFTER clearing so drain_loop doesn't skip new audio
+        # that arrives after the interrupt is fully handled.
         self._interrupted = False
         log.info("playback.interrupted")
 

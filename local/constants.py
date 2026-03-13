@@ -14,10 +14,10 @@ RIO_VERSION = "0.9.0"
 # ---------------------------------------------------------------------------
 # Gemini Model Names
 # ---------------------------------------------------------------------------
-MODEL_FLASH = "gemini-2.5-flash"
-MODEL_PRO = "gemini-2.5-pro-preview-03-25"
+MODEL_FLASH = "gemini-3-flash-preview"
+MODEL_PRO = "gemini-3-pro-preview"
 MODEL_COMPUTER_USE = "gemini-2.5-computer-use-preview-10-2025"
-MODEL_IMAGEN = "imagen-3"
+MODEL_IMAGEN = "imagen-4"
 
 # ---------------------------------------------------------------------------
 # API & Environment

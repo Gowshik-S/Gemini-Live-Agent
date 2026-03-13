@@ -81,7 +81,7 @@ rio:
     primary: "gemini-3-flash-preview"
     live: "gemini-2.5-flash-native-audio-latest"
     secondary: "gemini-3-pro-preview"
-    computer_use: "gemini-computer-use-preview"
+    computer_use: "gemini-2.5-computer-use-preview-10-2025"
     imagen: "imagen-4"
     pro_rpm_budget: 5
     fallback_chain:                   # models tried after primary fails
@@ -169,6 +169,67 @@ rio:
       capabilities: ["generate_image", "generate_video"]
       tags: ["creative", "visual"]
       schedule: null
+    # === P2.3 Specialist Agents (OpenFang-inspired) ===
+    summarizer_agent:
+      enabled: true
+      model: "gemini-3-flash-preview"
+      description: "Digest long documents, email threads, or research into concise summaries"
+      tools: "memory"
+      max_iterations: 8
+      deny_tools: ["run_command", "kill_process"]
+      system_instruction: "You are an expert summarizer. Extract key points, action items, and decisions. Output structured summaries: Background, Key Points, Action Items, Decision Needed (if any). Be concise."
+      capabilities: ["read_file", "search_notes", "save_note"]
+      tags: ["summarize", "analysis"]
+      schedule: null
+    email_drafter_agent:
+      enabled: true
+      model: "gemini-3-pro-preview"
+      description: "Compose professional emails, replies, and follow-ups"
+      tools: "memory"
+      max_iterations: 5
+      deny_tools: ["run_command", "kill_process"]
+      system_instruction: "You are a professional email writer. Match the user's tone and style. Output only the email text (subject + body), no commentary."
+      capabilities: ["search_notes", "save_note"]
+      tags: ["email", "writing"]
+      schedule: null
+    code_reviewer_agent:
+      enabled: true
+      model: "gemini-3-pro-preview"
+      description: "Review code for bugs, security issues, and style improvements"
+      tools: "dev"
+      max_iterations: 12
+      deny_tools: ["kill_process"]
+      system_instruction: "You are a senior code reviewer. Check for: (1) bugs and logic errors, (2) security vulnerabilities (OWASP Top 10), (3) performance issues, (4) style and maintainability. Provide specific line-level feedback."
+      capabilities: ["read_file", "run_command", "search_notes"]
+      tags: ["coding", "review", "security"]
+      schedule: null
+    meeting_notes_agent:
+      enabled: true
+      model: "gemini-3-flash-preview"
+      description: "Transcribe and structure meeting notes with action items"
+      tools: "memory"
+      max_iterations: 6
+      deny_tools: ["run_command", "kill_process"]
+      system_instruction: "You are a meeting notes specialist. Structure notes as: Attendees, Agenda, Discussion Points, Decisions Made, Action Items (with owner and deadline). Save to session memory."
+      capabilities: ["read_file", "write_file", "save_note"]
+      tags: ["meetings", "notes", "productivity"]
+      schedule: null
+    data_analyst_agent:
+      enabled: true
+      model: "gemini-3-pro-preview"
+      description: "Analyze CSV, JSON, and tabular data to find insights and patterns"
+      tools: "dev"
+      max_iterations: 15
+      deny_tools: ["kill_process"]
+      system_instruction: "You are a data analyst. Read data files, compute statistics, identify trends, and explain findings clearly. Suggest visualizations when relevant."
+      capabilities: ["read_file", "run_command", "write_file"]
+      tags: ["data", "analysis", "csv"]
+      schedule: null
+
+  # Orchestrator settings (P1 tuning)
+  orchestrator:
+    tool_timeout_seconds: 120       # Max seconds per tool call before heartbeat timeout
+    heartbeat_interval_seconds: 5   # Seconds between heartbeat messages to voice model
 
   # MCP (Model Context Protocol) external tool servers (F2)
   # Connect to external MCP servers to extend Rio's tool capabilities.
@@ -180,6 +241,11 @@ rio:
   #     command: "npx @modelcontextprotocol/server-github"
   #   - name: "filesystem"
   #     command: "npx @modelcontextprotocol/server-filesystem ./data"
+
+  # Browser automation settings (E1)
+  browser:
+    default_profile: "rio"              # Profile name for Playwright-managed browser data dir
+    default_browser: "auto"             # "auto" | "chrome" | "chromium" | "edge" | "brave"
 
   # Notifications (F5) — push alerts when user is away
   notifications:

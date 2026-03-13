@@ -65,7 +65,7 @@ class WSClient:
     # Reconnect parameters
     _INITIAL_BACKOFF: float = 1.0
     _MAX_BACKOFF: float = 30.0
-    _HEARTBEAT_INTERVAL: float = 10.0
+    _HEARTBEAT_INTERVAL: float = 5.0
 
     def __init__(
         self,
@@ -265,7 +265,11 @@ class WSClient:
             self._heartbeat_task = None
 
     async def _heartbeat_loop(self) -> None:
-        """Send a WebSocket ping every ``_HEARTBEAT_INTERVAL`` seconds."""
+        """Send a WebSocket ping every ``_HEARTBEAT_INTERVAL`` seconds.
+
+        Tolerates up to 4 consecutive failures before marking the
+        connection dead and triggering a reconnect.
+        """
         consecutive_failures = 0
         try:
             while True:
@@ -273,14 +277,14 @@ class WSClient:
                 if self._ws is not None and self.is_connected:
                     try:
                         pong = await self._ws.ping()
-                        await asyncio.wait_for(pong, timeout=5.0)
+                        await asyncio.wait_for(pong, timeout=8.0)
                         log.debug("ws.heartbeat_ok")
                         consecutive_failures = 0
                     except Exception as exc:
                         consecutive_failures += 1
                         log.warning("ws.heartbeat_failed", error=str(exc), failures=consecutive_failures)
-                        if consecutive_failures >= 2:
-                            log.warning("ws.heartbeat_dead", note="marking connection dead after 2 consecutive failures")
+                        if consecutive_failures >= 4:
+                            log.warning("ws.heartbeat_dead", note="marking connection dead after 4 consecutive failures")
                             self._state = ConnectionState.DISCONNECTED
                             try:
                                 await self._ws.close()

@@ -21,6 +21,8 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import json
 import os
 import uuid
@@ -87,13 +89,44 @@ USE_VERTEX = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
     "true", "1", "yes",
 )
 
-# Default live model for native audio streaming + function calling.
-# gemini-2.0-flash is deprecated — use 2.5 native-audio.
-_DEFAULT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
-LIVE_MODEL = os.environ.get("LIVE_MODEL", _DEFAULT_MODEL)
-ORCHESTRATOR_MODEL = os.environ.get(
-    "ORCHESTRATOR_MODEL", "gemini-3-flash-preview"
-)
+# Model resolution: env → yaml → hardcoded default
+_DEFAULT_MODEL = "gemini-2.5-flash-native-audio-latest"
+
+
+def _resolve_models() -> tuple[str, str]:
+    """Resolve live/orchestrator models from config in a robust way.
+
+    Running adk_server.py directly from rio/cloud can break package imports like
+    ``from rio.local.config import get_model``. This loader tries:
+      1) normal package import
+      2) direct load of rio/local/config.py via importlib
+      3) env/default fallback
+    """
+    try:
+        from rio.local.config import get_model as _get_model
+        return _get_model("live"), _get_model("orchestrator")
+    except Exception:
+        pass
+
+    try:
+        config_path = Path(__file__).resolve().parent.parent / "local" / "config.py"
+        spec = importlib.util.spec_from_file_location("rio_local_config", str(config_path))
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            get_model = getattr(module, "get_model", None)
+            if callable(get_model):
+                return get_model("live"), get_model("orchestrator")
+    except Exception:
+        pass
+
+    return (
+        os.environ.get("LIVE_MODEL", _DEFAULT_MODEL),
+        os.environ.get("ORCHESTRATOR_MODEL", "gemini-3-flash-preview"),
+    )
+
+
+LIVE_MODEL, ORCHESTRATOR_MODEL = _resolve_models()
 # Whether the live model itself can invoke function calls.
 # gemini-2.5-flash-native-audio-preview-12-2025 DOES support function calling
 # per https://ai.google.dev/gemini-api/docs/live-api/tools
@@ -107,7 +140,7 @@ ENABLE_OUTPUT_AUDIO_TRANSCRIPTION = _env_flag(
     "RIO_LIVE_ENABLE_OUTPUT_AUDIO_TRANSCRIPTION", False,
 )
 ENABLE_SESSION_RESUMPTION = _env_flag(
-    "RIO_LIVE_ENABLE_SESSION_RESUMPTION", False,
+    "RIO_LIVE_ENABLE_SESSION_RESUMPTION", True,
 )
 
 # ---------------------------------------------------------------------------
@@ -395,17 +428,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("notifier.startup_skip", error=str(_notif_err))
         app.state.notifier = None
 
+    # F6: Initialize bidirectional Telegram bot (long-polling)
+    try:
+        from telegram_bot import TelegramBot
+        app.state.telegram_bot = TelegramBot()
+        if app.state.telegram_bot.enabled:
+            app.state.telegram_bot.start()
+            logger.info("telegram_bot.initialized")
+    except Exception as _tg_err:
+        logger.debug("telegram_bot.startup_skip", error=str(_tg_err))
+        app.state.telegram_bot = None
+
     health_task = asyncio.create_task(
         _dashboard_health_broadcast_loop(), name="dashboard-health",
     )
 
     yield
 
+    # Shutdown
     health_task.cancel()
     try:
         await health_task
     except asyncio.CancelledError:
         pass
+    # Stop Telegram bot polling
+    _tg_bot = getattr(app.state, "telegram_bot", None)
+    if _tg_bot:
+        _tg_bot.stop()
     logger.info("rio.live.shutdown")
 
 
@@ -779,6 +828,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             return result
         orchestrator.register_hook("after_tool", _notify_on_task_complete)
 
+    # P1.1: Attach telegram bot reference so approval gate can notify via Telegram
+    _tg_bot_ref = getattr(app.state, "telegram_bot", None)
+    if _tg_bot_ref and _tg_bot_ref.enabled:
+        orchestrator._telegram_bot = _tg_bot_ref
+
     log.info(
         "orchestrator.ready",
         model=ORCHESTRATOR_MODEL,
@@ -790,8 +844,10 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     try:
         from trigger_engine import TriggerEngine
         # inject_context is defined later inside the live session scope,
-        # so we create the engine but start it once inject_context exists.
-        _trigger_engine = TriggerEngine(orchestrator, inject_fn=None)  # type: ignore
+        # so create the engine with a noop callback, then swap in inject_context.
+        async def _noop_inject(_: str) -> None:
+            return
+        _trigger_engine = TriggerEngine(orchestrator, _noop_inject)
         log.info("trigger_engine.created")
     except Exception as _te_err:
         log.debug("trigger_engine.skip", error=str(_te_err))
@@ -976,26 +1032,39 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         active = False
                     except asyncio.CancelledError:
                         pass
-                    except Exception:
+                    except Exception as exc:
+                        # Live API session may close transiently (e.g., 1011).
+                        # Treat as recoverable and let the outer reconnect loop
+                        # handle it, instead of forcing a full client disconnect.
+                        err = str(exc)
+                        if "1011" in err or "ConnectionClosed" in err:
+                            log.warning("upstream.session_closed", error=err[:200])
+                            return
                         log.exception("upstream.error")
                         active = False
 
                 # ---- Heartbeat: keep Gemini session alive ----
                 async def heartbeat_task() -> None:
+                    _hb_errors = 0
                     while active:
                         try:
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(3)
                             await session.send_realtime_input(
                                 audio=types.Blob(
                                     data=silent_chunk,
                                     mime_type="audio/pcm;rate=16000",
                                 ),
                             )
+                            _hb_errors = 0  # Reset on success
                         except asyncio.CancelledError:
                             break
                         except Exception:
-                            log.debug("heartbeat.error")
-                            break
+                            _hb_errors += 1
+                            if _hb_errors >= 3:
+                                log.warning("heartbeat.failed_repeatedly")
+                                break
+                            log.debug("heartbeat.error", consecutive=_hb_errors)
+                            await asyncio.sleep(1)
 
                 # ---- inject_context: send SYSTEM message to live session ----
                 async def inject_context(msg: str) -> None:
@@ -1023,7 +1092,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             turn_complete=True,
                         )
                     except Exception:
-                        log.debug("orchestrator.inject.failed")
+                        log.warning("orchestrator.inject.failed", exc_info=True)
 
                     # F5: Send push notification if configured
                     if _notifier and _notifier.is_enabled:
@@ -1038,6 +1107,90 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 # C5: Wire TriggerEngine with inject_context now that it's defined
                 if _trigger_engine is not None:
                     _trigger_engine._inject_fn = inject_context
+
+                # Resume any tasks that were interrupted by previous session disconnect
+                try:
+                    resumed = orchestrator.resume_interrupted_tasks(inject_context)
+                    if resumed:
+                        log.info("session.tasks_resumed", count=len(resumed))
+                except Exception:
+                    log.debug("session.resume_skip")
+
+                # F6: Wire Telegram bot to route incoming messages as PC workspace tasks
+                _telegram_bot = getattr(app.state, "telegram_bot", None)
+                if _telegram_bot and _telegram_bot.enabled:
+
+                    # Status function: returns human-readable list of active tasks
+                    def _telegram_status() -> str:
+                        active = [
+                            t.get_name().replace("orchestrator-", "• ", 1)
+                            for t in orchestrator._active_tasks
+                            if not t.done()
+                        ]
+                        if not active:
+                            return "No tasks currently running."
+                        return "\n".join(active)
+
+                    _telegram_bot.set_status_fn(_telegram_status)
+
+                    # Approval handler: forward yes/no to orchestrator
+                    async def _telegram_approve(approved: bool) -> None:
+                        orchestrator.resolve_approval(approved)
+
+                    _telegram_bot.set_approval_handler(_telegram_approve)
+
+                    async def _telegram_to_orchestrator(text: str) -> None:
+                        """Route incoming Telegram message to the PC workspace orchestrator.
+
+                        Creates a Telegram-aware inject_context wrapper so that:
+                        - Progress heartbeats are forwarded to Telegram
+                        - Task results are sent back to Telegram when done
+                        """
+                        log.info("telegram_bot.task_received", text=text[:80])
+
+                        # Telegram-aware inject_context: forwards results AND heartbeats
+                        async def _tg_inject(msg: str) -> None:
+                            # Always forward to voice model
+                            await inject_context(msg)
+                            # Also send to Telegram, filtering out raw system noise
+                            clean = msg.strip()
+                            if not clean:
+                                return
+                            # Heartbeat in progress
+                            if "[SYSTEM: Still working" in clean:
+                                try:
+                                    elapsed_hint = clean.split("elapsed")[0].split("(")[-1].strip() if "elapsed" in clean else ""
+                                    tool_hint = clean.split("Still working on")[-1].split("...")[0].strip() if "Still working on" in clean else "task"
+                                    await _telegram_bot.send(f"⏳ Working on: {tool_hint}{' ('+elapsed_hint+')' if elapsed_hint else ''}...")
+                                except Exception:
+                                    pass
+                            # Task was cancelled
+                            elif "[SYSTEM: The task was cancelled" in clean or "task was stopped" in clean.lower():
+                                try:
+                                    await _telegram_bot.send("🛑 Task was cancelled.")
+                                except Exception:
+                                    pass
+                            # Approval required
+                            elif "Approval required" in clean:
+                                try:
+                                    await _telegram_bot.send(f"⚠️ {clean[:500]}")
+                                except Exception:
+                                    pass
+                            # Normal result — strip [SYSTEM: ...] wrapper and send
+                            elif "[SYSTEM:" in clean:
+                                inner = clean.replace("[SYSTEM:", "").rstrip("]").strip()
+                                if len(inner) > 5:
+                                    try:
+                                        await _telegram_bot.send(f"✅ {inner[:1000]}")
+                                    except Exception:
+                                        pass
+
+                        orchestrator.spawn_task(
+                            f"[From Telegram] {text}", _tg_inject,
+                        )
+                        await _telegram_bot.send(f"▶️ Starting task: _{text[:120]}_")
+
+                    _telegram_bot.set_message_handler(_telegram_to_orchestrator)
 
                 # ---- Downstream: Gemini session → client WebSocket ----
                 async def downstream_task() -> None:
@@ -1299,7 +1452,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                     # auto-capture screenshot can arrive and be fed
                                     # into the session before the model continues.
                                     if fc.name in _SCREEN_ACTIONS:
-                                        await asyncio.sleep(0.5)
+                                        await asyncio.sleep(0.15)
 
                                 # Send tool responses back to model
                                 await session.send_tool_response(
@@ -1310,8 +1463,16 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         log.info("downstream.client_disconnected")
                     except asyncio.CancelledError:
                         pass
-                    except Exception:
-                        log.exception("downstream.error")
+                    except Exception as exc:
+                        # The Live API sometimes returns transient 1011 internal
+                        # errors. Log compactly and bubble up so outer loop
+                        # reconnects cleanly.
+                        err = str(exc)
+                        if "1011" in err or "Internal error occurred" in err:
+                            log.warning("downstream.live_api_internal_error", error=err[:200])
+                        else:
+                            log.exception("downstream.error")
+                        raise
 
                 # ---- Run upstream + heartbeat + downstream concurrently ----
                 tasks = [

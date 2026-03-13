@@ -34,6 +34,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -580,9 +581,11 @@ class ToolExecutor:
                 cwd=self._cwd,
                 timeout=COMMAND_TIMEOUT,
             )
-            output = proc.stdout or ""
-            if proc.stderr:
-                output += "\n[stderr]\n" + proc.stderr
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            output = stdout
+            if stderr:
+                output += "\n[stderr]\n" + stderr
 
             # Truncate large outputs
             if len(output) > MAX_OUTPUT_SIZE:
@@ -590,18 +593,24 @@ class ToolExecutor:
             # B3: Truncate for model context window
             output = _truncate_output(output)
 
-            return {
+            result: dict[str, Any] = {
                 "success": proc.returncode == 0,
                 "exit_code": proc.returncode,
                 "output": output,
+                "platform": sys.platform,
             }
+            # Always include "error" key on failure so the agent can self-correct
+            # (main.py display and the model both look for result["error"])
+            if proc.returncode != 0:
+                result["error"] = output or f"Command failed with exit code {proc.returncode}"
+            return result
         except subprocess.TimeoutExpired:
             return {
                 "success": False,
                 "error": f"Command timed out after {COMMAND_TIMEOUT}s",
             }
         except Exception as exc:
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
     # ------------------------------------------------------------------
     # create_ticket  (Customer Care skill)
@@ -1470,10 +1479,25 @@ class ToolExecutor:
         try:
             from google.genai import types as _gtypes
 
-            cu_model = (
-                _get_env_value("COMPUTER_USE_MODEL")
-                or "gemini-2.5-computer-use-preview-10-2025"
-            )
+            # Resolve CU model robustly across run modes:
+            # - package import (rio.local.config)
+            # - local import (config.py beside main runtime)
+            # - env/default fallback
+            try:
+                from rio.local.config import get_model as _get_model  # type: ignore
+            except Exception:
+                try:
+                    from config import get_model as _get_model  # type: ignore
+                except Exception:
+                    _get_model = None
+
+            if callable(_get_model):
+                cu_model = _get_model("computer_use")
+            else:
+                cu_model = os.environ.get(
+                    "COMPUTER_USE_MODEL",
+                    os.environ.get("CU_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
+                )
 
             # Build initial contents with screenshot + task description
             contents: list = [
@@ -1503,7 +1527,7 @@ class ToolExecutor:
             )
 
             first_click = None
-            max_turns = 5  # Safety limit for the agentic loop
+            max_turns = 3  # Safety limit — most clicks resolve in 1 turn
 
             for turn in range(max_turns):
                 # --- Call model with retry for transient 500s ---
@@ -1521,14 +1545,17 @@ class ToolExecutor:
                         last_exc = retry_exc
                         err_str = str(retry_exc)
                         if "500" in err_str or "503" in err_str or "INTERNAL" in err_str:
-                            wait = (attempt + 1) * 2
+                            wait = (attempt + 1) * 0.5
                             log.warning("cu.retry", attempt=attempt + 1, wait=wait, error=err_str[:200])
                             await asyncio.sleep(wait)
                             continue
                         raise
                 else:
-                    log.error("cu.ground_error", description=description, error=str(last_exc))
-                    return {"success": False, "error": f"Computer Use model error after 3 attempts: {last_exc}"}
+                    log.error("cu.ground_error", description=description, model=cu_model, error=str(last_exc))
+                    return {
+                        "success": False,
+                        "error": f"Computer Use model error after 3 attempts ({cu_model}): {last_exc}",
+                    }
 
                 # --- Parse model response ---
                 candidate = response.candidates[0] if response.candidates else None
@@ -1563,6 +1590,7 @@ class ToolExecutor:
 
                 # --- Execute actions and capture feedback ---
                 fn_response_parts = []
+                any_action_executed = False
                 for fc in function_calls:
                     log.info("cu.action", name=fc.name, args=fc.args)
 
@@ -1577,13 +1605,10 @@ class ToolExecutor:
                             "y": self._denormalize_y(ny),
                         }
 
-                    # Capture new screenshot after action
-                    # (For ground-only mode we don't physically execute —
-                    #  smart_click will do the actual click later)
-                    try:
-                        new_screenshot = await self._screen_capture.capture_full_resolution_async()
-                    except Exception:
-                        new_screenshot = screenshot  # reuse last
+                    # Execute the model-requested UI action so follow-up model
+                    # reasoning sees true post-action state.
+                    action_result = await self._execute_cu_action(fc.name, dict(fc.args or {}))
+                    any_action_executed = True
 
                     # Build FunctionResponse with screenshot blob
                     # (matches official Google pattern)
@@ -1591,10 +1616,20 @@ class ToolExecutor:
                         _gtypes.Part(
                             function_response=_gtypes.FunctionResponse(
                                 name=fc.name,
-                                response={"result": "success"},
+                                response=action_result,
                             ),
                         ),
                     )
+
+                # Capture a fresh screenshot AFTER executing action(s).
+                # If no action was executed (rare), keep the previous frame.
+                if any_action_executed:
+                    try:
+                        new_screenshot = await self._screen_capture.capture_full_resolution_async()
+                    except Exception:
+                        new_screenshot = screenshot
+                else:
+                    new_screenshot = screenshot
 
                 # Append function responses + new screenshot to history
                 # (Separate screenshot part — more reliable than FunctionResponseBlob
@@ -1629,7 +1664,7 @@ class ToolExecutor:
             }
 
         except Exception as exc:
-            log.exception("cu.ground_error", description=description)
+            log.exception("cu.ground_error", description=description, error=str(exc))
             return {"success": False, "error": f"Computer Use model error: {exc}"}
 
     async def _smart_click(
@@ -1642,7 +1677,7 @@ class ToolExecutor:
 
         Describe the element you want to click in natural language
         (e.g. 'the Save button', 'search input field').
-        Uses gemini-2.5-computer-use-preview-10-2025 with the official
+        Uses gemini-computer-use-preview with the official
         types.Tool(computer_use=ComputerUse(...)) API and 0-1000 normalized
         coordinates for reliable element detection.
         """
@@ -1847,11 +1882,27 @@ class ToolExecutor:
                 log.info("browser_tools.unavailable", note="Install playwright for browser automation")
         return self._browser_mod
 
-    async def _browser_connect(self, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
+    async def _browser_connect(
+        self,
+        cdp_url: str = "http://127.0.0.1:9222",
+        browser: str = "",
+        profile: str = "",
+    ) -> dict[str, Any]:
         mod = self._get_browser_mod()
         if mod is None:
             return {"success": False, "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"}
-        return await mod["connect"](cdp_url)
+        # Apply defaults from config.yaml browser section if not explicitly provided
+        if not browser or not profile:
+            try:
+                from config import _load_raw_browser_config
+                browser_cfg = _load_raw_browser_config()
+            except Exception:
+                browser_cfg = {}
+            if not browser:
+                browser = browser_cfg.get("default_browser", "auto")
+            if not profile:
+                profile = browser_cfg.get("default_profile", "rio")
+        return await mod["connect"](cdp_url, browser=browser, profile=profile)
 
     async def _browser_evaluate(self, javascript: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
         mod = self._get_browser_mod()

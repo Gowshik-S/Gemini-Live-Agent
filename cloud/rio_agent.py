@@ -459,10 +459,33 @@ def _make_tools(bridge: ToolBridge) -> list:
 
     # -- Browser automation (E1: Playwright CDP) --
 
-    async def browser_connect(cdp_url: str = "http://localhost:9222") -> dict:
-        """Connect to a running Chromium browser via Chrome DevTools Protocol.
-        The browser must be launched with --remote-debugging-port=9222."""
-        return await bridge.dispatch("browser_connect", {"cdp_url": cdp_url})
+    async def browser_connect(
+        cdp_url: str = "http://127.0.0.1:9222",
+        browser: str = "auto",
+        profile: str = "",
+    ) -> dict:
+        """Connect to (or auto-launch) a Chromium browser via Chrome DevTools Protocol.
+
+        The browser is launched automatically with --remote-debugging-port=9222
+        if it is not already running — no manual setup needed.
+
+        Args:
+            cdp_url:  CDP endpoint. Default: http://localhost:9222
+            browser:  Which browser to use/launch — "auto" (tries Chrome, Edge,
+                      Chromium, Brave in that order), "chrome", "chromium",
+                      "edge", or "brave". Default: "auto"
+            profile:  Chrome profile directory name to use, e.g. "Default",
+                      "Profile 1", "Profile 2". Leave empty for the default
+                      profile. Example: profile="Profile 1"
+
+        Examples:
+            browser_connect()                          # auto-detect, default profile
+            browser_connect(browser="chrome")          # force Chrome
+            browser_connect(browser="edge", profile="Profile 2")  # Edge with a specific profile
+        """
+        return await bridge.dispatch("browser_connect", {
+            "cdp_url": cdp_url, "browser": browser, "profile": profile,
+        })
 
     async def browser_evaluate(javascript: str) -> dict:
         """Execute JavaScript in the browser page and return the result.

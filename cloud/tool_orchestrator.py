@@ -60,8 +60,11 @@ _MAX_TASK_MEMORY = 20
 # ---------------------------------------------------------------------------
 # Context compaction thresholds (A6)
 # ---------------------------------------------------------------------------
-_CONTEXT_WARN_CHARS = 800_000     # ~200K tokens — log a warning
-_CONTEXT_COMPACT_CHARS = 900_000  # ~225K tokens — trigger compaction
+# Triggered earlier (50% of model context) so the model never approaches
+# the hard limit. At ~4 chars/token a 1M-token model gives ~4M chars;
+# 400K chars ≈ 100K tokens — comfortable headroom for long sessions.
+_CONTEXT_WARN_CHARS = 300_000     # ~75K tokens  — log a warning
+_CONTEXT_COMPACT_CHARS = 400_000  # ~100K tokens — trigger compaction
 
 # ---------------------------------------------------------------------------
 # Strip old tool results from context (A7)
@@ -90,6 +93,30 @@ def _strip_tool_result(result: dict, max_chars: int = _MAX_TOOL_RESULT_CHARS) ->
         stripped["result"] = content
 
     return stripped
+
+
+def _format_for_voice(text: str) -> str:
+    """Strip markdown formatting so TTS reads text naturally.
+
+    Removes: headers (#), bold/italic (*_), code fences (```), bullet
+    dashes/stars at line start, and URL markdown [text](url) → text.
+    The result is plain prose suitable for voice output.
+    """
+    import re
+    # Unwrap markdown links: [label](url) → label
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Remove code fences
+    text = re.sub(r"```[^\n]*\n?", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Remove headers
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Remove bold/italic markers
+    text = re.sub(r"(\*{1,3}|_{1,3})(.+?)\1", r"\2", text)
+    # Remove bullet points at line starts
+    text = re.sub(r"^\s*[-*+•]\s+", "", text, flags=re.MULTILINE)
+    # Collapse extra blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -353,11 +380,19 @@ _NON_TASK_STARTS = (
 )
 
 
+_CONVERSATIONAL_PREFIXES = (
+    "hey rio", "hey,", "hey ", "hi rio", "rio,", "rio ", "ok rio",
+    "okay rio", "yo rio", "alright rio", "so,", "so ", "now,", "now ",
+    "can you ", "could you ", "would you ", "will you ",
+    "i need you to ", "i want you to ", "i'd like you to ",
+)
+
+
 def _is_task_request(text: str) -> bool:
     """Return True when the transcribed utterance looks like an executable task.
 
-    Conservative by design — only returns True for clear action requests so
-    the orchestrator does not fire on every conversational turn.
+    Strips conversational prefixes before checking for action verbs, so phrases
+    like "Hey, open Chrome" or "Can you open Chrome?" are correctly detected.
     """
     text_lower = text.strip().lower().rstrip(".!?")
 
@@ -384,20 +419,34 @@ def _is_task_request(text: str) -> bool:
     if text_lower in ("resume", "continue", "go on", "keep going", "go ahead"):
         return True
 
-    # Skip greetings and questions
+    # Skip pure questions and greetings (but NOT prefixed tasks)
     for start in _NON_TASK_STARTS:
         if text_lower.startswith(start):
-            return False
+            # Before rejecting, strip the prefix and check for action verb
+            # e.g. "can you open Chrome" → should be a task
+            break
+    else:
+        # No non-task prefix matched — check directly
+        pass
 
     # Very short = unlikely to be an executable task
     if len(text_lower.split()) < 3:
         return False
 
-    # Action verb at the start of the sentence
+    # Strip conversational prefixes to find the core command
+    core = text_lower
+    for prefix in _CONVERSATIONAL_PREFIXES:
+        if core.startswith(prefix):
+            core = core[len(prefix):].lstrip(" ,")
+            break
+
+    # Action verb at the start of the sentence OR after prefix stripping
     for verb in _TASK_ACTION_VERBS:
         if (
             text_lower.startswith(verb + " ")
             or text_lower.startswith(verb + ":")
+            or core.startswith(verb + " ")
+            or core.startswith(verb + ":")
         ):
             return True
 
@@ -461,7 +510,14 @@ _ORCHESTRATOR_SYSTEM_INSTRUCTION = (
     "vision context. USE IT to decide the next step.\n"
     "- Maximum 25 tool calls per task.\n"
     "- If a step fails, try an alternative approach before giving up.\n"
-    "- When done, return ONLY the summary text (no markdown, no bullet points).\n"
+    "- When done, return ONLY the summary text (no markdown, no bullet points).\n\n"
+    "DELEGATION:\n"
+    "- For complex tasks requiring specialized expertise (e.g. research, code analysis, "
+    "image generation), use delegate_to_agent(agent_name, sub_goal) to hand off sub-tasks.\n"
+    "- Available agents: code_agent (coding/debugging), research_agent (analysis/reasoning), "
+    "creative_agent (image/video generation).\n"
+    "- Delegate when a sub-task clearly matches another agent's specialty.\n"
+    "- You can continue your own work after delegation completes.\n"
 )
 
 
@@ -485,8 +541,17 @@ class ToolOrchestrator:
         broadcast_fn: Any | None = None,
     ) -> None:
         self._client = genai_client
-        self._tool_fns = tool_fns
-        self._tool_map: dict[str, Any] = {fn.__name__: fn for fn in tool_fns}
+        # Ensure no duplicate function names enter the tool declaration set.
+        # Duplicate names cause Gemini API 400 INVALID_ARGUMENT.
+        self._tool_fns = []
+        self._tool_map: dict[str, Any] = {}
+        for fn in tool_fns:
+            name = fn.__name__
+            if name in self._tool_map:
+                logger.warning("tools.duplicate_skipped", name=name)
+                continue
+            self._tool_fns.append(fn)
+            self._tool_map[name] = fn
         self._model = (
             model
             or os.environ.get("ORCHESTRATOR_MODEL", _DEFAULT_ORCHESTRATOR_MODEL)
@@ -618,17 +683,24 @@ class ToolOrchestrator:
         return self._session_id
 
     def _persist_session(self) -> None:
-        """Save current session state (notes + task_history) to disk."""
+        """Save current session state (notes + task_history + active goals) to disk."""
         try:
             import json
             data_dir = pathlib.Path(__file__).resolve().parent.parent / "data" / "sessions"
             data_dir.mkdir(parents=True, exist_ok=True)
+            # Record goals of currently running tasks so they can be resumed
+            active_goals = [
+                t.get_name().replace("orchestrator-", "", 1)
+                for t in self._active_tasks
+                if not t.done()
+            ]
             state = {
                 "session_id": self._session_id,
                 "notes": dict(self._notes),
                 "agent_notes": {k: dict(v) for k, v in self._agent_notes.items()},
                 "task_history": list(self._task_history),
                 "current_agent": self._current_agent,
+                "active_goals": active_goals,
             }
             (data_dir / f"{self._session_id}.json").write_text(
                 json.dumps(state, indent=2, default=str), encoding="utf-8",
@@ -651,10 +723,35 @@ class ToolOrchestrator:
             for entry in state.get("task_history", []):
                 self._task_history.append(tuple(entry))
             self._current_agent = state.get("current_agent", "task_executor")
-            self._log.info("session.loaded", session_id=session_id)
+            self._pending_resume_goals = state.get("active_goals", [])
+            self._log.info("session.loaded", session_id=session_id,
+                           pending_resume=len(self._pending_resume_goals))
             return True
         except Exception:
             return False
+
+    def resume_interrupted_tasks(
+        self,
+        inject_context: Callable[[str], Awaitable[None]],
+    ) -> list[asyncio.Task]:
+        """Re-spawn tasks that were running when the previous session ended.
+
+        Call this after load_session() once inject_context is available.
+        Returns list of spawned asyncio.Tasks.
+        """
+        goals = getattr(self, "_pending_resume_goals", [])
+        if not goals:
+            return []
+        spawned = []
+        for goal in goals:
+            self._log.info("session.resume_task", goal=goal[:80])
+            # Prefix so the model knows this is a resumed task
+            resume_goal = f"[RESUMED from previous session] {goal}"
+            task = self.spawn_task(resume_goal, inject_context)
+            spawned.append(task)
+        self._pending_resume_goals = []
+        self._persist_session()
+        return spawned
 
     def set_chat_store(self, chat_store: Any) -> None:
         """Attach a ChatStore for unified memory search (A5)."""
@@ -771,6 +868,9 @@ class ToolOrchestrator:
             return {"success": True, "results": results[:limit]}
 
         for fn in (save_note, get_notes, search_notes):
+            if fn.__name__ in self._tool_map:
+                self._log.warning("tools.duplicate_skipped", name=fn.__name__)
+                continue
             self._tool_fns.append(fn)
             self._tool_map[fn.__name__] = fn
 
@@ -799,8 +899,9 @@ class ToolOrchestrator:
             self._persist_session()
             return {"success": True, "snapshot": snapshot}
 
-        self._tool_fns.append(export_context)
-        self._tool_map[export_context.__name__] = export_context
+        if export_context.__name__ not in self._tool_map:
+            self._tool_fns.append(export_context)
+            self._tool_map[export_context.__name__] = export_context
 
         # C3: Subagent delegation tool — allows the orchestrator to
         # delegate sub-goals to specialized agents with depth limits.
@@ -889,8 +990,9 @@ class ToolOrchestrator:
             finally:
                 _orchestrator_self._delegation_depth = old_depth
 
-        self._tool_fns.append(delegate_to_agent)
-        self._tool_map["delegate_to_agent"] = delegate_to_agent
+        if "delegate_to_agent" not in self._tool_map:
+            self._tool_fns.append(delegate_to_agent)
+            self._tool_map["delegate_to_agent"] = delegate_to_agent
 
     # ------------------------------------------------------------------
     # Approval queue (B2) — gate DANGEROUS/CRITICAL tools
@@ -901,11 +1003,12 @@ class ToolOrchestrator:
         tool_name: str,
         tool_args: dict,
         inject_fn: Any | None = None,
+        telegram_bot: Any | None = None,
     ) -> bool:
         """Request user approval for a dangerous tool call.
 
-        Sends an approval request via dashboard broadcast and optionally
-        injects a voice prompt.  Waits up to ``_approval_timeout`` seconds.
+        Sends an approval request via dashboard broadcast, voice prompt,
+        and optionally Telegram (P1.1). Waits up to ``_approval_timeout`` seconds.
         Returns True if approved, False if denied or timed out.
         """
         request_id = hashlib.md5(
@@ -924,6 +1027,13 @@ class ToolOrchestrator:
                     "risk": TOOL_RISK_MAP.get(tool_name, ToolRisk.DANGEROUS).value,
                     "timeout": self._approval_timeout,
                 })
+            except Exception:
+                pass
+
+        # P1.1: Notify via Telegram so user can approve from phone
+        if telegram_bot is not None and getattr(telegram_bot, "enabled", False):
+            try:
+                telegram_bot.notify_approval_pending(tool_name)
             except Exception:
                 pass
 
@@ -949,7 +1059,7 @@ class ToolOrchestrator:
             return False  # Auto-deny on timeout
 
     def resolve_approval(self, approved: bool) -> None:
-        """Resolve a pending approval request (called from dashboard/voice)."""
+        """Resolve a pending approval request (called from dashboard/voice/Telegram)."""
         try:
             self._approval_queue.put_nowait(approved)
         except asyncio.QueueFull:
@@ -1133,8 +1243,11 @@ class ToolOrchestrator:
 
     def cancel_all(self) -> None:
         """Cancel all running orchestrator tasks (call on session disconnect)."""
+        count = len(self._active_tasks)
         for t in list(self._active_tasks):
             t.cancel()
+        if count:
+            self._log.info("orchestrator.cancel_all", count=count)
 
     async def run_task(
         self,
@@ -1238,6 +1351,7 @@ class ToolOrchestrator:
                 max_iterations=max_iters,
                 task_obj=_current_task,
                 instruction_suffix=instruction_suffix,
+                inject_context=inject_context,
             )
             # Record in session memory so future tasks have context
             self._task_history.append((goal, result_text))
@@ -1257,7 +1371,7 @@ class ToolOrchestrator:
                 f"[SYSTEM: The autonomous task executor has completed the task.\n"
                 f"Agent: {agent_name} (model: {agent_model})\n"
                 f"Original goal: {goal}\n"
-                f"What was done: {result_text}\n"
+                f"What was done: {_format_for_voice(result_text)}\n"
                 f"Acknowledge completion in 1-2 sentences. Be concise and natural.]"
             )
             await inject_context(completion_msg)
@@ -1276,6 +1390,15 @@ class ToolOrchestrator:
                     self._task_store.save(_current_task)
                 except Exception:
                     pass
+            # Notify user that task was cancelled (prevents silent disappearance)
+            try:
+                await inject_context(
+                    f"[SYSTEM: The task was cancelled.\n"
+                    f"Goal: {goal}\n"
+                    f"Tell the user the task was stopped. Be brief.]"
+                )
+            except Exception:
+                pass
             raise  # Re-raise so the Task is properly cancelled
 
         except Exception as exc:
@@ -1330,6 +1453,7 @@ class ToolOrchestrator:
         max_iterations: int = _MAX_ITERATIONS,
         task_obj: Any | None = None,
         instruction_suffix: str = "",
+        inject_context: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """ReAct loop: think → call tools → observe → repeat until done.
 
@@ -1345,6 +1469,17 @@ class ToolOrchestrator:
         use_model = model or self._model
         use_tool_fns = tool_fns if tool_fns is not None else self._tool_fns
         use_tool_map = tool_map if tool_map is not None else self._tool_map
+
+        # Final guard: dedupe by callable name before passing to model API.
+        _seen_tool_names: set[str] = set()
+        _unique_tool_fns: list = []
+        for _fn in use_tool_fns:
+            _n = _fn.__name__
+            if _n in _seen_tool_names:
+                continue
+            _seen_tool_names.add(_n)
+            _unique_tool_fns.append(_fn)
+        use_tool_fns = _unique_tool_fns
 
         # Build context preamble from past tasks and saved notes
         context_parts: list[str] = []
@@ -1526,7 +1661,11 @@ class ToolOrchestrator:
 
                 # Approval gate (B2) — require approval for DANGEROUS/CRITICAL
                 if risk in (ToolRisk.DANGEROUS, ToolRisk.CRITICAL):
-                    approved = await self.request_approval(tool_name, tool_args)
+                    approved = await self.request_approval(
+                        tool_name, tool_args,
+                        inject_fn=inject_context,
+                        telegram_bot=getattr(self, "_telegram_bot", None),
+                    )
                     if not approved:
                         self._log.info("orchestrator.tool.denied", name=tool_name)
                         exec_result = {
@@ -1587,7 +1726,57 @@ class ToolOrchestrator:
                         except Exception as hook_exc:
                             self._log.debug("hook.before_tool.error", error=str(hook_exc))
                     try:
-                        exec_result = await fn(**tool_args)
+                        # Wrap tool execution with progress heartbeat + timeout.
+                        # If a tool takes >5s, inject a status message so the
+                        # voice model can speak to the user instead of silence.
+                        # P1.3: Per-tool timeouts from config (fallback = 120s)
+                        try:
+                            import yaml as _yaml, pathlib as _pl
+                            _cfg_p = _pl.Path(__file__).resolve().parent.parent / "config.yaml"
+                            _cfg_raw = _yaml.safe_load(_cfg_p.read_text(encoding="utf-8")) or {}
+                            _orch_cfg = _cfg_raw.get("rio", {}).get("orchestrator", {})
+                            _TOOL_TIMEOUT = _orch_cfg.get("tool_timeout_seconds", 120)
+                            _HEARTBEAT_INTERVAL = _orch_cfg.get("heartbeat_interval_seconds", 5)
+                        except Exception:
+                            _TOOL_TIMEOUT = 120  # seconds — generous for CU calls
+                            _HEARTBEAT_INTERVAL = 5  # seconds before first heartbeat
+
+                        async def _heartbeat_while_running(
+                            coro,
+                            tool_name_for_hb: str,
+                        ):
+                            """Run coro; inject progress heartbeats every 5s."""
+                            tool_task = asyncio.ensure_future(coro)
+                            elapsed = 0
+                            heartbeat_sent = False
+                            while not tool_task.done():
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.shield(tool_task),
+                                        timeout=_HEARTBEAT_INTERVAL,
+                                    )
+                                except asyncio.TimeoutError:
+                                    elapsed += _HEARTBEAT_INTERVAL
+                                    if inject_context and not heartbeat_sent:
+                                        heartbeat_sent = True
+                                        try:
+                                            await inject_context(
+                                                f"[SYSTEM: Still working on {tool_name_for_hb}... "
+                                                f"({elapsed}s elapsed). Tell the user you're still "
+                                                f"working on it briefly.]"
+                                            )
+                                        except Exception:
+                                            pass
+                                    if elapsed >= _TOOL_TIMEOUT:
+                                        tool_task.cancel()
+                                        raise asyncio.TimeoutError(
+                                            f"{tool_name_for_hb} timed out after {_TOOL_TIMEOUT}s"
+                                        )
+                            return tool_task.result()
+
+                        exec_result = await _heartbeat_while_running(
+                            fn(**tool_args), tool_name,
+                        )
                     except TypeError as exc:
                         self._log.warning(
                             "orchestrator.tool_bad_args",
@@ -1598,6 +1787,16 @@ class ToolOrchestrator:
                             "error": f"Bad arguments for {tool_name}: {exc}",
                         }
                         if _step: _step.mark_failed(str(exc))
+                    except (asyncio.TimeoutError, TimeoutError) as exc:
+                        self._log.warning(
+                            "orchestrator.tool_timeout",
+                            name=tool_name, error=str(exc),
+                        )
+                        exec_result = {
+                            "success": False,
+                            "error": f"Tool {tool_name} timed out: {exc}. Try a different approach.",
+                        }
+                        if _step: _step.mark_failed(f"timeout: {exc}")
                     except Exception as exc:
                         self._log.exception(
                             "orchestrator.tool_error", name=tool_name,

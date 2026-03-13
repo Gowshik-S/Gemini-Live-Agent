@@ -1,0 +1,52 @@
+# Rio Agent — Development Dependencies
+# Install with: pip install -r requirements-dev.txt
+#
+# This includes code quality, testing, and development tools.
+
+# ============================================================================
+# Code Quality & Linting
+# ============================================================================
+
+# Type checking
+mypy>=1.8.0
+types-PyYAML>=6.0.0
+types-requests>=2.31.0
+
+# Linting
+pylint>=3.0.0
+flake8>=7.0.0
+
+# Code formatting
+black>=24.0.0
+isort>=5.13.0
+
+# ============================================================================
+# Testing & Coverage
+# ============================================================================
+
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# ============================================================================
+# Documentation
+# ============================================================================
+
+# Sphinx for documentation generation (optional)
+# sphinx>=7.2.0
+# sphinx-rtd-theme>=2.0.0
+
+# ============================================================================
+# Development Utilities
+# ============================================================================
+
+# Interactive debugging
+ipython>=8.20.0
+ipdb>=0.13.13
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Pre-commit hooks (optional)
+# pre-commit>=3.6.0

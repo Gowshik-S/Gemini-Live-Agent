@@ -75,10 +75,14 @@ Rio-Agent/
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+ (3.10+ may work but 3.11+ is recommended)
 - A Gemini API key from Google AI Studio
 
-### Windows
+### Installation
+
+#### Option 1: Using setup scripts (Recommended)
+
+**Windows:**
 
 ```cmd
 cd Rio-Agent\rio\setup
@@ -92,7 +96,7 @@ run-cloud.bat
 run-local.bat
 ```
 
-### Linux / macOS
+**Linux / macOS:**
 
 ```bash
 cd Rio-Agent/rio/setup
@@ -105,6 +109,27 @@ Then run:
 ```bash
 ./run-cloud.sh
 ./run-local.sh
+```
+
+#### Option 2: Manual installation
+
+```bash
+cd Rio-Agent/rio
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate virtual environment
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# For development (optional)
+pip install -r requirements-dev.txt
 ```
 
 After startup:

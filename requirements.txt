@@ -1,5 +1,30 @@
-# Rio root — combined dependency set for the local client, cloud relay, CLI, and tests.
-# Optional vector memory packages remain commented out in local/requirements.txt.
+# Rio Agent — Combined dependency set for the local client, cloud relay, CLI, and tests.
+# This file aggregates all dependencies needed to run Rio Agent in full mode.
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# For development:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Python Version: 3.11+
+
+# ============================================================================
+# Core Dependencies (Local + Cloud)
+# ============================================================================
 
 -r local/requirements.txt
 -r cloud/requirements.txt
+
+# ============================================================================
+# Additional CLI & Testing Dependencies
+# ============================================================================
+
+# Testing framework
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+
+# Code quality (optional, for development)
+# mypy>=1.8.0
+# pylint>=3.0.0
+# black>=24.0.0

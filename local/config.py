@@ -79,8 +79,12 @@ class LoggingConfig:
 
 @dataclass
 class ModelConfig:
-    primary: str = "gemini-2.5-flash"
-    secondary: str = "gemini-2.5-pro-preview-03-25"
+    primary: str = "gemini-3-flash-preview"
+    live: str = "gemini-2.5-flash-native-audio-preview-12-2025"
+    secondary: str = "gemini-3-pro-preview"
+    computer_use: str = "gemini-2.5-computer-use-preview-10-2025"
+    creative: str = "gemini-3-pro-image-preview"
+    imagen: str = "imagen-4"
     pro_rpm_budget: int = 5
     fallback_chain: list = field(default_factory=lambda: ["gemini-2.5-flash"])
     cooldown_seconds: float = 60.0
@@ -235,3 +239,89 @@ def _build_skills(raw: dict | None) -> SkillsConfig:
         customer_care=_build(CustomerCareConfig, raw.get("customer_care")),
         tutor=_build(TutorConfig, raw.get("tutor")),
     )
+
+
+# ---------------------------------------------------------------------------
+# Model resolver: env → yaml → hardcoded default
+# ---------------------------------------------------------------------------
+
+# Maps logical model names to (env var, ModelConfig field name)
+_MODEL_ENV_MAP = {
+    "live":         ("LIVE_MODEL",          "live"),
+    "primary":      ("ORCHESTRATOR_MODEL",  "primary"),
+    "orchestrator": ("ORCHESTRATOR_MODEL",  "primary"),
+    "secondary":    ("RESEARCH_MODEL",      "secondary"),
+    "research":     ("RESEARCH_MODEL",      "secondary"),
+    "computer_use": ("COMPUTER_USE_MODEL",  "computer_use"),
+    "creative":     ("CREATIVE_MODEL",      "creative"),
+    "imagen":       ("IMAGEN_MODEL",        "imagen"),
+}
+
+# Singleton config — lazily loaded
+_cached_config: RioConfig | None = None
+
+
+def _load_env_file() -> None:
+    """Parse rio/cloud/.env and inject missing vars into os.environ."""
+    env_file = Path(__file__).resolve().parent.parent / "cloud" / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def get_model(name: str) -> str:
+    """Resolve a model name with env → yaml → hardcoded default fallback.
+
+    Usage::
+
+        from rio.local.config import get_model
+        cu_model = get_model("computer_use")
+        live_model = get_model("live")
+    """
+    global _cached_config
+
+    # 1. Parse .env file (one-time, fills os.environ for missing vars)
+    _load_env_file()
+
+    mapping = _MODEL_ENV_MAP.get(name)
+    if mapping is None:
+        raise ValueError(f"Unknown model name: {name!r}. Valid: {sorted(_MODEL_ENV_MAP)}")
+
+    env_var, config_field = mapping
+
+    # Priority 1: environment variable (includes .env file values)
+    env_val = os.environ.get(env_var, "").strip()
+    if env_val:
+        return env_val
+
+    # Priority 2: config.yaml value
+    if _cached_config is None:
+        _cached_config = RioConfig.load()
+    yaml_val = getattr(_cached_config.models, config_field, "").strip()
+    if yaml_val:
+        return yaml_val
+
+    # Priority 3: hardcoded default from ModelConfig dataclass
+    return getattr(ModelConfig(), config_field)
+
+
+def _load_raw_browser_config() -> dict:
+    """Return the raw ``rio.browser`` block from config.yaml (no dataclass)."""
+    path = Path(__file__).resolve().parent.parent / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    rio_block = raw.get("rio", raw)
+    return rio_block.get("browser", {})
