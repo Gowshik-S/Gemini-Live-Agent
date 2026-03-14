@@ -45,6 +45,7 @@ class Trigger:
     last_fired: float = 0.0
     fire_count: int = 0
     cooldown_seconds: int = 60  # Minimum gap between firings
+    run_once: bool = False
 
 
 class TriggerEngine:
@@ -119,9 +120,94 @@ class TriggerEngine:
                 "goal": t.goal[:100],
                 "enabled": t.enabled,
                 "fire_count": t.fire_count,
+                "run_once": t.run_once,
             }
             for t in self._triggers.values()
         ]
+
+    def try_schedule_from_utterance(self, utterance: str) -> dict[str, Any] | None:
+        """Parse natural-language scheduling intent and register a trigger.
+
+        Supported patterns:
+          - "remind me in 10 minutes to check email"
+          - "every 30 minutes check server status"
+          - "check email every 1 hour"
+        """
+        text = (utterance or "").strip()
+        if not text:
+            return None
+        lower = text.lower()
+
+        def _seconds(value: int, unit: str) -> int:
+            unit = unit.lower()
+            if unit.startswith("hour"):
+                return value * 3600
+            if unit.startswith("min"):
+                return value * 60
+            return value
+
+        one_shot = re.search(
+            r"remind me in\s+(\d+)\s+(seconds?|minutes?|hours?)\s+to\s+(.+)",
+            lower,
+        )
+        if one_shot:
+            value = int(one_shot.group(1))
+            unit = one_shot.group(2)
+            goal = one_shot.group(3).strip()
+            interval = max(30, _seconds(value, unit))
+            name = f"reminder_{int(time.time())}"
+            trigger = Trigger(
+                name=name,
+                trigger_type="schedule",
+                goal=goal,
+                interval_seconds=interval,
+                cooldown_seconds=30,
+                run_once=True,
+            )
+            self._triggers[name] = trigger
+            log.info("trigger.added_from_utterance", name=name, mode="reminder", interval=interval)
+            return {
+                "name": name,
+                "mode": "reminder",
+                "goal": goal,
+                "interval_seconds": interval,
+                "run_once": True,
+            }
+
+        recurring = re.search(
+            r"(?:every\s+(\d+)\s+(seconds?|minutes?|hours?)\s+(.+))|(?:^(.+?)\s+every\s+(\d+)\s+(seconds?|minutes?|hours?)$)",
+            lower,
+        )
+        if recurring:
+            if recurring.group(1):
+                value = int(recurring.group(1))
+                unit = recurring.group(2)
+                goal = recurring.group(3).strip()
+            else:
+                goal = recurring.group(4).strip()
+                value = int(recurring.group(5))
+                unit = recurring.group(6)
+            interval = max(30, _seconds(value, unit))
+            name = f"schedule_{int(time.time())}"
+            trigger = Trigger(
+                name=name,
+                trigger_type="schedule",
+                goal=goal,
+                interval_seconds=interval,
+                cooldown_seconds=min(interval, 60),
+                run_once=False,
+            )
+            self._triggers[name] = trigger
+            log.info("trigger.added_from_utterance", name=name, mode="recurring", interval=interval)
+            return {
+                "name": name,
+                "mode": "recurring",
+                "goal": goal,
+                "interval_seconds": interval,
+                "run_once": False,
+            }
+
+        return None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -206,5 +292,8 @@ class TriggerEngine:
         )
         try:
             self._orchestrator.spawn_task(trigger.goal, self._inject_fn)
+            if trigger.run_once:
+                trigger.enabled = False
+                log.info("trigger.disabled_after_fire", name=trigger.name)
         except Exception:
             log.exception("trigger.fire.error", name=trigger.name)

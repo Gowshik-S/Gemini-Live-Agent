@@ -38,6 +38,7 @@ import collections
 import hashlib
 import json
 import os
+import pathlib
 import time
 from enum import Enum
 from typing import Any, Awaitable, Callable
@@ -52,7 +53,7 @@ logger = structlog.get_logger(__name__)
 _DEFAULT_ORCHESTRATOR_MODEL = "gemini-3-flash-preview"
 
 # Hard safety cap: maximum tool-call iterations per task
-_MAX_ITERATIONS = 25
+_MAX_ITERATIONS = 50
 
 # How many past task summaries to keep in the session context
 _MAX_TASK_MEMORY = 20
@@ -71,6 +72,114 @@ _CONTEXT_COMPACT_CHARS = 400_000  # ~100K tokens — trigger compaction
 # ---------------------------------------------------------------------------
 _MAX_TOOL_RESULT_CHARS = 4000     # Full result limit per tool call
 _RESULT_STRIP_AFTER_TURNS = 3     # Strip results older than N turns
+
+_DEFAULT_TOOL_TIMEOUT_SECONDS = 120
+_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
+_DEFAULT_MAX_TOOL_CALLS_PER_TASK = 120
+_DEFAULT_MAX_COST_POINTS_PER_TASK = 200
+_DEFAULT_SESSION_PERSIST_INTERVAL_SECONDS = 3
+
+
+def _load_orchestrator_settings() -> dict[str, Any]:
+    """Load orchestrator settings from config.yaml with safe defaults."""
+    from pathlib import Path as _P
+
+    defaults: dict[str, Any] = {
+        "tool_timeout_seconds": _DEFAULT_TOOL_TIMEOUT_SECONDS,
+        "heartbeat_interval_seconds": _DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        "session_persist_interval_seconds": _DEFAULT_SESSION_PERSIST_INTERVAL_SECONDS,
+        "tool_policy": {
+            "default_per_minute": 20,
+            "max_calls_per_task": _DEFAULT_MAX_TOOL_CALLS_PER_TASK,
+            "max_cost_points_per_task": _DEFAULT_MAX_COST_POINTS_PER_TASK,
+            "cost_points": {},
+            "per_tool_per_minute": {},
+        },
+        "composite_routing": {
+            "enabled": True,
+            "simple_model": "gemini-3-flash-preview",
+            "complex_model": "gemini-3-pro-preview",
+            "simple_max_words": 22,
+            "complexity_keywords": [
+                "analyze", "architecture", "tradeoff", "security", "research",
+                "refactor", "optimize", "multi-step", "design", "plan",
+            ],
+        },
+        "prompt_fragments": {
+            "base": "",
+            "routing": "",
+            "safety": "",
+            "verification": "",
+            "compaction": "",
+        },
+        "loop_detection": {
+            "warning_at": 2,
+            "strategy_at": 3,
+            "stop_at": 4,
+        },
+        "semantic_compaction": {
+            "keep_middle_items": 8,
+            "high_value_keywords": [
+                "error", "failed", "path", "note", "decision", "todo", "retry",
+                "blocked", "fix", "approved", "denied", "security", "quota",
+            ],
+        },
+    }
+
+    try:
+        import yaml
+
+        for candidate in (
+            _P(__file__).resolve().parent.parent / "config.yaml",
+            _P(os.getcwd()) / "config.yaml",
+        ):
+            if not candidate.is_file():
+                continue
+            data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            loaded = data.get("rio", {}).get("orchestrator", {}) or {}
+            merged = dict(defaults)
+            for key in ("tool_timeout_seconds", "heartbeat_interval_seconds", "session_persist_interval_seconds"):
+                if key in loaded:
+                    merged[key] = loaded[key]
+            for key in (
+                "tool_policy",
+                "composite_routing",
+                "prompt_fragments",
+                "loop_detection",
+                "semantic_compaction",
+            ):
+                merged[key] = {
+                    **defaults.get(key, {}),
+                    **(loaded.get(key, {}) or {}),
+                }
+            return merged
+    except Exception:
+        pass
+
+    return defaults
+
+
+def _load_prompt_fragment_files(config_fragments: dict[str, str]) -> dict[str, str]:
+    """Load prompt fragments from inline strings or prompt fragment files."""
+    out: dict[str, str] = {}
+    base_dir = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "orchestrator"
+    for key in ("base", "routing", "safety", "verification", "compaction"):
+        raw = str(config_fragments.get(key, "") or "").strip()
+        if not raw:
+            out[key] = ""
+            continue
+        if "\n" in raw or len(raw.split()) > 8:
+            out[key] = raw
+            continue
+        candidate = base_dir / raw
+        if candidate.is_file():
+            try:
+                out[key] = candidate.read_text(encoding="utf-8").strip()
+                continue
+            except Exception:
+                pass
+        out[key] = raw
+    return out
 
 
 def _strip_tool_result(result: dict, max_chars: int = _MAX_TOOL_RESULT_CHARS) -> dict:
@@ -173,6 +282,13 @@ TOOL_RISK_MAP: dict[str, ToolRisk] = {
     "web_search": ToolRisk.SAFE,
     "web_fetch": ToolRisk.MODERATE,
     "web_cache_get": ToolRisk.SAFE,
+    # Google Workspace CLI tools (P2.2)
+    "gmail_search": ToolRisk.SAFE,
+    "gmail_send": ToolRisk.MODERATE,
+    "drive_list": ToolRisk.SAFE,
+    "calendar_list_events": ToolRisk.SAFE,
+    "sheets_read": ToolRisk.SAFE,
+    "docs_create": ToolRisk.MODERATE,
     # Long-running processes (E2)
     "start_process": ToolRisk.DANGEROUS,
     "check_process": ToolRisk.SAFE,
@@ -257,6 +373,36 @@ def _load_global_deny_tools() -> list[str]:
     return []
 
 
+def _load_filesystem_policy() -> dict[str, Any]:
+    """Load filesystem read/write policy from config.yaml with safe defaults."""
+    from pathlib import Path as _P
+
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "read_paths": ["."],
+        "write_paths": ["."],
+    }
+
+    try:
+        import yaml
+        for candidate in (
+            _P(__file__).resolve().parent.parent / "config.yaml",
+            _P(os.getcwd()) / "config.yaml",
+        ):
+            if not candidate.is_file():
+                continue
+            data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            fs = data.get("rio", {}).get("filesystem", {}) or {}
+            merged = dict(defaults)
+            merged.update(fs)
+            merged["read_paths"] = list(merged.get("read_paths") or defaults["read_paths"])
+            merged["write_paths"] = list(merged.get("write_paths") or defaults["write_paths"])
+            return merged
+    except Exception:
+        pass
+    return defaults
+
+
 def _load_modes() -> dict[str, dict]:
     """D2: Load packaged mode definitions from rio/modes/*.yaml."""
     from pathlib import Path as _P
@@ -298,6 +444,8 @@ _TOOL_SETS = {
         "read_file", "write_file", "patch_file", "run_command",
         "capture_screen", "save_note", "get_notes", "search_notes",
         "web_search", "web_fetch", "web_cache_get",
+        "gmail_search", "gmail_send", "drive_list",
+        "calendar_list_events", "sheets_read", "docs_create",
         "start_process", "check_process", "stop_process",
     }),
     "memory": frozenset({
@@ -312,12 +460,58 @@ _TOOL_SETS = {
 }
 
 
-def _select_agent(goal: str, agent_configs: dict[str, dict]) -> str:
+def _select_agent(goal: str, agent_configs: dict[str, dict],
+                  memory_store: Any | None = None) -> str:
     """Select the best agent for a given task goal.
 
-    Keyword-based routing — maps task content to agent specializations.
+    Uses semantic embedding similarity when available, falling back to
+    keyword matching.  The embedding approach resolves ambiguity like
+    'write an email about debugging code' which would match both
+    email_drafter and code_agent under keyword routing.
     """
+    # --- Semantic routing via embeddings (when available) ---
+    if memory_store is not None and hasattr(memory_store, 'embed'):
+        try:
+            candidates = {
+                name: cfg.get("description", "")
+                for name, cfg in agent_configs.items()
+                if cfg.get("enabled", True) and cfg.get("description")
+            }
+            if candidates:
+                goal_emb = memory_store.embed(goal)
+                best_agent = ""
+                best_score = -1.0
+                for name, desc in candidates.items():
+                    desc_emb = memory_store.embed(desc)
+                    # Cosine similarity
+                    dot = sum(a * b for a, b in zip(goal_emb, desc_emb))
+                    norm_a = sum(a * a for a in goal_emb) ** 0.5
+                    norm_b = sum(b * b for b in desc_emb) ** 0.5
+                    sim = dot / (norm_a * norm_b) if (norm_a and norm_b) else 0.0
+                    if sim > best_score:
+                        best_score = sim
+                        best_agent = name
+                if best_agent and best_score > 0.3:
+                    return best_agent
+        except Exception:
+            pass  # Fall through to keyword routing
+
+    # --- Keyword fallback routing ---
     goal_lower = goal.lower()
+
+    # Screen/GUI/computer-use keywords → computer_use_agent
+    screen_keywords = (
+        "click", "smart_click", "screen", "scroll", "navigate", "open app",
+        "open application", "launch", "window", "browser", "chrome",
+        "firefox", "edge", "type in", "go to", "goto", "visit",
+        "screenshot", "capture screen", "minimize", "maximize", "close window",
+        "drag", "hotkey", "press", "switch window", "focus window",
+        "open chrome", "open browser", "open file", "open folder",
+        "desktop", "taskbar", "start menu", "notification",
+    )
+    if any(kw in goal_lower for kw in screen_keywords):
+        if "computer_use_agent" in agent_configs and agent_configs["computer_use_agent"].get("enabled"):
+            return "computer_use_agent"
 
     # Code/dev keywords → code_agent
     code_keywords = (
@@ -327,7 +521,7 @@ def _select_agent(goal: str, agent_configs: dict[str, dict]) -> str:
         ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
     )
     if any(kw in goal_lower for kw in code_keywords):
-        if "code_agent" in agent_configs and agent_configs["code_agent"]["enabled"]:
+        if "code_agent" in agent_configs and agent_configs["code_agent"].get("enabled"):
             return "code_agent"
 
     # Creative keywords → creative_agent
@@ -336,19 +530,22 @@ def _select_agent(goal: str, agent_configs: dict[str, dict]) -> str:
         "imagen", "veo", "picture", "illustration", "photo",
     )
     if any(kw in goal_lower for kw in creative_keywords):
-        if "creative_agent" in agent_configs and agent_configs["creative_agent"]["enabled"]:
+        if "creative_agent" in agent_configs and agent_configs["creative_agent"].get("enabled"):
             return "creative_agent"
 
-    # Research/explanation keywords → research_agent
+    # Research/explanation keywords → research_agent (uses pro model)
     research_keywords = (
-        "research", "analyze", "explain", "compare", "summarize",
+        "research", "analyze", "analyse", "explain", "compare", "summarize",
         "what is", "how does", "why", "investigate", "study",
+        "deep dive", "thoroughly", "in detail", "comprehensive",
+        "architecture", "tradeoff", "trade-off", "security audit",
+        "plan", "strategy", "evaluate", "review",
     )
     if any(kw in goal_lower for kw in research_keywords):
-        if "research_agent" in agent_configs and agent_configs["research_agent"]["enabled"]:
+        if "research_agent" in agent_configs and agent_configs["research_agent"].get("enabled"):
             return "research_agent"
 
-    # Default → task_executor for screen/computer tasks
+    # Default → task_executor for mixed/general tasks
     return "task_executor"
 
 # ---------------------------------------------------------------------------
@@ -467,10 +664,42 @@ def _is_task_request(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ToolOrchestrator
+# Load agents.md system prompt (user-customizable orchestration instructions)
 # ---------------------------------------------------------------------------
 
+def _load_agents_md() -> str:
+    """Load agents.md from the project root as additional system instructions."""
+    use_agents_md = os.environ.get("RIO_ORCHESTRATOR_USE_AGENTS_MD", "").strip().lower()
+    if use_agents_md not in {"1", "true", "yes", "on"}:
+        logger.info("agents_md.disabled", env_var="RIO_ORCHESTRATOR_USE_AGENTS_MD")
+        return ""
+
+    from pathlib import Path as _P
+    # Search common locations for agents.md
+    _base = _P(__file__).resolve().parent.parent  # rio/
+    _project_root = _base.parent  # Rio-Agent/
+    candidates = [
+        _project_root / ".claude" / "agents" / "agents.md",
+        _project_root / "agents.md",
+        _base / "agents.md",
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    logger.info("agents_md.loaded", path=str(path))
+                    return content
+            except Exception:
+                pass
+    return ""
+
+_AGENTS_MD_CONTENT = _load_agents_md()
+
 _ORCHESTRATOR_SYSTEM_INSTRUCTION = (
+    # Include agents.md as the top-level orchestration philosophy
+    ((_AGENTS_MD_CONTENT + "\n\n---\n\n") if _AGENTS_MD_CONTENT else "")
+    +
     "You are Rio's autonomous task execution engine. "
     "The user has asked you to complete a specific task on their computer. "
     "Execute it fully using the available tools — do NOT stop to ask for "
@@ -514,8 +743,12 @@ _ORCHESTRATOR_SYSTEM_INSTRUCTION = (
     "DELEGATION:\n"
     "- For complex tasks requiring specialized expertise (e.g. research, code analysis, "
     "image generation), use delegate_to_agent(agent_name, sub_goal) to hand off sub-tasks.\n"
-    "- Available agents: code_agent (coding/debugging), research_agent (analysis/reasoning), "
+    "- Available agents: computer_use_agent (screen/GUI/clicking), code_agent (coding/debugging), "
+    "research_agent (deep analysis/reasoning with pro model), "
     "creative_agent (image/video generation).\n"
+    "- For screen tasks (open apps, click buttons, navigate), ALWAYS delegate to computer_use_agent.\n"
+    "- For research/analysis that needs deep thinking, delegate to research_agent (uses pro model).\n"
+    "- Use delegate_parallel to run multiple independent sub-tasks simultaneously.\n"
     "- Delegate when a sub-task clearly matches another agent's specialty.\n"
     "- You can continue your own work after delegation completes.\n"
 )
@@ -552,6 +785,21 @@ class ToolOrchestrator:
                 continue
             self._tool_fns.append(fn)
             self._tool_map[name] = fn
+
+        # Auto-register Google Workspace tools (Gmail, Drive, Calendar, etc.)
+        try:
+            from workspace_tools import get_workspace_tools
+            for ws_fn in get_workspace_tools():
+                ws_name = ws_fn.__name__
+                if ws_name not in self._tool_map:
+                    self._tool_fns.append(ws_fn)
+                    self._tool_map[ws_name] = ws_fn
+            if any(ws_fn.__name__ in self._tool_map for ws_fn in get_workspace_tools()):
+                logger.info("workspace_tools.registered")
+        except ImportError:
+            logger.debug("workspace_tools.not_available")
+        except Exception as ws_exc:
+            logger.debug("workspace_tools.registration_error", error=str(ws_exc))
         self._model = (
             model
             or os.environ.get("ORCHESTRATOR_MODEL", _DEFAULT_ORCHESTRATOR_MODEL)
@@ -583,6 +831,44 @@ class ToolOrchestrator:
         self._modes = _load_modes()
         self._active_mode: dict | None = None
 
+        # Priority 2/3 runtime settings
+        self._orchestrator_settings = _load_orchestrator_settings()
+        self._tool_timeout_seconds = int(
+            self._orchestrator_settings.get("tool_timeout_seconds", _DEFAULT_TOOL_TIMEOUT_SECONDS)
+        )
+        self._heartbeat_interval_seconds = int(
+            self._orchestrator_settings.get("heartbeat_interval_seconds", _DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+        )
+        self._tool_policy = self._orchestrator_settings.get("tool_policy", {}) or {}
+        self._loop_cfg = self._orchestrator_settings.get("loop_detection", {}) or {}
+        self._composite_routing_cfg = self._orchestrator_settings.get("composite_routing", {}) or {}
+        self._semantic_compaction_cfg = self._orchestrator_settings.get("semantic_compaction", {}) or {}
+        self._session_persist_interval_seconds = float(
+            self._orchestrator_settings.get(
+                "session_persist_interval_seconds",
+                _DEFAULT_SESSION_PERSIST_INTERVAL_SECONDS,
+            )
+        )
+        self._last_session_persist_at = 0.0
+        self._prompt_fragments = _load_prompt_fragment_files(
+            self._orchestrator_settings.get("prompt_fragments", {}) or {}
+        )
+        self._filesystem_policy = _load_filesystem_policy()
+        self._workspace_root = pathlib.Path(__file__).resolve().parent.parent
+
+        # Priority 3.1: rate limits, quotas, and lightweight cost tracking.
+        self._tool_call_times: dict[str, collections.deque[float]] = collections.defaultdict(collections.deque)
+        self._tool_usage_total: collections.Counter[str] = collections.Counter()
+        self._tool_cost_total: collections.Counter[str] = collections.Counter()
+
+        # Priority 1.4: richer task snapshots for resume.
+        self._active_task_state: dict[asyncio.Task, dict[str, Any]] = {}
+        self._pending_resume_snapshots: list[dict[str, Any]] = []
+
+        # Priority 3.2: delegated sub-task lifecycle registry.
+        self._subagent_registry: dict[str, dict[str, Any]] = {}
+        self._subagent_counter: int = 0
+
         # D3: Skill packaging
         try:
             import sys as _sys
@@ -597,10 +883,25 @@ class ToolOrchestrator:
         # Long-term memory store (ChromaDB) for semantic search (A1)
         self._memory_store = memory_store
 
+        # Memory compaction lock — prevents concurrent compaction (race condition fix)
+        self._compaction_lock = asyncio.Lock()
+
+        # Evaluation infrastructure (Agent Factory Podcast framework)
+        self._evaluation_store = None
+        self._llm_judge = None
+        self._eval_enabled = bool(os.environ.get("RIO_EVAL_ENABLED", ""))
+        try:
+            from evaluation import EvaluationStore, LLMJudge
+            self._evaluation_store = EvaluationStore()
+            if genai_client and self._eval_enabled:
+                self._llm_judge = LLMJudge(genai_client)
+        except ImportError:
+            pass
+
         # Unified memory facade (A5) — wraps vector + notes + chat
         self._unified_memory = None
         try:
-            import sys, pathlib
+            import sys
             _local_dir = str(pathlib.Path(__file__).resolve().parent.parent / "local")
             if _local_dir not in sys.path:
                 sys.path.insert(0, _local_dir)
@@ -613,7 +914,7 @@ class ToolOrchestrator:
         except Exception:
             pass
 
-        # Loop detection: recent call signatures (C6)
+        # Loop detection with graduated escalation (C6 + P3.4)
         self._recent_calls: collections.deque = collections.deque(maxlen=10)
 
         # Approval queue (B2) — gate dangerous tools via dashboard
@@ -633,7 +934,8 @@ class ToolOrchestrator:
         # C4: Workflow objects — create Task records for structured tracking
         self._task_store = None
         try:
-            import sys, pathlib as _pl
+            import sys
+            import pathlib as _pl
             _ld = str(_pl.Path(__file__).resolve().parent.parent / "local")
             if _ld not in sys.path:
                 sys.path.insert(0, _ld)
@@ -651,6 +953,33 @@ class ToolOrchestrator:
         #   after_tool:  (tool_name, args, result) → result (can modify result)
         self._before_tool_hooks: list = []
         self._after_tool_hooks: list = []
+
+    @property
+    def is_busy(self) -> bool:
+        """Return True if any task is currently running."""
+        return any(not t.done() for t in self._active_tasks)
+
+    @property
+    def model(self) -> str:
+        """Return the current orchestrator model name."""
+        return self._model
+
+    def set_model(self, model_name: str) -> None:
+        """Update the primary orchestrator model at runtime."""
+        self._model = model_name
+        self._log = logger.bind(component="tool_orchestrator", model=self._model)
+        self._log.info("orchestrator.model_updated", model=model_name)
+
+    def reset(self) -> None:
+        """Reset session-level task history and active notes."""
+        self._task_history.clear()
+        self._notes.clear()
+        self._agent_notes.clear()
+        self._log.info("orchestrator.reset", session_id=self._session_id)
+
+    def get_agents(self) -> dict[str, Any]:
+        """Return the current agent configurations."""
+        return self._agent_configs
 
     def register_hook(self, event: str, callback) -> None:
         """Register a hook callback.
@@ -688,25 +1017,27 @@ class ToolOrchestrator:
             import json
             data_dir = pathlib.Path(__file__).resolve().parent.parent / "data" / "sessions"
             data_dir.mkdir(parents=True, exist_ok=True)
-            # Record goals of currently running tasks so they can be resumed
-            active_goals = [
-                t.get_name().replace("orchestrator-", "", 1)
-                for t in self._active_tasks
-                if not t.done()
-            ]
             state = {
                 "session_id": self._session_id,
                 "notes": dict(self._notes),
                 "agent_notes": {k: dict(v) for k, v in self._agent_notes.items()},
                 "task_history": list(self._task_history),
                 "current_agent": self._current_agent,
-                "active_goals": active_goals,
+                "active_tasks": self._active_task_snapshots(),
             }
             (data_dir / f"{self._session_id}.json").write_text(
                 json.dumps(state, indent=2, default=str), encoding="utf-8",
             )
         except Exception:
             self._log.debug("session.persist_skip")
+
+    def _persist_session_if_due(self, force: bool = False) -> None:
+        """Persist session snapshots on an interval for robust task resumes."""
+        now = time.time()
+        if not force and (now - self._last_session_persist_at) < self._session_persist_interval_seconds:
+            return
+        self._persist_session()
+        self._last_session_persist_at = now
 
     def load_session(self, session_id: str) -> bool:
         """Restore a previously persisted session."""
@@ -723,9 +1054,9 @@ class ToolOrchestrator:
             for entry in state.get("task_history", []):
                 self._task_history.append(tuple(entry))
             self._current_agent = state.get("current_agent", "task_executor")
-            self._pending_resume_goals = state.get("active_goals", [])
+            self._pending_resume_snapshots = state.get("active_tasks", [])
             self._log.info("session.loaded", session_id=session_id,
-                           pending_resume=len(self._pending_resume_goals))
+                           pending_resume=len(self._pending_resume_snapshots))
             return True
         except Exception:
             return False
@@ -739,17 +1070,24 @@ class ToolOrchestrator:
         Call this after load_session() once inject_context is available.
         Returns list of spawned asyncio.Tasks.
         """
-        goals = getattr(self, "_pending_resume_goals", [])
-        if not goals:
+        snapshots = getattr(self, "_pending_resume_snapshots", [])
+        if not snapshots:
             return []
         spawned = []
-        for goal in goals:
-            self._log.info("session.resume_task", goal=goal[:80])
+        for snapshot in snapshots:
+            goal = str(snapshot.get("goal", "")).strip()
+            if not goal:
+                continue
+            self._log.info("session.resume_task", goal=goal[:80], task_id=snapshot.get("task_id"))
             # Prefix so the model knows this is a resumed task
-            resume_goal = f"[RESUMED from previous session] {goal}"
-            task = self.spawn_task(resume_goal, inject_context)
+            resume_goal = (
+                f"[RESUMED from previous session]\n"
+                f"Original goal: {goal}\n"
+                f"Last step: {snapshot.get('current_step', 'unknown')}"
+            )
+            task = self.spawn_task(resume_goal, inject_context, resume_snapshot=snapshot)
             spawned.append(task)
-        self._pending_resume_goals = []
+        self._pending_resume_snapshots = []
         self._persist_session()
         return spawned
 
@@ -787,6 +1125,218 @@ class ToolOrchestrator:
     def get_skills(self) -> dict:
         """D3: Return loaded skill definitions."""
         return self._skills
+
+    def _estimate_goal_complexity(self, goal: str) -> int:
+        """Estimate task complexity for composite model routing."""
+        words = goal.split()
+        score = 1
+        if len(words) > int(self._composite_routing_cfg.get("simple_max_words", 22)):
+            score += 1
+        keywords = [
+            kw.lower().strip()
+            for kw in (self._composite_routing_cfg.get("complexity_keywords", []) or [])
+            if str(kw).strip()
+        ]
+        goal_lower = goal.lower()
+        for kw in keywords:
+            if kw in goal_lower:
+                score += 1
+        if " and " in goal_lower or " then " in goal_lower:
+            score += 1
+        return min(score, 5)
+
+    def _route_model_for_goal(self, goal: str, agent_model: str) -> str:
+        """Priority 2.1: choose simple/complex model based on goal complexity."""
+        if not bool(self._composite_routing_cfg.get("enabled", True)):
+            return agent_model
+        complexity = self._estimate_goal_complexity(goal)
+        if complexity >= 3:
+            routed = str(self._composite_routing_cfg.get("complex_model", "") or "").strip()
+        else:
+            routed = str(self._composite_routing_cfg.get("simple_model", "") or "").strip()
+        return routed or agent_model
+
+    def _compose_system_instruction(self, instruction_suffix: str) -> str:
+        """Priority 2.1/2.3: compose orchestrator prompt from modular fragments."""
+        pieces: list[str] = [_ORCHESTRATOR_SYSTEM_INSTRUCTION]
+        for key in ("base", "routing", "safety", "verification", "compaction"):
+            fragment = self._prompt_fragments.get(key, "")
+            if fragment:
+                pieces.append(fragment)
+        if instruction_suffix:
+            pieces.append(instruction_suffix)
+        return "\n\n".join(p for p in pieces if p.strip())
+
+    def _enforce_tool_budget(
+        self,
+        tool_name: str,
+        task_cost_points: int,
+        task_tool_calls: int,
+    ) -> tuple[bool, str, int, int]:
+        """Priority 3.1: enforce per-tool rate limits and per-task quotas."""
+        now = time.time()
+        per_tool = self._tool_policy.get("per_tool_per_minute", {}) or {}
+        default_per_minute = int(self._tool_policy.get("default_per_minute", 20))
+        max_calls_per_task = int(self._tool_policy.get("max_calls_per_task", _DEFAULT_MAX_TOOL_CALLS_PER_TASK))
+        max_cost_points = int(self._tool_policy.get("max_cost_points_per_task", _DEFAULT_MAX_COST_POINTS_PER_TASK))
+        cost_points_cfg = self._tool_policy.get("cost_points", {}) or {}
+
+        max_per_minute = int(per_tool.get(tool_name, default_per_minute))
+        bucket = self._tool_call_times[tool_name]
+        while bucket and (now - bucket[0]) > 60.0:
+            bucket.popleft()
+        if len(bucket) >= max_per_minute:
+            return False, f"Rate limit exceeded for {tool_name}: {max_per_minute}/min", task_cost_points, 0
+
+        next_calls = task_tool_calls + 1
+        if next_calls > max_calls_per_task:
+            return False, f"Task quota exceeded: max {max_calls_per_task} tool calls", task_cost_points, 0
+
+        point_cost = int(cost_points_cfg.get(tool_name, 1))
+        next_cost = task_cost_points + point_cost
+        if next_cost > max_cost_points:
+            return False, f"Task cost budget exceeded: {next_cost}/{max_cost_points} points", task_cost_points, 0
+
+        bucket.append(now)
+        self._tool_usage_total[tool_name] += 1
+        self._tool_cost_total[tool_name] += point_cost
+        return True, "", next_cost, point_cost
+
+    def _compact_runtime_context_window(self, lines: list[str]) -> list[str]:
+        """Compact runtime context strings for task resume snapshots."""
+        compacted: list[str] = []
+        for line in lines:
+            text = str(line).strip()
+            if not text:
+                continue
+            compacted.append(text[:220])
+        return compacted[-10:]
+
+    def _semantic_compaction_score(self, item: Any) -> int:
+        """Score context items so compaction keeps semantically important turns."""
+        score = 0
+        text_blob = ""
+        keywords = [
+            str(k).lower().strip()
+            for k in (self._semantic_compaction_cfg.get("high_value_keywords", []) or [])
+            if str(k).strip()
+        ]
+
+        if hasattr(item, "parts"):
+            for part in (item.parts or []):
+                txt = getattr(part, "text", "") or ""
+                if txt:
+                    text_blob += " " + txt
+                fc = getattr(part, "function_call", None)
+                if fc is not None:
+                    score += 1
+                fr = getattr(part, "function_response", None)
+                if fr and hasattr(fr, "response") and isinstance(fr.response, dict):
+                    response = fr.response
+                    if response.get("error"):
+                        score += 4
+                    if response.get("_loop_warning"):
+                        score += 3
+                    if response.get("success") is False:
+                        score += 2
+                    text_blob += " " + str(response.get("result", ""))
+
+        low = text_blob.lower()
+        if any(tok in low for tok in ("todo", "next", "remaining", "decision", "approved", "denied")):
+            score += 2
+        if any(tok in low for tok in ("/", "\\", ".py", ".yaml", ".md")):
+            score += 1
+        score += sum(1 for kw in keywords if kw in low)
+        return score
+
+    def _resolve_policy_path(self, raw: Any) -> pathlib.Path | None:
+        """Resolve a candidate file path argument for policy checks."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        path = pathlib.Path(text).expanduser()
+        if not path.is_absolute():
+            path = self._workspace_root / path
+        try:
+            return path.resolve(strict=False)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_relative_to(child: pathlib.Path, parent: pathlib.Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
+    def _path_allowed(self, candidate: pathlib.Path, roots: list[str]) -> bool:
+        for root in roots:
+            base = self._resolve_policy_path(root)
+            if base is None:
+                continue
+            if self._is_relative_to(candidate, base):
+                return True
+        return False
+
+    def _enforce_filesystem_policy(self, tool_name: str, tool_args: dict[str, Any]) -> tuple[bool, str]:
+        """Priority 3.5: enforce configurable read/write filesystem boundaries."""
+        if not bool(self._filesystem_policy.get("enabled", True)):
+            return True, ""
+
+        intent_by_tool = {
+            "read_file": "read",
+            "write_file": "write",
+            "patch_file": "write",
+        }
+        intent = intent_by_tool.get(tool_name)
+        if not intent:
+            return True, ""
+
+        candidate = None
+        for key in ("path", "file_path", "filepath", "target", "filename", "file"):
+            if key in tool_args:
+                candidate = self._resolve_policy_path(tool_args.get(key))
+                if candidate is not None:
+                    break
+
+        if candidate is None:
+            return True, ""
+
+        roots = list(self._filesystem_policy.get("read_paths" if intent == "read" else "write_paths", []) or [])
+        if self._path_allowed(candidate, roots):
+            return True, ""
+
+        return False, (
+            f"Filesystem policy blocked {tool_name} for path '{candidate}'. "
+            f"Allowed {intent} roots: {roots}"
+        )
+
+    def _active_task_snapshots(self) -> list[dict[str, Any]]:
+        """Priority 1.4: collect resumable snapshots for active tasks."""
+        snapshots: list[dict[str, Any]] = []
+        for task, state in self._active_task_state.items():
+            if task.done():
+                continue
+            snapshots.append(
+                {
+                    "task_id": state.get("task_id"),
+                    "goal": state.get("goal", ""),
+                    "agent": state.get("agent", "task_executor"),
+                    "model": state.get("model", self._model),
+                    "started_at": state.get("started_at", 0),
+                    "current_step": state.get("current_step", ""),
+                    "partial_results": state.get("partial_results", [])[-8:],
+                    "context_window": state.get("context_window", [])[-10:],
+                    "tool_calls": state.get("tool_calls", 0),
+                    "cost_points": state.get("cost_points", 0),
+                    "tool_usage": dict(state.get("tool_usage", {})),
+                    "cost_by_tool": dict(state.get("cost_by_tool", {})),
+                }
+            )
+        return snapshots
 
     def _register_memory_tools(self) -> None:
         """Add save_note, get_notes, and search_notes as callable tools for the model."""
@@ -884,12 +1434,16 @@ class ToolOrchestrator:
                 "agent": self._current_agent,
                 "task_count": len(self._task_history),
                 "note_count": len(self._notes),
+                "subagent_count": len(self._subagent_registry),
             }
             if format == "full":
                 snapshot["tasks"] = [
                     {"goal": g, "result": r[:300]} for g, r in self._task_history
                 ]
                 snapshot["notes"] = dict(self._notes)
+                snapshot["subagents"] = list(self._subagent_registry.values())[-20:]
+                snapshot["tool_usage"] = dict(self._tool_usage_total)
+                snapshot["tool_cost"] = dict(self._tool_cost_total)
             else:
                 snapshot["recent_tasks"] = [
                     {"goal": g, "result": r[:100]}
@@ -933,11 +1487,27 @@ class ToolOrchestrator:
                 }
 
             # Select agent
-            if not agent_name:
-                agent_name = _select_agent(sub_goal, _orchestrator_self._agent_configs)
-            agent_cfg = _orchestrator_self._agent_configs.get(agent_name, {})
+            agent_name_for_delegate = agent_name
+            if not agent_name_for_delegate:
+                agent_name_for_delegate = _select_agent(
+                    sub_goal, _orchestrator_self._agent_configs,
+                    _orchestrator_self._memory_store,
+                )
+            agent_cfg = _orchestrator_self._agent_configs.get(agent_name_for_delegate, {})
             agent_model = agent_cfg.get("model", _orchestrator_self._model)
+            agent_model = _orchestrator_self._route_model_for_goal(sub_goal, agent_model)
             max_iters = min(agent_cfg.get("max_iterations", 15), 15)  # Cap sub-agent iterations
+            _orchestrator_self._subagent_counter += 1
+            subagent_id = f"subagent-{_orchestrator_self._subagent_counter:04d}"
+            _orchestrator_self._subagent_registry[subagent_id] = {
+                "id": subagent_id,
+                "goal": sub_goal,
+                "agent": agent_name_for_delegate,
+                "model": agent_model,
+                "status": "spawned",
+                "started_at": time.time(),
+                "depth": current_depth + 1,
+            }
 
             _orchestrator_self._log.info(
                 "subagent.delegating",
@@ -961,19 +1531,39 @@ class ToolOrchestrator:
             sub_tool_fns = _orchestrator_self._apply_policy_pipeline(sub_tool_fns, deny_list)
             sub_tool_map = {fn.__name__: fn for fn in sub_tool_fns}
 
+            # Shared memory: pass parent's notes + memory_store to subagent context
+            # so delegated agents can access what the parent already discovered.
+            shared_context_parts = []
+            if _orchestrator_self._notes:
+                shared_context_parts.append("=== PARENT AGENT NOTES ===")
+                for k, v in list(_orchestrator_self._notes.items())[:10]:
+                    shared_context_parts.append(f"- {k}: {v}")
+            if _orchestrator_self._task_history:
+                shared_context_parts.append("=== PARENT TASK HISTORY ===")
+                for prev_goal, prev_result in list(_orchestrator_self._task_history)[-5:]:
+                    shared_context_parts.append(f"- {prev_goal}: {prev_result[:100]}")
+            shared_prefix = "\n".join(shared_context_parts)
+            enriched_sub_goal = (
+                (shared_prefix + "\n\n" + sub_goal) if shared_prefix else sub_goal
+            )
+
             # Run the sub-agent loop with incremented depth
             old_depth = getattr(_orchestrator_self, "_delegation_depth", 0)
             _orchestrator_self._delegation_depth = old_depth + 1
             try:
+                _orchestrator_self._subagent_registry[subagent_id]["status"] = "running"
                 result = await asyncio.wait_for(
                     _orchestrator_self._agent_loop(
-                        sub_goal,
+                        enriched_sub_goal,
                         model=agent_model,
                         tool_fns=sub_tool_fns,
                         tool_map=sub_tool_map,
                         max_iterations=max_iters,
-                        instruction_suffix=f"You are a sub-agent (depth {current_depth + 1}). "
-                                          f"Complete the sub-goal and return a concise result.",
+                        system_instruction=_orchestrator_self._compose_system_instruction(
+                            f"You are a sub-agent (depth {current_depth + 1}). "
+                            f"Complete the sub-goal and return a concise result. "
+                            f"You have access to the parent agent's notes and task history above."
+                        ),
                     ),
                     timeout=timeout_seconds,
                 )
@@ -982,10 +1572,30 @@ class ToolOrchestrator:
                     agent=agent_name,
                     result_len=len(result),
                 )
+                _orchestrator_self._subagent_registry[subagent_id].update(
+                    {
+                        "status": "completed",
+                        "completed_at": time.time(),
+                        "result": result[:500],
+                    }
+                )
                 return {"success": True, "agent": agent_name, "result": result[:3000]}
             except asyncio.TimeoutError:
+                _orchestrator_self._subagent_registry[subagent_id].update(
+                    {
+                        "status": "timeout",
+                        "completed_at": time.time(),
+                    }
+                )
                 return {"success": False, "error": f"Sub-agent timed out after {timeout_seconds}s"}
             except Exception as exc:
+                _orchestrator_self._subagent_registry[subagent_id].update(
+                    {
+                        "status": "failed",
+                        "completed_at": time.time(),
+                        "error": str(exc),
+                    }
+                )
                 return {"success": False, "error": f"Sub-agent failed: {exc}"}
             finally:
                 _orchestrator_self._delegation_depth = old_depth
@@ -993,6 +1603,83 @@ class ToolOrchestrator:
         if "delegate_to_agent" not in self._tool_map:
             self._tool_fns.append(delegate_to_agent)
             self._tool_map["delegate_to_agent"] = delegate_to_agent
+
+        # ---- Parallel sub-agent delegation (Team Lead pattern) ----
+
+        async def delegate_parallel(
+            sub_tasks: str = "",
+        ) -> dict:
+            """Run multiple sub-agent tasks in parallel using asyncio.gather.
+
+            This is the "Team Lead" pattern: delegate several independent
+            sub-tasks to specialist agents simultaneously, then collect
+            all results when they complete.
+
+            Args:
+                sub_tasks: JSON string containing a list of sub-task objects.
+                    Each object should have:
+                    - "goal": description of the sub-task
+                    - "agent_name": (optional) target agent name
+                    Example: '[{"goal": "research X"}, {"goal": "write code for Y"}]'
+            """
+            try:
+                tasks_list = json.loads(sub_tasks)
+            except (json.JSONDecodeError, TypeError):
+                return {"success": False, "error": "sub_tasks must be a valid JSON list of {goal, agent_name?} objects"}
+
+            if not isinstance(tasks_list, list) or len(tasks_list) == 0:
+                return {"success": False, "error": "sub_tasks must be a non-empty list"}
+
+            if len(tasks_list) > 5:
+                return {"success": False, "error": "Maximum 5 parallel sub-tasks allowed"}
+
+            _orchestrator_self._log.info(
+                "parallel_delegation.start",
+                count=len(tasks_list),
+                goals=[t.get("goal", "?")[:40] for t in tasks_list],
+            )
+
+            # Run all sub-tasks concurrently
+            async def _run_one(task_spec: dict) -> dict:
+                goal = task_spec.get("goal", "")
+                agent = task_spec.get("agent_name", "")
+                if not goal:
+                    return {"success": False, "error": "missing goal"}
+                return await delegate_to_agent(
+                    sub_goal=goal,
+                    agent_name=agent,
+                )
+
+            results = await asyncio.gather(
+                *[_run_one(t) for t in tasks_list],
+                return_exceptions=True,
+            )
+
+            # Package results
+            output = []
+            for i, result in enumerate(results):
+                goal = tasks_list[i].get("goal", "?")[:80]
+                if isinstance(result, Exception):
+                    output.append({"goal": goal, "success": False, "error": str(result)})
+                else:
+                    output.append({"goal": goal, **result})
+
+            succeeded = sum(1 for r in output if r.get("success"))
+            _orchestrator_self._log.info(
+                "parallel_delegation.complete",
+                total=len(output), succeeded=succeeded,
+            )
+
+            return {
+                "success": succeeded > 0,
+                "total": len(output),
+                "succeeded": succeeded,
+                "results": output,
+            }
+
+        if "delegate_parallel" not in self._tool_map:
+            self._tool_fns.append(delegate_parallel)
+            self._tool_map["delegate_parallel"] = delegate_parallel
 
     # ------------------------------------------------------------------
     # Approval queue (B2) — gate DANGEROUS/CRITICAL tools
@@ -1139,20 +1826,35 @@ class ToolOrchestrator:
 
         self._recent_calls.append(call_sig)
 
-        if consecutive >= 4:
+        warning_at = int(self._loop_cfg.get("warning_at", 2))
+        strategy_at = int(self._loop_cfg.get("strategy_at", 3))
+        stop_at = int(self._loop_cfg.get("stop_at", 4))
+        repeats = consecutive + 1
+
+        if repeats >= stop_at:
             self._log.warning(
                 "orchestrator.loop.force_stop",
-                tool=tool_name, consecutive=consecutive + 1,
+                tool=tool_name, consecutive=repeats,
             )
             return "STOP"
-        elif consecutive >= 2:
+        if repeats >= strategy_at:
+            self._log.warning(
+                "orchestrator.loop.strategy_change",
+                tool=tool_name,
+                consecutive=repeats,
+            )
+            return (
+                f"STRATEGY: {tool_name} has repeated {repeats} times with the same arguments. "
+                "Change approach: inspect state first, then try a different tool or parameters."
+            )
+        if repeats >= warning_at:
             self._log.warning(
                 "orchestrator.loop.warning",
-                tool=tool_name, consecutive=consecutive + 1,
+                tool=tool_name, consecutive=repeats,
             )
             return (
                 f"WARNING: You've called {tool_name} with the same arguments "
-                f"{consecutive + 1} times consecutively. Try a different approach."
+                f"{repeats} times consecutively."
             )
         return None
 
@@ -1176,16 +1878,29 @@ class ToolOrchestrator:
         return total
 
     def _compact_context(self, contents: list) -> list:
-        """Strip old tool results and summarize early turns."""
+        """Compact context while preserving semantically important turns."""
         from google.genai import types as _types
 
         if len(contents) <= 6:
             return contents
 
-        # Keep first item (user goal) + last 5 turns verbatim
-        # Strip tool results from earlier turns
+        # Keep first item and last 5 turns verbatim.
+        # From the middle, keep high-value items (errors, decisions, paths, notes).
+        middle = contents[1:-5]
+        scored_middle: list[tuple[int, Any]] = []
+        keep_middle_items = int(self._semantic_compaction_cfg.get("keep_middle_items", 8))
+        for item in middle:
+            score = self._semantic_compaction_score(item)
+            scored_middle.append((score, item))
+
+        keep_middle = [
+            item
+            for score, item in sorted(scored_middle, key=lambda x: x[0], reverse=True)[:keep_middle_items]
+            if score > 0
+        ]
+
         compacted = [contents[0]]
-        for item in contents[1:-5]:
+        for item in keep_middle:
             if hasattr(item, "parts"):
                 new_parts = []
                 for part in (item.parts or []):
@@ -1227,18 +1942,104 @@ class ToolOrchestrator:
     # Public API
     # ------------------------------------------------------------------
 
+    async def compact_memory(self, limit: int = 50, cluster_size: int = 10) -> bool:
+        """Phase 4: Memory Compaction — summarize fragmented memories into lessons.
+
+        Uses a lock to prevent concurrent compaction (race condition fix).
+        """
+        if not self._memory_store or not self._client:
+            return False
+
+        if self._compaction_lock.locked():
+            self._log.debug("memory.compaction_skipped_locked")
+            return False
+
+        async with self._compaction_lock:
+            try:
+                recent = self._memory_store.get_recent_memories(limit=limit)
+                # Find tool use or failure clusters that aren't already lessons
+                fragments = [m for m in recent if m.entry_type in ("tool_use", "failure_path", "interaction")]
+                if len(fragments) < cluster_size:
+                    return False
+
+                self._log.info("memory.compaction_start", fragments=len(fragments))
+
+                # Format fragment text for LLM
+                fragment_text = "\n".join([f"- [{f.entry_type}] {f.content}" for f in fragments[:cluster_size]])
+
+                prompt = (
+                    "Analyze the following fragmented logs from an AI agent's computer session. "
+                    "Synthesize them into one single, high-level 'Lesson Learned' or 'Project Insight'. "
+                    "Focus on what worked, what failed, and the final state. "
+                    "The result must be a concise, one-sentence memory.\n\n"
+                    f"FRAGMENTED LOGS:\n{fragment_text}"
+                )
+
+                from google.genai import types as _types
+                response = await self._client.aio.models.generate_content(
+                    model=self._model,
+                    contents=prompt,
+                    config=_types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=256,
+                    )
+                )
+
+                lesson = response.text.strip()
+                if lesson:
+                    # Store the distilled lesson
+                    self._memory_store.add(lesson, entry_type="lesson_learned")
+                    # Delete the original fragments
+                    self._memory_store.delete_entries([f.id for f in fragments[:cluster_size]])
+                    self._log.info("memory.compacted", lesson=lesson[:100])
+                    return True
+
+                return False
+            except Exception as exc:
+                self._log.warning("memory.compaction_failed", error=str(exc))
+                return False
+
+    def get_evaluation_stats(self) -> dict:
+        """Return aggregate evaluation statistics.
+
+        Data source for /api/evaluation/stats endpoint.
+        Returns overall score, per-agent breakdown, and trajectory metrics.
+        """
+        if self._evaluation_store is not None:
+            return self._evaluation_store.get_stats()
+        return {"total_tasks": 0, "error": "evaluation not initialized"}
+
     def spawn_task(
         self,
         goal: str,
         inject_context: Callable[[str], Awaitable[None]],
+        resume_snapshot: dict[str, Any] | None = None,
     ) -> asyncio.Task:
         """Launch run_task as a background Task and return it."""
+        task_id = (resume_snapshot or {}).get("task_id") or hashlib.md5(
+            f"{goal}:{time.time()}".encode()
+        ).hexdigest()[:8]
         task = asyncio.create_task(
-            self.run_task(goal, inject_context),
-            name=f"orchestrator-{goal[:30]}",
+            self.run_task(goal, inject_context, resume_snapshot=resume_snapshot),
+            name=f"orchestrator-{task_id}",
         )
         self._active_tasks.add(task)
+        self._active_task_state[task] = {
+            "task_id": task_id,
+            "goal": goal,
+            "started_at": time.time(),
+            "resume_snapshot": resume_snapshot or {},
+            "partial_results": list((resume_snapshot or {}).get("partial_results", [])),
+            "context_window": list((resume_snapshot or {}).get("context_window", [])),
+            "current_step": str((resume_snapshot or {}).get("current_step", "")),
+            "tool_calls": int((resume_snapshot or {}).get("tool_calls", 0)),
+            "cost_points": int((resume_snapshot or {}).get("cost_points", 0)),
+            "tool_usage": dict((resume_snapshot or {}).get("tool_usage", {})),
+            "cost_by_tool": dict((resume_snapshot or {}).get("cost_by_tool", {})),
+        }
+        self._persist_session_if_due(force=True)
         task.add_done_callback(self._active_tasks.discard)
+        task.add_done_callback(lambda t: self._active_task_state.pop(t, None))
         return task
 
     def cancel_all(self) -> None:
@@ -1253,16 +2054,18 @@ class ToolOrchestrator:
         self,
         goal: str,
         inject_context: Callable[[str], Awaitable[None]],
+        resume_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Run the agentic loop to completion and inject the result.
 
         Uses multi-agent routing to select the best agent (model + tools)
         for the task. Falls back to the default task_executor if routing fails.
         """
-        # Select the best agent for this task
-        agent_name = _select_agent(goal, self._agent_configs)
+        # Select the best agent for this task (semantic routing when available)
+        agent_name = _select_agent(goal, self._agent_configs, self._memory_store)
         agent_cfg = self._agent_configs.get(agent_name, {})
         agent_model = agent_cfg.get("model", self._model)
+        agent_model = self._route_model_for_goal(goal, agent_model)
         agent_tools_key = agent_cfg.get("tools", "all")
         max_iters = agent_cfg.get("max_iterations", _MAX_ITERATIONS)
 
@@ -1294,6 +2097,14 @@ class ToolOrchestrator:
             except Exception:
                 pass
         instruction_suffix = "\n".join(instruction_suffix_parts)
+        system_instruction = self._compose_system_instruction(instruction_suffix)
+
+        runtime_state = self._active_task_state.get(asyncio.current_task())
+        if runtime_state is not None:
+            runtime_state["agent"] = agent_name
+            runtime_state["model"] = agent_model
+            if resume_snapshot:
+                runtime_state["resume_snapshot"] = resume_snapshot
 
         self._log.info(
             "orchestrator.task.start",
@@ -1350,15 +2161,47 @@ class ToolOrchestrator:
                 tool_map=agent_tool_map,
                 max_iterations=max_iters,
                 task_obj=_current_task,
-                instruction_suffix=instruction_suffix,
+                system_instruction=system_instruction,
                 inject_context=inject_context,
+                runtime_state=runtime_state,
             )
             # Record in session memory so future tasks have context
             self._task_history.append((goal, result_text))
             self._log_transcript("task_complete", goal=goal, result=result_text[:500])
 
+            # --- Evaluation: LLM-as-judge post-task scoring ---
+            if self._llm_judge and self._evaluation_store:
+                try:
+                    from evaluation import TrajectoryRecorder
+                    # Get the trajectory recorder from the agent loop result
+                    recorder = getattr(self, '_last_trajectory_recorder', None)
+                    if recorder:
+                        eval_result = recorder.finalize(result_text)
+                        # Get recalled context for judge evaluation
+                        recalled = await self._recall_past_context(goal)
+                        judge_scores = await self._llm_judge.evaluate(eval_result, recalled)
+                        eval_result.judge_scores = judge_scores
+                        self._evaluation_store.record(eval_result)
+                        self._log_transcript(
+                            "evaluation",
+                            scores=judge_scores.to_dict(),
+                            overall=judge_scores.overall,
+                        )
+                        self._log.info(
+                            "orchestrator.evaluation",
+                            overall=round(judge_scores.overall, 2),
+                            task_completion=judge_scores.task_completion,
+                            efficiency=judge_scores.efficiency,
+                        )
+                except Exception as eval_exc:
+                    self._log.debug("orchestrator.evaluation.failed", error=str(eval_exc))
+
             # G4: Auto-persist session state after each task completion
             self._persist_session()
+
+            # Phase 4: Memory Compaction (Learning Loop)
+            # Try to summarize recent tool/failure fragments into lessons.
+            asyncio.create_task(self.compact_memory())
 
             # C4: Mark task done
             if _current_task is not None:
@@ -1444,6 +2287,40 @@ class ToolOrchestrator:
     # Internal: ReAct agent loop
     # ------------------------------------------------------------------
 
+    async def _recall_past_context(self, goal: str) -> str:
+        """Phase 1 & 2: Automatically query long-term memory for past lessons/failures."""
+        if not self._memory_store:
+            return ""
+
+        try:
+            # Query memory store for related past interactions
+            memories = self._memory_store.hybrid_query(goal, top_k=5)
+            if not memories:
+                return ""
+
+            lines = ["=== RECALLED MEMORIES & LESSONS ==="]
+            failures = []
+            general = []
+
+            for m in memories:
+                if m.entry_type == "failure_path":
+                    failures.append(f"• [FAILED PATH] {m.content}")
+                else:
+                    general.append(f"• {m.content}")
+
+            if failures:
+                lines.append("\nCRITICAL: Avoid these previously failed approaches:")
+                lines.extend(failures)
+            
+            if general:
+                lines.append("\nRelevant past context:")
+                lines.extend(general)
+
+            return "\n".join(lines) + "\n"
+        except Exception as exc:
+            self._log.warning("orchestrator.recall_failed", error=str(exc))
+            return ""
+
     async def _agent_loop(
         self,
         goal: str,
@@ -1452,14 +2329,16 @@ class ToolOrchestrator:
         tool_map: dict | None = None,
         max_iterations: int = _MAX_ITERATIONS,
         task_obj: Any | None = None,
-        instruction_suffix: str = "",
+        system_instruction: str = "",
         inject_context: Callable[[str], Awaitable[None]] | None = None,
+        runtime_state: dict[str, Any] | None = None,
     ) -> str:
         """ReAct loop: think → call tools → observe → repeat until done.
 
-        Includes: loop detection (C6), risk logging (B1),
+        Includes: loop detection (C6 + P3.4), risk logging (B1),
         context compaction (A6), pre-compaction flush (A3),
-        strip old tool results (A7), JSONL transcript (G3).
+        strip old tool results (A7), JSONL transcript (G3),
+        and policy quotas/rate limits (P3.1).
 
         Returns the final summary text from the orchestrator model.
         Raises on unrecoverable errors.
@@ -1469,6 +2348,10 @@ class ToolOrchestrator:
         use_model = model or self._model
         use_tool_fns = tool_fns if tool_fns is not None else self._tool_fns
         use_tool_map = tool_map if tool_map is not None else self._tool_map
+        effective_instruction = system_instruction or _ORCHESTRATOR_SYSTEM_INSTRUCTION
+
+        task_cost_points = int((runtime_state or {}).get("cost_points", 0))
+        task_tool_calls = int((runtime_state or {}).get("tool_calls", 0))
 
         # Final guard: dedupe by callable name before passing to model API.
         _seen_tool_names: set[str] = set()
@@ -1480,6 +2363,15 @@ class ToolOrchestrator:
             _seen_tool_names.add(_n)
             _unique_tool_fns.append(_fn)
         use_tool_fns = _unique_tool_fns
+
+        # --- Trajectory recording (Agent Factory: Tool Utilization eval) ---
+        _trajectory_recorder = None
+        try:
+            from evaluation import TrajectoryRecorder
+            agent_name = (runtime_state or {}).get("agent", "unknown")
+            _trajectory_recorder = TrajectoryRecorder(goal, agent_name, use_model)
+        except ImportError:
+            pass
 
         # Build context preamble from past tasks and saved notes
         context_parts: list[str] = []
@@ -1493,8 +2385,30 @@ class ToolOrchestrator:
                 context_parts.append(f"- {key}: {val}")
 
         initial_text = goal
+        resume_snapshot = (runtime_state or {}).get("resume_snapshot", {})
+        resume_prefix = ""
+        if resume_snapshot:
+            resume_lines = [
+                "=== RESUME SNAPSHOT ===",
+                f"Task ID: {resume_snapshot.get('task_id', 'unknown')}",
+                f"Last step: {resume_snapshot.get('current_step', 'unknown')}",
+            ]
+            for item in list(resume_snapshot.get("partial_results", []))[-5:]:
+                resume_lines.append(f"- {item}")
+            if resume_snapshot.get("context_window"):
+                resume_lines.append("Recent context:")
+                for line in list(resume_snapshot.get("context_window", []))[-5:]:
+                    resume_lines.append(f"* {line}")
+            resume_prefix = "\n".join(resume_lines) + "\n\n"
         if context_parts:
-            initial_text = "\n".join(context_parts) + "\n\n=== CURRENT TASK ===\n" + goal
+            initial_text = resume_prefix + "\n".join(context_parts) + "\n\n=== CURRENT TASK ===\n" + goal
+        else:
+            initial_text = resume_prefix + initial_text
+
+        # Phase 1: Recall-Before-Respond
+        recalled_context = await self._recall_past_context(goal)
+        if recalled_context:
+            initial_text = recalled_context + "\n" + initial_text
 
         history: list[_types.Content] = [
             _types.Content(
@@ -1505,11 +2419,41 @@ class ToolOrchestrator:
 
         # Reset loop detection for this task
         self._recent_calls.clear()
+        self._tool_usage_total.clear()
+        self._tool_cost_total.clear()
 
         for iteration in range(max_iterations):
+            # --- Wrap-up warning: alert the model it's running low on steps ---
+            remaining = max_iterations - iteration
+            if remaining == 5:
+                history.append(_types.Content(
+                    role="user",
+                    parts=[_types.Part(text=(
+                        "[SYSTEM WARNING: You have 5 iterations remaining. "
+                        "Finish your current step, then provide a clear summary of: "
+                        "(1) what was completed, (2) what still needs to be done. "
+                        "If the task is not finishable in 5 steps, say so explicitly.]"
+                    ))],
+                ))
+                self._log.info("orchestrator.wrap_up_warning", remaining=remaining)
             self._log.debug(
                 "orchestrator.loop", iteration=iteration, goal=goal[:60],
             )
+            if runtime_state is not None:
+                recent: list[str] = []
+                for content in history[-10:]:
+                    if not hasattr(content, "parts"):
+                        continue
+                    for part in (content.parts or []):
+                        if getattr(part, "text", None):
+                            recent.append(str(part.text)[:300])
+                            break
+                        fr = getattr(part, "function_response", None)
+                        if fr is not None:
+                            recent.append(f"[tool:{getattr(fr, 'name', 'unknown')}]")
+                            break
+                runtime_state["context_window"] = self._compact_runtime_context_window(recent)
+                self._persist_session_if_due()
 
             # --- C2: Check message queue for steer/cancel ---
             should_cancel, steer_msgs = self._drain_messages()
@@ -1566,10 +2510,7 @@ class ToolOrchestrator:
                     model=use_model,
                     contents=history,
                     config=_types.GenerateContentConfig(
-                        system_instruction=(
-                            _ORCHESTRATOR_SYSTEM_INSTRUCTION + "\n" + instruction_suffix
-                            if instruction_suffix else _ORCHESTRATOR_SYSTEM_INSTRUCTION
-                        ),
+                        system_instruction=effective_instruction,
                         tools=use_tool_fns,
                         temperature=0.2,
                         max_output_tokens=4096,
@@ -1599,10 +2540,10 @@ class ToolOrchestrator:
                     # Cancel watcher fired — user said cancel
                     self._log.info("orchestrator.task.cancelled_during_model_call")
                     self._log_transcript("task_cancelled_by_user", goal=goal)
-                    if _current_task:
+                    if task_obj:
                         try:
-                            _current_task.mark_cancelled()
-                            self._task_store.save(_current_task)
+                            task_obj.mark_cancelled()
+                            self._task_store.save(task_obj)
                         except Exception:
                             pass
                     return "Task cancelled by user."
@@ -1625,6 +2566,15 @@ class ToolOrchestrator:
                 elif getattr(part, "text", None):
                     text_parts.append(part.text)
 
+            # --- Reasoning trace capture (Agent Factory: Reasoning evaluation) ---
+            if text_parts and _trajectory_recorder:
+                reasoning_text = " ".join(text_parts).strip()
+                if reasoning_text:
+                    _trajectory_recorder.record_reasoning(reasoning_text, iteration)
+                    self._log_transcript(
+                        "reasoning", text=reasoning_text[:500], iteration=iteration,
+                    )
+
             # Append model turn to history
             history.append(model_content)
 
@@ -1632,6 +2582,9 @@ class ToolOrchestrator:
             if not function_calls:
                 final = " ".join(text_parts).strip() or "Task completed successfully."
                 self._log_transcript("final_answer", text=final[:500])
+                # Stash recorder on self for run_task LLM-as-judge hook
+                if _trajectory_recorder:
+                    self._last_trajectory_recorder = _trajectory_recorder
                 return final
 
             # --- Execute all function calls and collect responses ---
@@ -1658,6 +2611,48 @@ class ToolOrchestrator:
                     "tool_call", tool=tool_name, risk=risk.value,
                     args={k: str(v)[:80] for k, v in tool_args.items()},
                 )
+
+                allowed, budget_error, next_cost_points, point_cost = self._enforce_tool_budget(
+                    tool_name,
+                    task_cost_points,
+                    task_tool_calls,
+                )
+                if not allowed:
+                    exec_result = {"success": False, "error": budget_error}
+                    fn_response_parts.append(
+                        _types.Part(
+                            function_response=_types.FunctionResponse(
+                                name=tool_name,
+                                response=exec_result,
+                            )
+                        )
+                    )
+                    continue
+
+                fs_allowed, fs_error = self._enforce_filesystem_policy(tool_name, tool_args)
+                if not fs_allowed:
+                    exec_result = {"success": False, "error": fs_error}
+                    fn_response_parts.append(
+                        _types.Part(
+                            function_response=_types.FunctionResponse(
+                                name=tool_name,
+                                response=exec_result,
+                            )
+                        )
+                    )
+                    continue
+
+                task_cost_points = next_cost_points
+                task_tool_calls += 1
+                if runtime_state is not None:
+                    runtime_state["cost_points"] = task_cost_points
+                    runtime_state["tool_calls"] = task_tool_calls
+                    runtime_state["current_step"] = f"{tool_name}({', '.join(tool_args.keys())})"
+                    tool_usage = runtime_state.setdefault("tool_usage", {})
+                    tool_usage[tool_name] = int(tool_usage.get(tool_name, 0)) + 1
+                    cost_by_tool = runtime_state.setdefault("cost_by_tool", {})
+                    cost_by_tool[tool_name] = int(cost_by_tool.get(tool_name, 0)) + int(point_cost)
+                    self._persist_session_if_due()
 
                 # Approval gate (B2) — require approval for DANGEROUS/CRITICAL
                 if risk in (ToolRisk.DANGEROUS, ToolRisk.CRITICAL):
@@ -1727,19 +2722,10 @@ class ToolOrchestrator:
                             self._log.debug("hook.before_tool.error", error=str(hook_exc))
                     try:
                         # Wrap tool execution with progress heartbeat + timeout.
-                        # If a tool takes >5s, inject a status message so the
-                        # voice model can speak to the user instead of silence.
-                        # P1.3: Per-tool timeouts from config (fallback = 120s)
-                        try:
-                            import yaml as _yaml, pathlib as _pl
-                            _cfg_p = _pl.Path(__file__).resolve().parent.parent / "config.yaml"
-                            _cfg_raw = _yaml.safe_load(_cfg_p.read_text(encoding="utf-8")) or {}
-                            _orch_cfg = _cfg_raw.get("rio", {}).get("orchestrator", {})
-                            _TOOL_TIMEOUT = _orch_cfg.get("tool_timeout_seconds", 120)
-                            _HEARTBEAT_INTERVAL = _orch_cfg.get("heartbeat_interval_seconds", 5)
-                        except Exception:
-                            _TOOL_TIMEOUT = 120  # seconds — generous for CU calls
-                            _HEARTBEAT_INTERVAL = 5  # seconds before first heartbeat
+                        # If a tool takes longer than heartbeat interval, inject
+                        # an in-progress message instead of silence.
+                        _TOOL_TIMEOUT = self._tool_timeout_seconds
+                        _HEARTBEAT_INTERVAL = self._heartbeat_interval_seconds
 
                         async def _heartbeat_while_running(
                             coro,
@@ -1777,6 +2763,12 @@ class ToolOrchestrator:
                         exec_result = await _heartbeat_while_running(
                             fn(**tool_args), tool_name,
                         )
+                        if runtime_state is not None:
+                            runtime_state.setdefault("partial_results", []).append(
+                                f"{tool_name}: {str(exec_result)[:240]}"
+                            )
+                            runtime_state["partial_results"] = runtime_state["partial_results"][-8:]
+                            self._persist_session_if_due()
                     except TypeError as exc:
                         self._log.warning(
                             "orchestrator.tool_bad_args",
@@ -1810,11 +2802,34 @@ class ToolOrchestrator:
                             else:
                                 _step.mark_failed(str(exec_result.get("error", ""))[:200])
 
+                    # Phase 2: Negative Memory — Capture failures
+                    if not exec_result.get("success", True) and self._memory_store:
+                        try:
+                            fail_summary = (
+                                f"Failed to call {tool_name} with args {tool_args}. "
+                                f"Error: {exec_result.get('error', 'unknown')}"
+                            )
+                            self._memory_store.add(
+                                fail_summary,
+                                entry_type="failure_path",
+                                metadata={"tool": tool_name, "error": str(exec_result.get("error", ""))}
+                            )
+                        except Exception:
+                            pass
+
                     self._log.debug(
                         "orchestrator.tool_result",
                         name=tool_name,
                         success=exec_result.get("success"),
                     )
+                    # --- Trajectory recording: record this tool call ---
+                    if _trajectory_recorder:
+                        _trajectory_recorder.record_tool_call(
+                            tool=tool_name,
+                            args=tool_args,
+                            result=exec_result if isinstance(exec_result, dict) else {"result": str(exec_result)[:200]},
+                            latency_ms=0.0,  # Latency already tracked in heartbeat
+                        )
                     # F4: Run after_tool hooks
                     for hook in self._after_tool_hooks:
                         try:
@@ -1849,6 +2864,8 @@ class ToolOrchestrator:
                 except Exception:
                     pass
 
+            self._persist_session_if_due()
+
             # --- Strip old tool results from context (A7) ---
             # After _RESULT_STRIP_AFTER_TURNS iterations, compress older results
             if iteration >= _RESULT_STRIP_AFTER_TURNS and len(history) > 6:
@@ -1872,4 +2889,20 @@ class ToolOrchestrator:
                             new_parts.append(part)
                     history[idx] = _types.Content(role=item.role, parts=new_parts)
 
-        return f"Task reached the {max_iterations}-step safety limit."
+        # Build a partial-results summary so the user knows what was done
+        partial = ""
+        if runtime_state and runtime_state.get("partial_results"):
+            partial = "\nPartial results:\n" + "\n".join(
+                f"  - {r}" for r in runtime_state["partial_results"][-8:]
+            )
+        self._log.warning(
+            "orchestrator.iteration_limit",
+            max=max_iterations,
+            goal=goal[:80],
+        )
+        return (
+            f"Task reached the {max_iterations}-step safety limit and could not "
+            f"fully complete.{partial}\n"
+            f"Original goal: {goal[:200]}\n"
+            f"Please break this into smaller tasks or increase the iteration limit."
+        )

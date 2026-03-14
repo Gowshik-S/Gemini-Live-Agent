@@ -46,3 +46,5 @@ output/creative/*
 *.swo
 .DS_Store
 Thumbs.db
+Evaluation/
+tests/

@@ -37,6 +37,10 @@ DEFAULT_LIVE_MODEL = os.environ.get(
     "LIVE_MODEL", "gemini-2.5-flash-native-audio-latest"
 )
 
+_DEFAULT_TOOLBRIDGE_TIMEOUT_SECONDS = 60.0
+_DEFAULT_BROWSER_CONNECT_TIMEOUT_SECONDS = 180.0
+_DEFAULT_SMART_CLICK_TIMEOUT_SECONDS = 120.0
+
 
 # ---------------------------------------------------------------------------
 # ToolBridge — per-connection async bridge for remote tool execution
@@ -58,6 +62,31 @@ class ToolBridge:
         self._broadcast = broadcast_fn
         self._pending: dict[str, asyncio.Future[dict]] = {}
         self._log = logger.bind(component="tool_bridge")
+        self._default_timeout_seconds = float(
+            os.environ.get("RIO_TOOLBRIDGE_TIMEOUT_SECONDS", _DEFAULT_TOOLBRIDGE_TIMEOUT_SECONDS)
+        )
+        self._browser_connect_timeout_seconds = float(
+            os.environ.get(
+                "RIO_TOOLBRIDGE_BROWSER_CONNECT_TIMEOUT_SECONDS",
+                _DEFAULT_BROWSER_CONNECT_TIMEOUT_SECONDS,
+            )
+        )
+        self._smart_click_timeout_seconds = float(
+            os.environ.get(
+                "RIO_TOOLBRIDGE_SMART_CLICK_TIMEOUT_SECONDS",
+                _DEFAULT_SMART_CLICK_TIMEOUT_SECONDS,
+            )
+        )
+        self._tool_timeout_overrides = {
+            "browser_connect": self._browser_connect_timeout_seconds,
+            "smart_click": self._smart_click_timeout_seconds,
+        }
+
+    def _timeout_for_tool(self, name: str) -> float:
+        timeout = self._tool_timeout_overrides.get(name)
+        if timeout is not None:
+            return timeout
+        return self._default_timeout_seconds
 
     async def dispatch(self, name: str, args: dict) -> dict:
         """Send a tool call to the local client and await the result."""
@@ -73,7 +102,20 @@ class ToolBridge:
             "id": call_id,
         })
         self._log.info("tool_bridge.dispatch", name=name, call_id=call_id)
-        await self._ws.send_text(frame)
+        try:
+            await self._ws.send_text(frame)
+        except Exception as exc:
+            self._pending.pop(call_id, None)
+            self._log.warning(
+                "tool_bridge.dispatch.websocket_closed",
+                name=name,
+                call_id=call_id,
+                error=str(exc)[:200],
+            )
+            return {
+                "success": False,
+                "error": "Local desktop session is disconnected",
+            }
 
         if self._broadcast:
             await self._broadcast({
@@ -84,7 +126,8 @@ class ToolBridge:
             })
 
         try:
-            result = await asyncio.wait_for(future, timeout=60.0)
+            timeout_seconds = self._timeout_for_tool(name)
+            result = await asyncio.wait_for(future, timeout=timeout_seconds)
             self._log.info(
                 "tool_bridge.result",
                 name=name, call_id=call_id,
@@ -92,8 +135,17 @@ class ToolBridge:
             )
             return result
         except asyncio.TimeoutError:
-            self._log.error("tool_bridge.timeout", name=name, call_id=call_id)
-            return {"success": False, "error": f"Tool '{name}' timed out (60s)"}
+            timeout_seconds = self._timeout_for_tool(name)
+            self._log.error(
+                "tool_bridge.timeout",
+                name=name,
+                call_id=call_id,
+                timeout_seconds=timeout_seconds,
+            )
+            return {
+                "success": False,
+                "error": f"Tool '{name}' timed out ({int(timeout_seconds)}s)",
+            }
         finally:
             self._pending.pop(call_id, None)
 
@@ -415,6 +467,57 @@ def _make_tools(bridge: ToolBridge) -> list:
         and whether compaction is needed."""
         return await bridge.dispatch("memory_stats", {})
 
+    # -- Google Workspace CLI tools (P2.2) --
+
+    async def gmail_search(query: str, max_results: int = 10) -> dict:
+        """Search Gmail messages by query string.
+        Example query: from:alice@example.com newer_than:7d has:attachment"""
+        return await bridge.dispatch(
+            "gmail_search", {"query": query, "max_results": max_results}
+        )
+
+    async def gmail_send(to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> dict:
+        """Send an email via Google Workspace CLI."""
+        return await bridge.dispatch(
+            "gmail_send",
+            {"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc},
+        )
+
+    async def drive_list(folder_id: str = "", max_results: int = 20) -> dict:
+        """List files in Google Drive or a specific folder."""
+        return await bridge.dispatch(
+            "drive_list", {"folder_id": folder_id, "max_results": max_results}
+        )
+
+    async def calendar_list_events(
+        calendar: str = "primary",
+        time_min: str = "",
+        time_max: str = "",
+        max_results: int = 10,
+    ) -> dict:
+        """List events from a Google Calendar."""
+        return await bridge.dispatch(
+            "calendar_list_events",
+            {
+                "calendar": calendar,
+                "time_min": time_min,
+                "time_max": time_max,
+                "max_results": max_results,
+            },
+        )
+
+    async def sheets_read(spreadsheet_id: str, range_a1: str) -> dict:
+        """Read a range from Google Sheets using A1 notation."""
+        return await bridge.dispatch(
+            "sheets_read", {"spreadsheet_id": spreadsheet_id, "range_a1": range_a1}
+        )
+
+    async def docs_create(title: str, content: str = "") -> dict:
+        """Create a Google Doc with optional initial content."""
+        return await bridge.dispatch(
+            "docs_create", {"title": title, "content": content}
+        )
+
     # -- Web tools (E3) --
 
     async def web_search(query: str, max_results: int = 5) -> dict:
@@ -529,6 +632,9 @@ def _make_tools(bridge: ToolBridge) -> list:
         get_clipboard, set_clipboard, get_screen_info,
         # Persistent memory (enhanced)
         search_notes, export_context, memory_stats,
+        # Google Workspace CLI (P2.2)
+        gmail_search, gmail_send, drive_list,
+        calendar_list_events, sheets_read, docs_create,
         # Web tools (E3)
         web_search, web_fetch, web_cache_get,
         # Long-running processes (E2)

@@ -29,7 +29,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator, Set
+from typing import Any, AsyncGenerator, Set
 
 import structlog
 import uvicorn
@@ -39,15 +39,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
+from starlette.websockets import WebSocketState
 
 try:
     from .gemini_session import build_system_instruction
     from .rio_agent import ToolBridge, _make_tools
     from .tool_orchestrator import ToolOrchestrator, _is_task_request
+    from .voice_plugin import apply_voice_plugin, load_voice_runtime
 except ImportError:
     from gemini_session import build_system_instruction
     from rio_agent import ToolBridge, _make_tools
     from tool_orchestrator import ToolOrchestrator, _is_task_request
+    from voice_plugin import apply_voice_plugin, load_voice_runtime
 
 # ---------------------------------------------------------------------------
 # Environment & logging
@@ -74,6 +77,8 @@ logger = structlog.get_logger(__name__)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 WS_AUTH_TOKEN = os.environ.get("RIO_WS_TOKEN", "")
 VOICE_NAME = os.environ.get("RIO_VOICE", "Puck")
+VOICE_RUNTIME = load_voice_runtime(VOICE_NAME)
+ACTIVE_VOICE_NAME = VOICE_RUNTIME.active_voice
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -150,10 +155,12 @@ _shared_memory_store = None
 _memory_store_loaded = False
 
 
-def _get_shared_memory_store():
+def _get_shared_memory_store(genai_client: Optional[genai.Client] = None):
     """Return a shared MemoryStore singleton (lazy-init on first call)."""
     global _shared_memory_store, _memory_store_loaded
     if _memory_store_loaded:
+        if _shared_memory_store and genai_client:
+            _shared_memory_store.set_client(genai_client)
         return _shared_memory_store
     _memory_store_loaded = True
     try:
@@ -162,7 +169,7 @@ def _get_shared_memory_store():
         if _local_dir not in sys.path:
             sys.path.insert(0, _local_dir)
         from memory import MemoryStore
-        _shared_memory_store = MemoryStore()
+        _shared_memory_store = MemoryStore(genai_client=genai_client)
         logger.info("memory_store.singleton_loaded")
     except Exception as exc:
         logger.warning("memory_store.singleton_unavailable", error=str(exc))
@@ -178,6 +185,9 @@ genai_client: genai.Client | None = None
 dashboard_clients: Set[WebSocket] = set()
 dashboard_lock = asyncio.Lock()
 
+# Priority 4.4: basic user-scoped runtime registry
+_trigger_engines_by_user: dict[str, Any] = {}
+
 # Transcript buffer for dashboard
 _transcript_buffer: list[dict] = []
 _TRANSCRIPT_BUFFER_MAX = 200
@@ -187,6 +197,10 @@ _TRANSCRIPT_BUFFER_MAX = 200
 # ---------------------------------------------------------------------------
 _conversations_dir = Path(__file__).resolve().parent.parent / "data" / "conversations"
 _conversations_dir.mkdir(parents=True, exist_ok=True)
+_user_configs_dir = Path(__file__).resolve().parent.parent / "data" / "users"
+_user_configs_dir.mkdir(parents=True, exist_ok=True)
+_workspaces_dir = Path(__file__).resolve().parent.parent / "data" / "workspaces"
+_workspaces_dir.mkdir(parents=True, exist_ok=True)
 
 _current_conversation_id: str | None = None
 _current_conversation_messages: list[dict] = []
@@ -236,6 +250,80 @@ def _buffer_transcript(entry: dict) -> None:
         _save_conversation()
 
 
+def _sanitize_user_id(value: str | None) -> str:
+    raw = (value or "default").strip().lower()
+    if not raw:
+        return "default"
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in raw)
+    return (safe[:64] or "default")
+
+
+def _default_user_config(user_id: str) -> dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "workspace_policy": {
+            "shared_workspace_enabled": True,
+            "allowed_shared_users": [],
+            "read_paths": ["."],
+            "write_paths": ["."],
+        },
+        "preferences": {
+            "preferred_channel": "telegram",
+        },
+    }
+
+
+def _user_config_path(user_id: str) -> Path:
+    return _user_configs_dir / f"{_sanitize_user_id(user_id)}.json"
+
+
+def _load_user_config(user_id: str) -> dict[str, Any]:
+    safe_user = _sanitize_user_id(user_id)
+    path = _user_config_path(safe_user)
+    default_cfg = _default_user_config(safe_user)
+    if not path.exists():
+        return default_cfg
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default_cfg
+    except Exception:
+        return default_cfg
+
+    cfg = dict(default_cfg)
+    cfg.update(raw)
+    wp = cfg.get("workspace_policy", {})
+    if not isinstance(wp, dict):
+        wp = {}
+    merged_wp = dict(default_cfg["workspace_policy"])
+    merged_wp.update(wp)
+    merged_wp["read_paths"] = list(merged_wp.get("read_paths") or ["."])
+    merged_wp["write_paths"] = list(merged_wp.get("write_paths") or ["."])
+    cfg["workspace_policy"] = merged_wp
+    cfg["user_id"] = safe_user
+    return cfg
+
+
+def _save_user_config(user_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    safe_user = _sanitize_user_id(user_id)
+    merged = _load_user_config(safe_user)
+    merged.update(config or {})
+    merged["user_id"] = safe_user
+
+    wp = merged.get("workspace_policy", {})
+    if not isinstance(wp, dict):
+        wp = {}
+    merged_wp = dict(_default_user_config(safe_user)["workspace_policy"])
+    merged_wp.update(wp)
+    merged_wp["read_paths"] = list(merged_wp.get("read_paths") or ["."])
+    merged_wp["write_paths"] = list(merged_wp.get("write_paths") or ["."])
+    merged["workspace_policy"] = merged_wp
+
+    path = _user_config_path(safe_user)
+    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # LiveConnectConfig builder
 # ---------------------------------------------------------------------------
@@ -267,12 +355,26 @@ def _build_live_config(
 ) -> types.LiveConnectConfig:
     """Build a LiveConnectConfig for the direct Gemini Live API."""
 
+    def _audio_transcription_config() -> types.AudioTranscriptionConfig:
+        """Build transcription config across SDK versions.
+
+        Some google-genai versions expose AudioTranscriptionConfig without
+        accepting language_code. Newer variants may include that field.
+        """
+        fields = getattr(types.AudioTranscriptionConfig, "model_fields", {}) or {}
+        if "language_code" in fields:
+            try:
+                return types.AudioTranscriptionConfig(language_code="en")
+            except Exception:
+                pass
+        return types.AudioTranscriptionConfig()
+
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name=VOICE_NAME,
+                    voice_name=ACTIVE_VOICE_NAME,
                 ),
             ),
         ),
@@ -285,7 +387,7 @@ def _build_live_config(
         tools=tool_objects if LIVE_MODEL_TOOLS else None,
         # Always enable input transcription so the ToolOrchestrator can detect
         # task requests from the user's speech, even if the env flag is off.
-        input_audio_transcription=types.AudioTranscriptionConfig(),
+        input_audio_transcription=_audio_transcription_config(),
         # Disable thinking/reasoning tokens — native-audio preview models can
         # emit thought=True parts which cause the Live API to close with 1011.
         thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -301,13 +403,14 @@ def _build_live_config(
             ),
         )
     if ENABLE_INPUT_AUDIO_TRANSCRIPTION:
-        config.input_audio_transcription = types.AudioTranscriptionConfig()
+        config.input_audio_transcription = _audio_transcription_config()
     if ENABLE_OUTPUT_AUDIO_TRANSCRIPTION:
-        config.output_audio_transcription = types.AudioTranscriptionConfig()
+        config.output_audio_transcription = _audio_transcription_config()
     if ENABLE_SESSION_RESUMPTION:
         config.session_resumption = types.SessionResumptionConfig(
             handle=session_handle,
         )
+    config = apply_voice_plugin(config, VOICE_RUNTIME)
     return config
 
 
@@ -373,12 +476,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         "rio.live.startup",
         model=LIVE_MODEL,
         vertex=USE_VERTEX,
-        voice=VOICE_NAME,
+        voice=ACTIVE_VOICE_NAME,
+        voice_plugin=VOICE_RUNTIME.plugin_name or "none",
         project=GCP_PROJECT or "(not set)",
     )
 
     # Pre-warm memory store so first WS connection doesn't block 4-6s
-    _get_shared_memory_store()
+    _get_shared_memory_store(genai_client=genai_client)
 
     # A4+G2: Run startup maintenance (prune old conversations, vacuum DBs)
     try:
@@ -439,6 +543,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("telegram_bot.startup_skip", error=str(_tg_err))
         app.state.telegram_bot = None
 
+    # Priority 4.2: ChannelManager (Telegram + WhatsApp only)
+    try:
+        import sys as _sys3, pathlib as _pl3
+        _local_dir3 = str(_pl3.Path(__file__).resolve().parent.parent / "local")
+        if _local_dir3 not in _sys3.path:
+            _sys3.path.insert(0, _local_dir3)
+        from channel_manager import ChannelManager, TelegramChannel
+        from whatsapp_channel import WhatsAppChannel
+
+        _tg_channel = TelegramChannel(getattr(app.state, "telegram_bot", None))
+        _wa_channel = WhatsAppChannel()
+        app.state.channel_manager = ChannelManager([_tg_channel, _wa_channel])
+        logger.info(
+            "channel_manager.initialized",
+            channels=app.state.channel_manager.enabled_channels(),
+        )
+    except Exception as _ch_err:
+        logger.debug("channel_manager.startup_skip", error=str(_ch_err))
+        app.state.channel_manager = None
+
     health_task = asyncio.create_task(
         _dashboard_health_broadcast_loop(), name="dashboard-health",
     )
@@ -498,13 +622,83 @@ async def health() -> dict:
         "backend": "direct-live-api",
         "model": LIVE_MODEL,
         "vertex_ai": USE_VERTEX,
-        "voice": VOICE_NAME,
+        "voice": ACTIVE_VOICE_NAME,
+        "voice_plugin": VOICE_RUNTIME.plugin_name,
+        "voice_plugin_metadata": VOICE_RUNTIME.plugin_metadata,
     }
 
 
 @app.get("/api/chat-history")
 async def get_chat_history(limit: int = 100) -> dict:
     return {"messages": _transcript_buffer[-limit:], "total": len(_transcript_buffer)}
+
+
+@app.get("/api/users/{user_id}/config")
+async def get_user_config(user_id: str) -> dict:
+    safe_user = _sanitize_user_id(user_id)
+    return {"config": _load_user_config(safe_user)}
+
+
+@app.post("/api/users/{user_id}/config")
+async def save_user_config(user_id: str, request: Request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        return {"success": False, "error": "JSON object body required"}
+    saved = _save_user_config(_sanitize_user_id(user_id), body)
+    return {"success": True, "config": saved}
+
+
+@app.get("/api/triggers")
+async def list_triggers(user_id: str = "default") -> dict:
+    safe_user = _sanitize_user_id(user_id)
+    engine = _trigger_engines_by_user.get(safe_user)
+    if engine is None:
+        return {"user_id": safe_user, "triggers": [], "active": False}
+    return {"user_id": safe_user, "triggers": engine.list_triggers(), "active": True}
+
+
+@app.post("/api/triggers/schedule")
+async def add_schedule_trigger(request: Request) -> dict:
+    body = await request.json()
+    user_id = _sanitize_user_id(str(body.get("user_id", "default")))
+    engine = _trigger_engines_by_user.get(user_id)
+    if engine is None:
+        return {"success": False, "error": f"No active session for user '{user_id}'"}
+
+    name = str(body.get("name", "")).strip() or f"schedule_{int(datetime.now(timezone.utc).timestamp())}"
+    goal = str(body.get("goal", "")).strip()
+    interval_seconds = int(body.get("interval_seconds", 0) or 0)
+    cooldown_seconds = int(body.get("cooldown_seconds", min(max(interval_seconds, 30), 60)) or 60)
+    if not goal or interval_seconds <= 0:
+        return {"success": False, "error": "goal and interval_seconds are required"}
+
+    trigger = engine.add_schedule(
+        name=name,
+        interval_seconds=interval_seconds,
+        goal=goal,
+        cooldown_seconds=cooldown_seconds,
+    )
+    return {
+        "success": True,
+        "user_id": user_id,
+        "trigger": {
+            "name": trigger.name,
+            "type": trigger.trigger_type,
+            "goal": trigger.goal,
+            "interval_seconds": trigger.interval_seconds,
+            "run_once": trigger.run_once,
+        },
+    }
+
+
+@app.delete("/api/triggers/{name}")
+async def remove_trigger(name: str, user_id: str = "default") -> dict:
+    safe_user = _sanitize_user_id(user_id)
+    engine = _trigger_engines_by_user.get(safe_user)
+    if engine is None:
+        return {"success": False, "error": f"No active session for user '{safe_user}'"}
+    ok = engine.remove(name)
+    return {"success": ok, "user_id": safe_user, "name": name}
 
 
 _config_yaml_path = Path(__file__).resolve().parent.parent / "config.yaml"
@@ -547,7 +741,8 @@ async def models_status() -> dict:
         "models": {
             "live": LIVE_MODEL,
             "orchestrator": ORCHESTRATOR_MODEL,
-            "voice": VOICE_NAME,
+            "voice": ACTIVE_VOICE_NAME,
+            "voice_plugin": VOICE_RUNTIME.plugin_name,
         },
         "api_key_set": bool(GEMINI_API_KEY),
         "vertex_ai": USE_VERTEX,
@@ -641,6 +836,39 @@ async def save_agents(request: Request) -> dict:
         return {"status": "saved", "agents": agents_data}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Evaluation API endpoints (Agent Factory Podcast framework)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/evaluation/stats")
+async def evaluation_stats() -> dict:
+    """Return aggregate evaluation statistics.
+
+    Provides data on task success rates, per-agent scores,
+    trajectory metrics, and LLM-as-judge dimension scores.
+    Powered by the EvaluationStore in ToolOrchestrator.
+    """
+    # The orchestrator is per-session, so we return stats from the
+    # module-level evaluation store if available.
+    try:
+        from evaluation import EvaluationStore
+        # Access via the orchestrator attached to the current session
+        # For now, return a placeholder that gets populated when sessions are active
+        return {
+            "status": "evaluation_available",
+            "note": "Evaluation data is per-session. Connect via WebSocket to populate.",
+            "framework": "Agent Factory Podcast (Google Cloud)",
+            "dimensions": [
+                "task_completion", "efficiency", "safety",
+                "output_quality", "reasoning_quality",
+                "hallucination_risk", "memory_relevance",
+            ],
+            "enable_hint": "Set RIO_EVAL_ENABLED=1 environment variable to enable LLM-as-judge scoring.",
+        }
+    except ImportError:
+        return {"error": "evaluation module not available"}
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +989,14 @@ async def ws_dashboard(websocket: WebSocket) -> None:
 async def ws_rio_live(websocket: WebSocket) -> None:
     await websocket.accept()
     client_id = str(uuid.uuid4())
-    log = logger.bind(client_id=client_id)
+    user_id = _sanitize_user_id(
+        (
+        websocket.query_params.get("user_id")
+        or websocket.headers.get("x-rio-user-id")
+        or "default"
+        )
+    )
+    log = logger.bind(client_id=client_id, user_id=user_id)
 
     # ---- Authentication ----
     if WS_AUTH_TOKEN:
@@ -782,10 +1017,29 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     log.info("live.client.connected")
     await _broadcast_dashboard({
         "type": "dashboard", "subtype": "client_event",
-        "event": "connected", "client_id": client_id,
+        "event": "connected", "client_id": client_id, "user_id": user_id,
     })
 
     assert genai_client is not None
+    user_cfg = _load_user_config(user_id)
+    workspace_policy = user_cfg.get("workspace_policy", {}) if isinstance(user_cfg, dict) else {}
+    if not isinstance(workspace_policy, dict):
+        workspace_policy = {}
+
+    shared_enabled = bool(workspace_policy.get("shared_workspace_enabled", True))
+    allowed_shared_users = {
+        _sanitize_user_id(v)
+        for v in (workspace_policy.get("allowed_shared_users", []) or [])
+        if str(v).strip()
+    }
+    if shared_enabled and allowed_shared_users and user_id not in allowed_shared_users:
+        await websocket.send_text(json.dumps({
+            "type": "control",
+            "action": "workspace_access_denied",
+            "detail": "User not allowed for shared workspace policy",
+        }))
+        await websocket.close(code=4003, reason="shared workspace access denied")
+        return
 
     # ---- Create ToolBridge + tool functions ----
     bridge = ToolBridge(websocket, broadcast_fn=_broadcast_dashboard)
@@ -819,6 +1073,22 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         memory_store=_mem_store,
         broadcast_fn=_broadcast_dashboard,
     )
+
+    # Priority 4.4: per-user workspace/policy overlay
+    if shared_enabled:
+        workspace_root = Path(__file__).resolve().parent.parent
+    else:
+        workspace_root = _workspaces_dir / user_id
+        workspace_root.mkdir(parents=True, exist_ok=True)
+
+    read_paths = list(workspace_policy.get("read_paths", ["."]) or ["."])
+    write_paths = list(workspace_policy.get("write_paths", ["."]) or ["."])
+    orchestrator._workspace_root = workspace_root
+    orchestrator._filesystem_policy = {
+        "enabled": True,
+        "read_paths": read_paths,
+        "write_paths": write_paths,
+    }
     # F5: Wire notifier as an after_tool hook for task completion notifications
     _notifier = getattr(app.state, "notifier", None)
     if _notifier and _notifier.is_enabled:
@@ -837,6 +1107,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         "orchestrator.ready",
         model=ORCHESTRATOR_MODEL,
         tools=len(tool_fns),
+        workspace_root=str(workspace_root),
+        shared_workspace=shared_enabled,
     )
 
     # C5: TriggerEngine — event-driven automation (keyword + schedule triggers)
@@ -848,6 +1120,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         async def _noop_inject(_: str) -> None:
             return
         _trigger_engine = TriggerEngine(orchestrator, _noop_inject)
+        _trigger_engines_by_user[user_id] = _trigger_engine
         log.info("trigger_engine.created")
     except Exception as _te_err:
         log.debug("trigger_engine.skip", error=str(_te_err))
@@ -870,6 +1143,14 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     # ---- Session with auto-reconnect ----
     session_handle: str | None = None
     active = True
+
+    def _ws_is_open() -> bool:
+        return (
+            active
+            and websocket.client_state == WebSocketState.CONNECTED
+            and websocket.application_state == WebSocketState.CONNECTED
+        )
+
     # Silent 20ms chunk for heartbeat (320 samples × 2 bytes = 640 bytes)
     silent_chunk = b"\x00" * 640
 
@@ -881,6 +1162,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             input_audio_transcription=ENABLE_INPUT_AUDIO_TRANSCRIPTION,
             output_audio_transcription=ENABLE_OUTPUT_AUDIO_TRANSCRIPTION,
             session_resumption=ENABLE_SESSION_RESUMPTION,
+            voice=ACTIVE_VOICE_NAME,
+            voice_plugin=VOICE_RUNTIME.plugin_name or "none",
         )
 
         try:
@@ -1070,29 +1353,49 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 async def inject_context(msg: str) -> None:
                     """Inject an orchestrator result into the live audio session.
 
-                    Called when an orchestrator task completes.  The voice
-                    model is never suppressed — it continues responding
-                    normally while tasks run in the background.
+                    Called when an orchestrator task completes or sends
+                    progress updates.  Heartbeats and progress messages
+                    use turn_complete=False so the voice model is NOT
+                    interrupted.  Only final results (task complete, error,
+                    cancellation) use turn_complete=True to trigger a
+                    spoken response.
                     """
-                    try:
-                        # Notify client that the background task finished
-                        await websocket.send_text(json.dumps({
-                            "type": "control",
-                            "action": "task_mode",
-                            "active": False,
-                        }))
-                    except Exception:
-                        pass
-                    try:
-                        await session.send_client_content(
-                            turns=types.Content(
-                                role="user",
-                                parts=[types.Part(text=msg)],
-                            ),
-                            turn_complete=True,
-                        )
-                    except Exception:
-                        log.warning("orchestrator.inject.failed", exc_info=True)
+                    # Classify message: heartbeats are non-final context
+                    # that should NOT interrupt the voice model.
+                    is_heartbeat = (
+                        "[SYSTEM: Still working" in msg
+                        or "[SYSTEM: Approval required" in msg
+                    )
+
+                    if _ws_is_open():
+                        # Only send task_mode:false for final results,
+                        # not for progress heartbeats (prevents UI flicker).
+                        if not is_heartbeat:
+                            try:
+                                await websocket.send_text(json.dumps({
+                                    "type": "control",
+                                    "action": "task_mode",
+                                    "active": False,
+                                }))
+                            except Exception:
+                                pass
+                        try:
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=msg)],
+                                ),
+                                # Heartbeats: turn_complete=False → voice
+                                # model treats this as background context
+                                # and does NOT interrupt ongoing speech.
+                                # Final results: turn_complete=True → voice
+                                # model generates a spoken response.
+                                turn_complete=not is_heartbeat,
+                            )
+                        except Exception:
+                            log.warning("orchestrator.inject.failed", exc_info=True)
+                    else:
+                        log.info("orchestrator.inject.skipped_closed_session")
 
                     # F5: Send push notification if configured
                     if _notifier and _notifier.is_enabled:
@@ -1104,9 +1407,19 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         except Exception:
                             pass
 
+                    _channel_mgr = getattr(app.state, "channel_manager", None)
+                    if _channel_mgr:
+                        try:
+                            if "task executor has completed" in msg.lower() or "task complete" in msg.lower():
+                                short_msg = msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
+                                await _channel_mgr.send_all(f"🤖 Rio: {short_msg}")
+                        except Exception:
+                            pass
+
                 # C5: Wire TriggerEngine with inject_context now that it's defined
                 if _trigger_engine is not None:
                     _trigger_engine._inject_fn = inject_context
+                    await _trigger_engine.start()
 
                 # Resume any tasks that were interrupted by previous session disconnect
                 try:
@@ -1118,10 +1431,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                 # F6: Wire Telegram bot to route incoming messages as PC workspace tasks
                 _telegram_bot = getattr(app.state, "telegram_bot", None)
+                _channel_manager = getattr(app.state, "channel_manager", None)
                 if _telegram_bot and _telegram_bot.enabled:
+                    app.state.telegram_active_client_id = client_id
 
                     # Status function: returns human-readable list of active tasks
                     def _telegram_status() -> str:
+                        owner = getattr(app.state, "telegram_active_client_id", None)
+                        if owner != client_id or not _ws_is_open():
+                            return "Desktop session is offline. Reconnect your local Rio client."
                         active = [
                             t.get_name().replace("orchestrator-", "• ", 1)
                             for t in orchestrator._active_tasks
@@ -1135,9 +1453,114 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                     # Approval handler: forward yes/no to orchestrator
                     async def _telegram_approve(approved: bool) -> None:
+                        owner = getattr(app.state, "telegram_active_client_id", None)
+                        if owner != client_id or not _ws_is_open():
+                            return
                         orchestrator.resolve_approval(approved)
 
                     _telegram_bot.set_approval_handler(_telegram_approve)
+
+                    async def _telegram_on_command(cmd: str, args: list[str]) -> None:
+                        """Handle slash commands from Telegram (Next Level)."""
+                        owner = getattr(app.state, "telegram_active_client_id", None)
+                        if owner != client_id:
+                            return
+                        logger.info("telegram_bot.command_received", cmd=cmd, args=args)
+
+                        if cmd == "reset":
+                            orchestrator.reset()
+                            await _telegram_bot.send("🔄 *Session Reset:* History and notes have been cleared.")
+
+                        elif cmd == "model":
+                            if not args:
+                                current = orchestrator.model
+                                await _telegram_bot.send(
+                                    f"🤖 *Current Orchestrator Model:* `{current}`\n\n"
+                                    f"To change: `/model [name]`\n"
+                                    f"Example: `/model gemini-3-pro-preview`"
+                                )
+                                return
+                            new_model = args[0]
+                            orchestrator.set_model(new_model)
+                            await _telegram_bot.send(f"✅ *Model Switched:* Now using `{new_model}`")
+
+                        elif cmd == "models":
+                            # List models from config
+                            from config import RioConfig
+                            try:
+                                cfg = RioConfig.load()
+                                models = cfg.get("rio", {}).get("models", {})
+                                lines = ["📊 *Available Models (from config):*"]
+                                for k, v in models.items():
+                                    if isinstance(v, str):
+                                        lines.append(f"• `{k}`: {v}")
+                                await _telegram_bot.send("\n".join(lines))
+                            except Exception:
+                                await _telegram_bot.send("❌ Error loading model list.")
+
+                        elif cmd == "screenshot":
+                            if not _ws_is_open():
+                                await _telegram_bot.send("⚠️ Desktop session is offline. Reconnect your local Rio client first.")
+                                return
+                            # Request a manual screenshot from the local client
+                            await _telegram_bot.send("📸 *Capturing PC screen...*")
+                            try:
+                                await websocket.send_text(json.dumps({
+                                    "type": "tool_call",
+                                    "name": "capture_screen",
+                                    "args": {"force": True},
+                                    "id": f"tg_screenshot_{int(time.time())}"
+                                }))
+                            except Exception as e:
+                                await _telegram_bot.send(f"❌ Failed to request screenshot: {e}")
+
+                        elif cmd == "memory":
+                            if not args:
+                                await _telegram_bot.send("🧠 *Memory Search*\n\nUsage: `/memory [query]`")
+                                return
+                            query = " ".join(args)
+                            _mem_store = getattr(orchestrator, "_memory_store", None)
+                            if _mem_store:
+                                try:
+                                    results = _mem_store.query(query, top_k=3)
+                                    if not results:
+                                        await _telegram_bot.send(f"🔍 No memories found for: `{query}`")
+                                    else:
+                                        lines = [f"🧠 *Top 3 Memories for:* `{query}`"]
+                                        for r in results:
+                                            # Truncate content for Telegram
+                                            content = r.content[:300] + ("..." if len(r.content) > 300 else "")
+                                            lines.append(f"• {content} _(dist: {r.distance:.2f})_")
+                                        await _telegram_bot.send("\n".join(lines))
+                                except Exception as e:
+                                    await _telegram_bot.send(f"❌ Memory search failed: {e}")
+                            else:
+                                await _telegram_bot.send("❌ Memory store not initialized on this session.")
+
+                        elif cmd == "agents":
+                            try:
+                                agents = orchestrator.get_agents()
+                                lines = ["🕵️ *Specialist Agents:*"]
+                                for name, data in agents.items():
+                                    if data.get("enabled"):
+                                        desc = data.get("description", "No description")
+                                        model = data.get("model", "default")
+                                        lines.append(f"• *{name}* ({model}): {desc}")
+                                await _telegram_bot.send("\n".join(lines))
+                            except Exception:
+                                await _telegram_bot.send("❌ Error loading agent list.")
+
+                        elif cmd == "voice":
+                            await _telegram_bot.send(
+                                "🎤 *Voice Control*\n\n"
+                                "To mute Rio's voice, type: `stop speaking` or `be quiet`.\n"
+                                "To enable/disable fully, use the F6 key on your PC."
+                            )
+
+                        else:
+                            await _telegram_bot.send(f"❓ Unknown command: `/{cmd}`. Type /help for a list.")
+
+                    _telegram_bot.set_command_handler(_telegram_on_command)
 
                     async def _telegram_to_orchestrator(text: str) -> None:
                         """Route incoming Telegram message to the PC workspace orchestrator.
@@ -1146,7 +1569,34 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         - Progress heartbeats are forwarded to Telegram
                         - Task results are sent back to Telegram when done
                         """
+                        owner = getattr(app.state, "telegram_active_client_id", None)
+                        if owner != client_id:
+                            return
+                        if not _ws_is_open():
+                            await _telegram_bot.send("⚠️ Desktop session is offline. Reconnect your local Rio client first.")
+                            return
                         log.info("telegram_bot.task_received", text=text[:80])
+                        draft_handle = None
+                        draft_finished = False
+
+                        async def _draft_update(text_payload: str, final: bool = False) -> None:
+                            nonlocal draft_handle, draft_finished
+                            if _channel_manager is None:
+                                return
+                            if final and draft_finished:
+                                return
+                            if draft_handle is None:
+                                draft_handle = await _channel_manager.start_draft(text_payload, channel="telegram")
+                                if draft_handle is None:
+                                    await _channel_manager.send(text_payload, channel="telegram")
+                                    if final:
+                                        draft_finished = True
+                                return
+                            if final:
+                                await _channel_manager.finish_draft(draft_handle, text_payload)
+                                draft_finished = True
+                            else:
+                                await _channel_manager.update_draft(draft_handle, text_payload)
 
                         # Telegram-aware inject_context: forwards results AND heartbeats
                         async def _tg_inject(msg: str) -> None:
@@ -1161,19 +1611,22 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 try:
                                     elapsed_hint = clean.split("elapsed")[0].split("(")[-1].strip() if "elapsed" in clean else ""
                                     tool_hint = clean.split("Still working on")[-1].split("...")[0].strip() if "Still working on" in clean else "task"
-                                    await _telegram_bot.send(f"⏳ Working on: {tool_hint}{' ('+elapsed_hint+')' if elapsed_hint else ''}...")
+                                    await _draft_update(
+                                        f"⏳ Working on: {tool_hint}{' ('+elapsed_hint+')' if elapsed_hint else ''}...",
+                                        final=False,
+                                    )
                                 except Exception:
                                     pass
                             # Task was cancelled
                             elif "[SYSTEM: The task was cancelled" in clean or "task was stopped" in clean.lower():
                                 try:
-                                    await _telegram_bot.send("🛑 Task was cancelled.")
+                                    await _draft_update("🛑 Task was cancelled.", final=True)
                                 except Exception:
                                     pass
                             # Approval required
                             elif "Approval required" in clean:
                                 try:
-                                    await _telegram_bot.send(f"⚠️ {clean[:500]}")
+                                    await _draft_update(f"⚠️ {clean[:500]}", final=False)
                                 except Exception:
                                     pass
                             # Normal result — strip [SYSTEM: ...] wrapper and send
@@ -1181,16 +1634,49 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 inner = clean.replace("[SYSTEM:", "").rstrip("]").strip()
                                 if len(inner) > 5:
                                     try:
-                                        await _telegram_bot.send(f"✅ {inner[:1000]}")
+                                        await _draft_update(f"✅ {inner[:1000]}", final=True)
                                     except Exception:
                                         pass
 
                         orchestrator.spawn_task(
                             f"[From Telegram] {text}", _tg_inject,
                         )
-                        await _telegram_bot.send(f"▶️ Starting task: _{text[:120]}_")
+                        await _draft_update(f"▶️ Starting task: _{text[:120]}_", final=False)
 
                     _telegram_bot.set_message_handler(_telegram_to_orchestrator)
+
+                    # Wire chat handler: conversational (non-task) messages
+                    # get injected into the live Gemini session as context,
+                    # so the model responds naturally without spawning a task.
+                    async def _telegram_chat_handler(text: str) -> None:
+                        """Handle conversational Telegram messages (non-tasks).
+
+                        Injects the message into the live model session so Gemini
+                        can respond conversationally. The response comes back through
+                        the normal downstream audio/text pipeline.
+                        """
+                        owner = getattr(app.state, "telegram_active_client_id", None)
+                        if owner != client_id:
+                            return
+                        if not _ws_is_open():
+                            await _telegram_bot.send("⚠️ Desktop session is offline.")
+                            return
+                        log.info("telegram_bot.chat_message", text=text[:80])
+                        try:
+                            # Inject as a user turn so the live model responds
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=f"[Message from Telegram] {text}")],
+                                ),
+                                turn_complete=True,
+                            )
+                            await _telegram_bot.send(f"💬 _{text[:100]}_ — response coming via voice...")
+                        except Exception as exc:
+                            log.warning("telegram_bot.chat_inject_error", error=str(exc))
+                            await _telegram_bot.send(f"❌ Could not process: {exc}")
+
+                    _telegram_bot.set_chat_handler(_telegram_chat_handler)
 
                 # ---- Downstream: Gemini session → client WebSocket ----
                 async def downstream_task() -> None:
@@ -1341,6 +1827,17 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 # C5: Check keyword triggers on every utterance
                                 if full_utterance and _trigger_engine is not None:
                                     _trigger_engine.check_utterance(full_utterance)
+                                    scheduled = _trigger_engine.try_schedule_from_utterance(full_utterance)
+                                    if scheduled:
+                                        mode = scheduled.get("mode", "schedule")
+                                        goal = scheduled.get("goal", "")
+                                        interval = int(scheduled.get("interval_seconds", 0) or 0)
+                                        human = (
+                                            f"[SYSTEM: Scheduled {mode} task '{goal}' every {interval} seconds.]"
+                                            if not scheduled.get("run_once")
+                                            else f"[SYSTEM: Scheduled one-time reminder '{goal}' in {interval} seconds.]"
+                                        )
+                                        await inject_context(human)
 
                             # ---- Go-away (session about to expire) ----
                             ga = getattr(response, "go_away", None)
@@ -1521,12 +2018,34 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             await _trigger_engine.stop()
         except Exception:
             pass
+        _trigger_engines_by_user.pop(user_id, None)
+
+    _telegram_bot = getattr(app.state, "telegram_bot", None)
+    if _telegram_bot and _telegram_bot.enabled:
+        owner = getattr(app.state, "telegram_active_client_id", None)
+        if owner == client_id:
+            async def _telegram_offline_message(_: str) -> None:
+                await _telegram_bot.send("⚠️ Desktop session is offline. Reconnect your local Rio client first.")
+
+            async def _telegram_offline_command(cmd: str, _: list[str]) -> None:
+                if cmd in {"help", "status", "tasks"}:
+                    await _telegram_bot.send("⚠️ Desktop session is offline. Reconnect your local Rio client first.")
+
+            async def _telegram_offline_approval(_: bool) -> None:
+                return
+
+            _telegram_bot.set_message_handler(_telegram_offline_message)
+            _telegram_bot.set_command_handler(_telegram_offline_command)
+            _telegram_bot.set_approval_handler(_telegram_offline_approval)
+            _telegram_bot.set_status_fn(lambda: "Desktop session is offline. Reconnect your local Rio client.")
+            app.state.telegram_active_client_id = None
+
     # Persist conversation on disconnect
     _save_conversation()
     log.info("live.client.cleanup_done", client_id=client_id)
     await _broadcast_dashboard({
         "type": "dashboard", "subtype": "client_event",
-        "event": "disconnected", "client_id": client_id,
+        "event": "disconnected", "client_id": client_id, "user_id": user_id,
     })
 
 
@@ -1729,9 +2248,18 @@ async def openai_chat_completions(request: Request):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
-        log_level="info",
-    )
+    try:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+            log_level="info",
+        )
+    except KeyboardInterrupt:
+        logger.info("server.shutdown_requested")
+    except asyncio.CancelledError:
+        logger.info("server.cancelled")
+    except SystemExit:
+        pass
+    finally:
+        logger.info("server.stopped")

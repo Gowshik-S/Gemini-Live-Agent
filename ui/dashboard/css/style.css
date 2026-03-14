@@ -588,6 +588,112 @@ body {
   gap: 8px;
 }
 
+/* --------------------------------------------------------------------------
+   Schedule Manager
+   -------------------------------------------------------------------------- */
+.schedule-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+
+.schedule-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.schedule-input {
+  width: 100%;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.schedule-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(108, 99, 255, 0.15);
+}
+
+.schedule-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.schedule-btn {
+  flex: 1;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  background: var(--success-dim);
+  color: var(--success);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.schedule-btn--secondary {
+  border-color: var(--border);
+  background: var(--bg-surface-hover);
+  color: var(--text-secondary);
+}
+
+.schedule-status {
+  font-size: 11px;
+  min-height: 16px;
+}
+
+.schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.schedule-item {
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.schedule-item__meta {
+  min-width: 0;
+}
+
+.schedule-item__name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.schedule-item__goal {
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.schedule-item__delete {
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  background: var(--error-dim);
+  color: var(--error);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 .health-card {
   background: var(--bg-base);
   border: 1px solid var(--border-subtle);

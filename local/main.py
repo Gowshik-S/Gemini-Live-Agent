@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -1775,6 +1776,17 @@ async def _shutdown_runtime(
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    # -- Graceful shutdown support (Windows-safe) --------------------------
+    shutdown_event = asyncio.Event()
+
+    def _signal_shutdown(signum, frame):
+        """Handle SIGINT/SIGTERM to trigger clean shutdown."""
+        print("\n  [Ctrl+C detected — shutting down gracefully...]")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, _signal_shutdown)
+    signal.signal(signal.SIGTERM, _signal_shutdown)
+
     # -- Load config -------------------------------------------------------
     config = RioConfig.load()
     config.validate()
@@ -2388,12 +2400,16 @@ async def main() -> None:
         except ConnectionError:
             log.warning("startup.greeting_failed", reason="not connected")
 
-        # Wait until any task exits (user typed /quit, Ctrl-C, or fatal error)
-        done, _ = await asyncio.wait(
-            tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        send_goodbye = bool(done) and all(_task_allows_goodbye(task) for task in done)
+        # Wait until any task exits, user presses Ctrl+C, or shutdown_event is set
+        while not shutdown_event.is_set():
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=1.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if done:
+                break
+        send_goodbye = not shutdown_event.is_set() and bool(done) and all(_task_allows_goodbye(task) for task in done)
     finally:
         await asyncio.shield(_shutdown_runtime(
             client=client,

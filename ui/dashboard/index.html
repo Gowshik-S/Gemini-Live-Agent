@@ -197,6 +197,31 @@
         </div>
       </section>
 
+      <!-- SCHEDULE MANAGER -->
+      <section class="panel panel--schedules" id="schedules-panel">
+        <div class="panel__header">
+          <svg class="icon" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10 6v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <h2 class="panel__title">Schedules</h2>
+          <span class="panel__badge" id="schedule-count">0</span>
+        </div>
+        <div class="panel__body schedule-body">
+          <div class="schedule-controls">
+            <input id="schedule-user-id" class="schedule-input" type="text" placeholder="user id" value="default">
+            <input id="schedule-goal" class="schedule-input" type="text" placeholder="goal (e.g. check inbox)">
+            <input id="schedule-interval" class="schedule-input" type="number" min="30" step="1" placeholder="interval seconds">
+            <div class="schedule-actions">
+              <button id="schedule-add" class="schedule-btn">Add</button>
+              <button id="schedule-refresh" class="schedule-btn schedule-btn--secondary">Refresh</button>
+            </div>
+            <div id="schedule-status" class="schedule-status text-muted">No active schedule session.</div>
+          </div>
+          <div id="schedule-list" class="schedule-list"></div>
+        </div>
+      </section>
+
       <!-- HEALTH / RPM / STATS -->
       <section class="panel panel--health" id="health-panel">
         <div class="panel__header">
@@ -307,6 +332,7 @@
   <script src="js/gauge.js"></script>
   <script src="js/toollog.js"></script>
   <script src="js/health.js"></script>
+  <script src="js/schedules.js"></script>
 
 </body>
 </html>

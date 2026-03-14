@@ -151,11 +151,49 @@ class ToolExecutor:
         self._screen_capture = None    # Set via set_screen_capture()
         self._ws_send_binary = None    # Set via set_ws_sender()
         self._last_actions: list[tuple[str, str]] = []  # (name, args_key) ring buffer
+        self._fs_policy = self._load_filesystem_policy()
+        self._workspace_cli_bin = os.environ.get("RIO_WORKSPACE_CLI_BIN", "workspace-cli")
         log.info("tools.init", working_dir=self._cwd)
 
     @property
     def working_dir(self) -> str:
         return self._cwd
+
+    def _load_filesystem_policy(self) -> dict[str, list[Path]]:
+        """Load filesystem read/write policy from config.yaml."""
+        policy: dict[str, list[Path]] = {"read": [Path(self._cwd).resolve()], "write": [Path(self._cwd).resolve()]}
+        cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+        if not cfg_path.is_file():
+            return policy
+        try:
+            import yaml
+
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            fs = raw.get("rio", {}).get("filesystem", {}) or {}
+            for mode in ("read_paths", "write_paths"):
+                roots = []
+                for entry in fs.get(mode, []) or []:
+                    p = Path(str(entry))
+                    if not p.is_absolute():
+                        p = Path(self._cwd) / p
+                    roots.append(p.resolve())
+                if roots:
+                    key = "read" if mode == "read_paths" else "write"
+                    policy[key] = roots
+        except Exception:
+            pass
+        return policy
+
+    def _allowed_by_policy(self, resolved: Path, mode: str) -> bool:
+        """Return True if resolved path is allowed for read or write mode."""
+        roots = self._fs_policy.get(mode, [])
+        for root in roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
 
     def set_screen_navigator(self, navigator) -> None:
         """Attach a ScreenNavigator instance for screen interaction tools."""
@@ -459,6 +497,8 @@ class ToolExecutor:
     async def _read_file(self, path: str) -> dict[str, Any]:
         """Read the contents of a file."""
         resolved = self._resolve(path)
+        if not self._allowed_by_policy(resolved, "read"):
+            return {"success": False, "error": f"Read denied by filesystem policy: {path}"}
         log.info("tool.read_file", path=str(resolved))
 
         if not resolved.exists():
@@ -491,6 +531,8 @@ class ToolExecutor:
     async def _write_file(self, path: str, content: str) -> dict[str, Any]:
         """Write content to a file, creating a .rio.bak backup if it exists."""
         resolved = self._resolve(path)
+        if not self._allowed_by_policy(resolved, "write"):
+            return {"success": False, "error": f"Write denied by filesystem policy: {path}"}
         log.info("tool.write_file", path=str(resolved), content_len=len(content))
 
         # Create backup of existing file
@@ -519,6 +561,8 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Apply a find-and-replace edit to a file."""
         resolved = self._resolve(path)
+        if not self._allowed_by_policy(resolved, "write"):
+            return {"success": False, "error": f"Patch denied by filesystem policy: {path}"}
         log.info("tool.patch_file", path=str(resolved))
 
         if not resolved.exists():

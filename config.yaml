@@ -1,254 +1,176 @@
-# Rio — Your Virtual Friend & Assistant
-# User configuration file
-# All values here can be overridden; sensible defaults exist in local/config.py
-
 rio:
-  # Agent identity — customise to your liking
-  agent_name: "Rio"                       # Display name (shown in UI, voice greetings)
-  agent_tagline: "Your Virtual Friend & Assistant"  # Short description
-  # Personality presets: "assistant" | "tutor" | "customer_care" | "developer"
-  # Or write your own in the system_instruction override below.
-  agent_role: "assistant"
-
-  # WebSocket URL for the Rio cloud backend
-  # Change to your Cloud Run URL after deployment
-  cloud_url: "ws://localhost:8080/ws/rio/live"
-
-  # Backend mode: "direct" uses Gemini Live API directly for lowest latency
-  backend: "direct"
-
-  # Session mode: "live" for Live API bidirectional audio, "text" for text-only fallback
-  session_mode: "live"
-
-  # Google Cloud Platform — $300 free credits
-  # Set use_vertex_ai: true to route through Vertex AI (production, billing, quotas)
-  # Set use_vertex_ai: false to use Gemini API directly (development, simpler)
-  gcp:
-    use_vertex_ai: false
-    project_id: ""                  # Your GCP project ID (e.g., "my-project-123")
-    location: "us-central1"         # Vertex AI region
-    # To enable Vertex AI:
-    #   1. Go to console.cloud.google.com → create/select project
-    #   2. Enable Vertex AI API + Generative Language API
-    #   3. Set project_id above (or GOOGLE_CLOUD_PROJECT env var)
-    #   4. Set use_vertex_ai: true (or GOOGLE_GENAI_USE_VERTEXAI=True env var)
-    #   5. Run: gcloud auth application-default login
-
-  # Audio capture / playback settings (Layer 1+)
-  audio:
-    sample_rate: 16000        # Hz — matches Gemini Live API expectation
-    block_size: 320           # samples per chunk (~20ms at 16kHz, was 1600/100ms)
-    input_device: null        # null = system default mic
-    output_device: null       # null = system default speaker
-    latency: "low"            # "low" for voice assistant, "high" for stability
-    use_wasapi: true          # Enable WASAPI low-latency on Windows
-
-  # Keyboard shortcuts (Layer 1+)
-  hotkeys:
-    push_to_talk: "f2"
-    screenshot: "f3"
-    toggle_proactive: "f4"
-    screen_mode: "f5"
-    live_mode: "f6"
-
-  # Voice Activity Detection (Day 5)
-  vad:
-    enabled: true
-    threshold: 0.5              # Silero probability threshold (0.0-1.0)
-
-  # Screen/vision capture settings (Layer 2+)
-  vision:
-    fps: 0.33                 # ~1 frame every 3 seconds
-    quality: 85               # JPEG quality (0-100)
-    resize_factor: 0.75       # downscale factor before sending
-    default_mode: "on_demand" # on_demand | autonomous (autonomous = always watching screen + auto-capture after actions)
-
-  # Struggle detection settings (Layer 4+)
-  struggle:
-    enabled: true
-    threshold: 0.85           # confidence threshold to trigger proactive help (extreme conservatism)
-    cooldown_seconds: 300     # minimum seconds between proactive interventions
-    decline_cooldown: 600     # cooldown after user declines help
-    demo_mode: false          # if true, lower thresholds for demonstration
-
-  # Local memory / RAG settings (Layer 5+)
-  memory:
-    db_path: "./data/memory"
-    max_recall: 5             # max memory entries to inject into context
-
-  # Model selection & fallback
-  models:
-    primary: "gemini-3-flash-preview"
-    live: "gemini-2.5-flash-native-audio-latest"
-    secondary: "gemini-3-pro-preview"
-    computer_use: "gemini-2.5-computer-use-preview-10-2025"
-    imagen: "imagen-4"
-    pro_rpm_budget: 5
-    fallback_chain:                   # models tried after primary fails
-      - "gemini-2.5-flash"
-    cooldown_seconds: 60.0            # seconds before retrying a failed model
-    timeout_seconds: 30.0             # per-request timeout
-
-  # Logging configuration
-  logging:
-    log_dir: "./logs"                 # directory for structured log files
-    verbose: false                    # show DEBUG-level output in console
-    max_files: 7                      # log rotation — keep last N days         # max requests-per-minute to the pro model
-  # Skills configuration (Customer Care + Tutor)
-  skills:
-    customer_care:
-      enabled: true
-      ticket_dir: "./rio_tickets"           # where ticket JSON files are stored
-      auto_escalate_after: 300              # seconds before auto-escalation
-      default_priority: "medium"            # low | medium | high | critical
-    tutor:
-      enabled: true
-      progress_dir: "./rio_progress"        # where student progress is stored
-      default_difficulty: "intermediate"    # beginner | novice | intermediate | advanced
-      quiz_num_questions: 5                 # default number of quiz questions
-      socratic_mode: true                   # use Socratic method (questions, not answers)
-
-  # Global deny list — tools here are blocked for ALL agents regardless of
-  # per-agent config.  Deny-wins: if a tool appears here, no agent can use it.
-  # Session-level overrides can further restrict (never relax) this list.
-  global_deny_tools: []
-  # Example: global_deny_tools: ["kill_process", "close_window"]
-
-  # Multi-agent orchestration
-  # Each agent specializes in a task type and uses the best model for it.
-  # The orchestrator auto-selects the right agent based on task content.
+  agent_name: Rio
+  agent_role: assistant
+  agent_tagline: Your Virtual Friend & Assistant
   agents:
-    task_executor:
-      enabled: true
-      model: "gemini-3-flash-preview"
-      description: "Executes computer tasks: opening apps, clicking, typing, file operations"
-      tools: "all"
-      max_iterations: 25
-      deny_tools: []
-      system_instruction: "You are a precise computer task executor. Always verify actions completed successfully before reporting done."
-      capabilities: ["screen", "keyboard", "mouse", "file_system", "process"]
-      tags: ["computer_use", "automation"]
-      schedule: null
     code_agent:
       enabled: true
-      model: "gemini-3-flash-preview"
-      description: "Code analysis, debugging, file reading/writing, refactoring"
-      tools: "dev"
       max_iterations: 15
-      deny_tools:
-        - "kill_process"
-        - "close_window"
-      system_instruction: "You are a senior developer. Write clean, tested code. Read existing code before modifying."
-      capabilities: ["read_file", "write_file", "run_command", "patch_file"]
-      tags: ["coding", "analysis"]
-      schedule: null
-    research_agent:
+      model: gemini-3-flash-preview
+      tools: dev
+      description: "Coding, debugging, writing code, fixing bugs, refactoring, git operations, file editing, build and test"
+    computer_use_agent:
       enabled: true
-      model: "gemini-3-pro-preview"
-      description: "Research, analysis, explanations, complex reasoning"
-      tools: "memory"
-      max_iterations: 10
-      deny_tools:
-        - "run_command"
-        - "kill_process"
-      system_instruction: "You are a research analyst. Provide thorough, well-sourced answers. Use memory tools to recall and save key findings."
-      capabilities: ["search_notes", "save_note", "reasoning"]
-      tags: ["research", "reasoning"]
-      schedule: null
+      max_iterations: 25
+      model: gemini-2.5-computer-use-preview-10-2025
+      tools: screen
+      description: "Screen interaction, clicking UI elements, opening applications, navigating windows, typing in apps, scrolling, browser navigation, GUI automation"
     creative_agent:
       enabled: true
-      model: "gemini-3-pro-image-preview"
-      description: "Image and video generation using Imagen 3 and Veo 2"
-      tools: "creative"
       max_iterations: 5
-      deny_tools:
-        - "run_command"
-        - "kill_process"
-        - "close_window"
-      system_instruction: "You are a creative assistant specializing in visual content generation."
-      capabilities: ["generate_image", "generate_video"]
-      tags: ["creative", "visual"]
-      schedule: null
-    # === P2.3 Specialist Agents (OpenFang-inspired) ===
-    summarizer_agent:
+      model: ''
+      tools: creative
+      description: "Image generation, video creation, design, illustration, drawing, creative content"
+    research_agent:
       enabled: true
-      model: "gemini-3-flash-preview"
-      description: "Digest long documents, email threads, or research into concise summaries"
-      tools: "memory"
-      max_iterations: 8
-      deny_tools: ["run_command", "kill_process"]
-      system_instruction: "You are an expert summarizer. Extract key points, action items, and decisions. Output structured summaries: Background, Key Points, Action Items, Decision Needed (if any). Be concise."
-      capabilities: ["read_file", "search_notes", "save_note"]
-      tags: ["summarize", "analysis"]
-      schedule: null
-    email_drafter_agent:
+      max_iterations: 10
+      model: gemini-2.5-pro-preview-06-05
+      tools: memory
+      description: "Deep research, complex analysis, reasoning, explaining concepts, investigating topics, studying, comparing alternatives"
+    task_executor:
       enabled: true
-      model: "gemini-3-pro-preview"
-      description: "Compose professional emails, replies, and follow-ups"
-      tools: "memory"
-      max_iterations: 5
-      deny_tools: ["run_command", "kill_process"]
-      system_instruction: "You are a professional email writer. Match the user's tone and style. Output only the email text (subject + body), no commentary."
-      capabilities: ["search_notes", "save_note"]
-      tags: ["email", "writing"]
-      schedule: null
-    code_reviewer_agent:
-      enabled: true
-      model: "gemini-3-pro-preview"
-      description: "Review code for bugs, security issues, and style improvements"
-      tools: "dev"
-      max_iterations: 12
-      deny_tools: ["kill_process"]
-      system_instruction: "You are a senior code reviewer. Check for: (1) bugs and logic errors, (2) security vulnerabilities (OWASP Top 10), (3) performance issues, (4) style and maintainability. Provide specific line-level feedback."
-      capabilities: ["read_file", "run_command", "search_notes"]
-      tags: ["coding", "review", "security"]
-      schedule: null
-    meeting_notes_agent:
-      enabled: true
-      model: "gemini-3-flash-preview"
-      description: "Transcribe and structure meeting notes with action items"
-      tools: "memory"
-      max_iterations: 6
-      deny_tools: ["run_command", "kill_process"]
-      system_instruction: "You are a meeting notes specialist. Structure notes as: Attendees, Agenda, Discussion Points, Decisions Made, Action Items (with owner and deadline). Save to session memory."
-      capabilities: ["read_file", "write_file", "save_note"]
-      tags: ["meetings", "notes", "productivity"]
-      schedule: null
-    data_analyst_agent:
-      enabled: true
-      model: "gemini-3-pro-preview"
-      description: "Analyze CSV, JSON, and tabular data to find insights and patterns"
-      tools: "dev"
-      max_iterations: 15
-      deny_tools: ["kill_process"]
-      system_instruction: "You are a data analyst. Read data files, compute statistics, identify trends, and explain findings clearly. Suggest visualizations when relevant."
-      capabilities: ["read_file", "run_command", "write_file"]
-      tags: ["data", "analysis", "csv"]
-      schedule: null
-
-  # Orchestrator settings (P1 tuning)
-  orchestrator:
-    tool_timeout_seconds: 120       # Max seconds per tool call before heartbeat timeout
-    heartbeat_interval_seconds: 5   # Seconds between heartbeat messages to voice model
-
-  # MCP (Model Context Protocol) external tool servers (F2)
-  # Connect to external MCP servers to extend Rio's tool capabilities.
-  # Each entry needs a name and a shell command that starts the server.
-  mcp_servers: []
-  # Example:
-  # mcp_servers:
-  #   - name: "github"
-  #     command: "npx @modelcontextprotocol/server-github"
-  #   - name: "filesystem"
-  #     command: "npx @modelcontextprotocol/server-filesystem ./data"
-
-  # Browser automation settings (E1)
+      max_iterations: 25
+      model: gemini-3-flash-preview
+      tools: all
+      description: "General task execution, multi-step workflows, coordinating actions across tools"
+  audio:
+    block_size: 320
+    input_device: null
+    latency: low
+    output_device: null
+    sample_rate: 16000
+    use_wasapi: true
+  backend: direct
   browser:
-    default_profile: "rio"              # Profile name for Playwright-managed browser data dir
-    default_browser: "auto"             # "auto" | "chrome" | "chromium" | "edge" | "brave"
-
-  # Notifications (F5) — push alerts when user is away
+    default_browser: auto
+    default_profile: rio
+  cloud_url: ws://localhost:8080/ws/rio/live
+  filesystem:
+    enabled: true
+    read_paths:
+    - .
+    write_paths:
+    - .
+  gcp:
+    location: us-central1
+    project_id: ''
+    use_vertex_ai: false
+  global_deny_tools: []
+  hotkeys:
+    live_mode: f6
+    push_to_talk: f2
+    screen_mode: f5
+    screenshot: f3
+    toggle_proactive: f4
+  logging:
+    log_dir: ./logs
+    max_files: 7
+    verbose: false
+  mcp_servers: []
+  memory:
+    db_path: ./data/memory
+    max_recall: 5
+  models:
+    computer_use: gemini-2.5-computer-use-preview-10-2025
+    cooldown_seconds: 60.0
+    fallback_chain:
+    - gemini-2.5-flash
+    imagen: imagen-4
+    live: gemini-2.5-flash-native-audio-latest
+    primary: gemini-3-flash-preview
+    pro_rpm_budget: 5
+    secondary: gemini-3-pro-preview
+    timeout_seconds: 30.0
   notifications:
     telegram:
-      bot_token: ""     # Set via RIO_TELEGRAM_BOT_TOKEN env var
-      chat_id: ""       # Set via RIO_TELEGRAM_CHAT_ID env var
+      bot_token: ''
+      chat_id: ''
+  orchestrator:
+    composite_routing:
+      complex_model: gemini-3-pro-preview
+      complexity_keywords:
+      - analyze
+      - architecture
+      - security
+      - tradeoff
+      - research
+      - refactor
+      - optimize
+      - plan
+      enabled: true
+      simple_max_words: 22
+      simple_model: gemini-3-flash-preview
+    heartbeat_interval_seconds: 5
+    loop_detection:
+      stop_at: 4
+      strategy_at: 3
+      warning_at: 2
+    prompt_fragments:
+      base: ''
+      compaction: ''
+      routing: ''
+      safety: ''
+      verification: ''
+    semantic_compaction:
+      high_value_keywords:
+      - error
+      - failed
+      - decision
+      - todo
+      - retry
+      - security
+      - quota
+      keep_middle_items: 8
+    session_persist_interval_seconds: 3
+    tool_policy:
+      cost_points:
+        generate_video: 6
+        gmail_send: 3
+        run_command: 4
+        start_process: 5
+      default_per_minute: 20
+      max_calls_per_task: 120
+      max_cost_points_per_task: 200
+      per_tool_per_minute:
+        gmail_send: 6
+        run_command: 8
+        smart_click: 30
+    tool_timeout_seconds: 120
+  session_mode: live
+  skills:
+    customer_care:
+      auto_escalate_after: 300
+      default_priority: medium
+      enabled: true
+      ticket_dir: ./rio_tickets
+    tutor:
+      default_difficulty: intermediate
+      enabled: true
+      progress_dir: ./rio_progress
+      quiz_num_questions: 5
+      socratic_mode: true
+  struggle:
+    cooldown_seconds: 300
+    decline_cooldown: 600
+    demo_mode: false
+    enabled: true
+    threshold: 0.85
+  vad:
+    enabled: true
+    threshold: 0.5
+  vision:
+    default_mode: on_demand
+    fps: 0.33
+    quality: 85
+    resize_factor: 0.75
+  voice:
+    default_name: Puck
+    plugin:
+      config:
+        provider: google-prebuilt
+        voice_name: Puck
+      enabled: false
+      factory: create_plugin
+      module: rio.cloud.voice_plugins.custom_voice
+  workspace_cli:
+    binary: workspace-cli
