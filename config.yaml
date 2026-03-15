@@ -12,7 +12,7 @@ rio:
     computer_use_agent:
       enabled: true
       max_iterations: 25
-      model: gemini-2.5-computer-use-preview-10-2025
+      model: gemini-3-flash-preview
       tools: screen
       description: "Screen interaction, clicking UI elements, opening applications, navigating windows, typing in apps, scrolling, browser navigation, GUI automation"
     creative_agent:
@@ -24,7 +24,7 @@ rio:
     research_agent:
       enabled: true
       max_iterations: 10
-      model: gemini-2.5-pro-preview-06-05
+      model: gemini-2.5-pro
       tools: memory
       description: "Deep research, complex analysis, reasoning, explaining concepts, investigating topics, studying, comparing alternatives"
     task_executor:
@@ -52,9 +52,9 @@ rio:
     write_paths:
     - .
   gcp:
-    location: us-central1
-    project_id: ''
-    use_vertex_ai: false
+    location: global
+    project_id: 'rio-agent-45'
+    use_vertex_ai: true
   global_deny_tools: []
   hotkeys:
     live_mode: f6
@@ -71,7 +71,7 @@ rio:
     db_path: ./data/memory
     max_recall: 5
   models:
-    computer_use: gemini-2.5-computer-use-preview-10-2025
+    computer_use: gemini-3-flash-preview
     cooldown_seconds: 60.0
     fallback_chain:
     - gemini-2.5-flash
@@ -87,7 +87,7 @@ rio:
       chat_id: ''
   orchestrator:
     composite_routing:
-      complex_model: gemini-3-pro-preview
+      complex_model: gemini-3.1-pro-preview
       complexity_keywords:
       - analyze
       - architecture
@@ -163,6 +163,12 @@ rio:
     fps: 0.33
     quality: 85
     resize_factor: 0.75
+  ui_navigator:
+    enabled: false
+    fps: 10.0
+    model: gemini-2.5-flash
+    confidence_threshold: 0.85
+    analyze_every_n_frames: 3
   voice:
     default_name: Puck
     plugin:

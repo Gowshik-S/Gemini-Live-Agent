@@ -119,16 +119,21 @@ def _ensure_psutil() -> bool:
 
 _win32gui = None
 _win32com_client = None
-
+_win32api = None
+_win32con = None
 
 def _ensure_win32() -> bool:
     """Attempt to load pywin32 modules. Returns True if win32gui loaded."""
-    global _win32gui, _win32com_client
+    global _win32gui, _win32com_client, _win32api, _win32con
     if _win32gui is not None:
         return True
     try:
         import win32gui as _wg
+        import win32api as _wa
+        import win32con as _wccon
         _win32gui = _wg
+        _win32api = _wa
+        _win32con = _wccon
     except ImportError:
         pass
     try:
@@ -199,6 +204,64 @@ class _RateLimiter:
 
 
 # ---------------------------------------------------------------------------
+# pywin32 execution helpers
+# ---------------------------------------------------------------------------
+
+def _win32_click(x: int, y: int, button: str = "left", clicks: int = 1) -> None:
+    if _win32api is None or _win32con is None:
+        raise RuntimeError("win32api not available")
+    
+    _win32api.SetCursorPos((x, y))
+    
+    if button == "left":
+        down = _win32con.MOUSEEVENTF_LEFTDOWN
+        up = _win32con.MOUSEEVENTF_LEFTUP
+    elif button == "right":
+        down = _win32con.MOUSEEVENTF_RIGHTDOWN
+        up = _win32con.MOUSEEVENTF_RIGHTUP
+    else:
+        down = _win32con.MOUSEEVENTF_MIDDLEDOWN
+        up = _win32con.MOUSEEVENTF_MIDDLEUP
+
+    for _ in range(clicks):
+        _win32api.mouse_event(down, x, y, 0, 0)
+        time.sleep(0.02)
+        _win32api.mouse_event(up, x, y, 0, 0)
+        if clicks > 1:
+            time.sleep(0.05)
+
+def _win32_type_text(text: str, interval: float = 0.02) -> None:
+    if _win32api is None or _win32con is None:
+        raise RuntimeError("win32api not available")
+        
+    for char in text:
+        # Simplistic approach for ASCII. Real unicode injection requires SendInput.
+        vk = _win32api.VkKeyScan(char)
+        if vk != -1:
+            shift = (vk & 0x100) != 0
+            code = vk & 0xFF
+            if shift:
+                _win32api.keybd_event(_win32con.VK_SHIFT, 0, 0, 0)
+            _win32api.keybd_event(code, 0, 0, 0)
+            _win32api.keybd_event(code, 0, _win32con.KEYEVENTF_KEYUP, 0)
+            if shift:
+                _win32api.keybd_event(_win32con.VK_SHIFT, 0, _win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(interval)
+        else:
+            # Fallback to clip/paste if character not found on keyboard
+            try:
+                import pyperclip
+                pyperclip.copy(char)
+                _win32api.keybd_event(_win32con.VK_CONTROL, 0, 0, 0)
+                _win32api.keybd_event(ord('V'), 0, 0, 0)
+                _win32api.keybd_event(ord('V'), 0, _win32con.KEYEVENTF_KEYUP, 0)
+                _win32api.keybd_event(_win32con.VK_CONTROL, 0, _win32con.KEYEVENTF_KEYUP, 0)
+                time.sleep(interval)
+            except ImportError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # ScreenNavigator
 # ---------------------------------------------------------------------------
 
@@ -222,12 +285,24 @@ class ScreenNavigator:
         resize_factor: float = 0.5,
         monitor_left: int = 0,
         monitor_top: int = 0,
+        backend: str = "pyautogui",
     ) -> None:
         self._resize_factor = resize_factor
         self._monitor_left = monitor_left
         self._monitor_top = monitor_top
+        self._backend = backend.lower()
         self._dpi_aware = _setup_dpi_awareness()
-        self._available = _ensure_pyautogui()
+        
+        self._available = False
+        if self._backend == "pywin32":
+            self._available = _ensure_win32()
+            if not self._available:
+                log.warning("screen_nav.pywin32_unavailable", note="Falling back to pyautogui")
+                self._backend = "pyautogui"
+        
+        if self._backend == "pyautogui":
+            self._available = _ensure_pyautogui()
+            
         self._rate_limiter = _RateLimiter(max_actions=15, window_seconds=5.0)
         self._action_log: list[ActionLogEntry] = []
         self._max_log_entries = 200
@@ -237,12 +312,12 @@ class ScreenNavigator:
                 "screen_nav.init",
                 resize_factor=resize_factor,
                 dpi_aware=self._dpi_aware,
-                failsafe=True,
+                backend=self._backend,
             )
         else:
             log.warning(
                 "screen_nav.unavailable",
-                note="Install pyautogui: pip install pyautogui",
+                note="Install required dependencies (pyautogui or pywin32)",
             )
 
     # ------------------------------------------------------------------
@@ -317,7 +392,12 @@ class ScreenNavigator:
 
     def _check_available(self) -> dict[str, Any] | None:
         """Returns error dict if navigator is not available, else None."""
-        if not self._available or _pyautogui is None:
+        if not self._available:
+            return {
+                "success": False,
+                "error": f"Screen navigator unavailable — install dependencies for {self._backend}",
+            }
+        if self._backend == "pyautogui" and _pyautogui is None:
             return {
                 "success": False,
                 "error": "Screen navigator unavailable — install pyautogui",
@@ -362,11 +442,16 @@ class ScreenNavigator:
 
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
-                None, lambda: _safe_execute(_pyautogui.click, x, y, button=button, clicks=clicks)
-            )
+            if self._backend == "pywin32":
+                await loop.run_in_executor(None, _win32_click, x, y, button, clicks)
+            else:
+                await loop.run_in_executor(
+                    None, lambda: _safe_execute(_pyautogui.click, x, y, button=button, clicks=clicks)
+                )
         except _FailSafeAbort as e:
             self._log_action("click_absolute", (x, y), (x, y), error="failsafe")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
             return {"success": False, "error": str(e)}
 
         self._log_action("click_absolute", (x, y), (x, y), button=button, clicks=clicks)
@@ -408,11 +493,16 @@ class ScreenNavigator:
 
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
-                None, lambda: _safe_execute(_pyautogui.click, rx, ry, button=button, clicks=clicks)
-            )
+            if self._backend == "pywin32":
+                await loop.run_in_executor(None, _win32_click, rx, ry, button, clicks)
+            else:
+                await loop.run_in_executor(
+                    None, lambda: _safe_execute(_pyautogui.click, rx, ry, button=button, clicks=clicks)
+                )
         except _FailSafeAbort as e:
             self._log_action("click", (x, y), (rx, ry), error="failsafe")
+            return {"success": False, "error": str(e)}
+        except Exception as e:
             return {"success": False, "error": str(e)}
 
         self._log_action("click", (x, y), (rx, ry), button=button, clicks=clicks)
@@ -447,33 +537,38 @@ class ScreenNavigator:
         loop = asyncio.get_running_loop()
 
         try:
-            # Check if text is pure ASCII — pyautogui.write only handles ASCII
-            if all(ord(c) < 128 for c in text):
-                await loop.run_in_executor(
-                    None, lambda: _safe_execute(_pyautogui.write, text, interval=interval)
-                )
+            if self._backend == "pywin32":
+                await loop.run_in_executor(None, _win32_type_text, text, interval)
             else:
-                # For unicode: use clipboard paste
-                try:
-                    import pyperclip
-                    pyperclip.copy(text)
-                    if platform.system() == "Darwin":
-                        await loop.run_in_executor(
-                            None, lambda: _safe_execute(_pyautogui.hotkey, "command", "v")
-                        )
-                    else:
-                        await loop.run_in_executor(
-                            None, lambda: _safe_execute(_pyautogui.hotkey, "ctrl", "v")
-                        )
-                except ImportError:
-                    # No pyperclip — try character by character via write
-                    # (may lose non-ASCII chars)
-                    safe = text.encode("ascii", "replace").decode("ascii")
+                # Check if text is pure ASCII — pyautogui.write only handles ASCII
+                if all(ord(c) < 128 for c in text):
                     await loop.run_in_executor(
-                        None, lambda: _safe_execute(_pyautogui.write, safe, interval=interval)
+                        None, lambda: _safe_execute(_pyautogui.write, text, interval=interval)
                     )
+                else:
+                    # For unicode: use clipboard paste
+                    try:
+                        import pyperclip
+                        pyperclip.copy(text)
+                        if platform.system() == "Darwin":
+                            await loop.run_in_executor(
+                                None, lambda: _safe_execute(_pyautogui.hotkey, "command", "v")
+                            )
+                        else:
+                            await loop.run_in_executor(
+                                None, lambda: _safe_execute(_pyautogui.hotkey, "ctrl", "v")
+                            )
+                    except ImportError:
+                        # No pyperclip — try character by character via write
+                        # (may lose non-ASCII chars)
+                        safe = text.encode("ascii", "replace").decode("ascii")
+                        await loop.run_in_executor(
+                            None, lambda: _safe_execute(_pyautogui.write, safe, interval=interval)
+                        )
         except _FailSafeAbort as e:
             self._log_action("type_text", details={"length": len(text), "error": "failsafe"})
+            return {"success": False, "error": str(e)}
+        except Exception as e:
             return {"success": False, "error": str(e)}
 
         self._log_action("type_text", details={"length": len(text)})
@@ -683,6 +778,8 @@ class ScreenNavigator:
     async def focus_window(self, title_contains: str) -> dict[str, Any]:
         """Bring a window to the foreground by title.
 
+        If this succeeds but the window still isn't visible, use list_all_windows to check its state.
+
         Args:
             title_contains: Substring to search for in window titles.
         """
@@ -698,14 +795,28 @@ class ScreenNavigator:
         loop = asyncio.get_running_loop()
 
         def _focus():
-            windows = _pygetwindow.getWindowsWithTitle(title_contains)
-            if not windows:
+            try:
+                windows = _pygetwindow.getWindowsWithTitle(title_contains)
+                if not windows:
+                    return None
+                w = windows[0]
+                
+                try:
+                    if w.isMinimized:
+                        w.restore()
+                except Exception as e:
+                    log.debug("navigator.focus_window.restore_failed", error=str(e))
+                
+                try:
+                    w.activate()
+                except Exception as e:
+                    # Often fails due to 'Focus Stealing Prevention' or PyGetWindow 'Error 0' bug
+                    log.debug("navigator.focus_window.activate_failed", title=w.title, error=str(e))
+                
+                return w.title
+            except Exception as e:
+                log.error("navigator.focus_window.error", query=title_contains, error=str(e))
                 return None
-            w = windows[0]
-            if w.isMinimized:
-                w.restore()
-            w.activate()
-            return w.title
 
         title = await loop.run_in_executor(None, _focus)
         if title is None:
@@ -737,6 +848,9 @@ class ScreenNavigator:
           - Full executable paths: "C:\\\\Program Files\\\\...\\\\app.exe"
           - File associations via os.startfile: "document.pdf", "image.png"
           - URLs: "https://google.com" (opens in default browser)
+
+        IMPORTANT: If this returns success but the app isn't visible yet, it may be loading.
+        Wait a moment and use `focus_window` or `list_all_windows` to verify.
 
         Args:
             name_or_path: Application name, path, file, or URL.
@@ -804,6 +918,20 @@ class ScreenNavigator:
             # URLs or ms-* protocol links: use os.startfile on Windows
             if resolved.startswith(("http://", "https://", "ms-")):
                 if platform.system() == "Windows":
+                    # Check if we should override the default browser for URLs
+                    try:
+                        from config import RioConfig
+                        cfg = RioConfig.load()
+                        preferred = cfg.browser.default_browser
+                        if preferred == "chrome" and resolved.startswith("http"):
+                            subprocess.Popen(f'start chrome "{resolved}"', shell=True)
+                            return resolved, "url", None
+                        elif preferred == "edge" and resolved.startswith("http"):
+                            subprocess.Popen(f'start msedge "{resolved}"', shell=True)
+                            return resolved, "url", None
+                    except Exception:
+                        pass
+                    
                     os.startfile(resolved)
                 else:
                     subprocess.Popen(["xdg-open", resolved])

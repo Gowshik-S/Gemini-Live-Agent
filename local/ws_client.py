@@ -65,7 +65,7 @@ class WSClient:
     # Reconnect parameters
     _INITIAL_BACKOFF: float = 1.0
     _MAX_BACKOFF: float = 30.0
-    _HEARTBEAT_INTERVAL: float = 5.0
+    _HEARTBEAT_INTERVAL: float = 10.0 # Increased for stability
 
     def __init__(
         self,
@@ -80,6 +80,10 @@ class WSClient:
         self._state = ConnectionState.DISCONNECTED
         self._should_reconnect = True
         self._heartbeat_task: Optional[asyncio.Task] = None
+        
+        # Priority queue for outgoing messages: (priority, timestamp, payload)
+        self._send_queue: asyncio.PriorityQueue[tuple[int, float, str | bytes]] = asyncio.PriorityQueue()
+        self._send_task: Optional[asyncio.Task] = None
 
         # Pluggable callbacks
         self._on_connect = on_connect
@@ -106,6 +110,9 @@ class WSClient:
         """Establish the WebSocket connection (with reconnect loop)."""
         self._should_reconnect = True
         backoff = self._INITIAL_BACKOFF
+
+        if self._send_task is None or self._send_task.done():
+            self._send_task = asyncio.create_task(self._send_worker(), name="ws_send_worker")
 
         while self._should_reconnect:
             self._state = ConnectionState.CONNECTING
@@ -140,33 +147,53 @@ class WSClient:
     # Send
     # ------------------------------------------------------------------
 
-    async def send_text(self, text: str) -> None:
-        """Send a JSON text frame.  *text* is the raw string payload."""
-        self._ensure_connected()
-        assert self._ws is not None
-        log.debug("ws.send_text", length=len(text))
-        try:
-            await self._ws.send(text)
-        except websockets.exceptions.ConnectionClosed as exc:
-            self._state = ConnectionState.DISCONNECTED
-            self._stop_heartbeat()
-            raise ConnectionError(f"WebSocket closed: {exc}") from exc
+    async def _send_worker(self) -> None:
+        """Background worker that pulls from the priority queue and sends."""
+        while self._should_reconnect:
+            try:
+                priority, timestamp, payload = await self._send_queue.get()
+                
+                if not self.is_connected or self._ws is None:
+                    # Re-queue and wait if disconnected
+                    self._send_queue.put_nowait((priority, timestamp, payload))
+                    await asyncio.sleep(0.5)
+                    continue
 
-    async def send_json(self, obj: dict[str, Any]) -> None:
+                if isinstance(payload, bytes):
+                    log.debug("ws.send_bytes", length=len(payload))
+                    await self._ws.send(payload)
+                elif isinstance(payload, str):
+                    log.debug("ws.send_text", length=len(payload))
+                    await self._ws.send(payload)
+                    
+                self._send_queue.task_done()
+                # Yield control to event loop to keep audio flowing
+                await asyncio.sleep(0.001)
+
+            except asyncio.CancelledError:
+                break
+            except websockets.exceptions.ConnectionClosed:
+                # Connection dropped, put back in queue for retry
+                self._send_queue.put_nowait((priority, timestamp, payload))
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.error("ws.send_worker.error", error=str(e))
+                self._send_queue.task_done()
+
+    async def send_text(self, text: str, priority: int = 1) -> None:
+        """Send a JSON text frame.  *text* is the raw string payload."""
+        # Priority 1 for general text
+        self._send_queue.put_nowait((priority, time.monotonic(), text))
+
+    async def send_json(self, obj: dict[str, Any], priority: int = 1) -> None:
         """Convenience: serialize *obj* as JSON and send as a text frame."""
-        await self.send_text(json.dumps(obj))
+        await self.send_text(json.dumps(obj), priority=priority)
 
     async def send_binary(self, data: bytes) -> None:
         """Send a binary frame (audio chunks, screenshots, etc.)."""
-        self._ensure_connected()
-        assert self._ws is not None
-        log.debug("ws.send_binary", length=len(data))
-        try:
-            await self._ws.send(data)
-        except websockets.exceptions.ConnectionClosed as exc:
-            self._state = ConnectionState.DISCONNECTED
-            self._stop_heartbeat()
-            raise ConnectionError(f"WebSocket closed: {exc}") from exc
+        # Priority 0 for audio (small frames), Priority 2 for images (large frames)
+        priority = 2 if len(data) > 32000 else 0
+        self._send_queue.put_nowait((priority, time.monotonic(), data))
 
     async def send_json_resilient(self, obj: dict[str, Any], retries: int = 2) -> bool:
         """Send JSON with retry on transient failures.
@@ -174,21 +201,10 @@ class WSClient:
         Returns True if sent successfully, False otherwise.
         Unlike ``send_json``, this never raises — it logs failures.
         """
-        for attempt in range(retries + 1):
-            try:
-                await self.send_json(obj)
-                return True
-            except ConnectionError:
-                if attempt < retries:
-                    log.debug("ws.send_json_resilient.retry", attempt=attempt + 1)
-                    await asyncio.sleep(0.5)
-                else:
-                    log.warning("ws.send_json_resilient.failed", attempts=retries + 1)
-                    return False
-            except Exception:
-                log.exception("ws.send_json_resilient.error")
-                return False
-        return False
+        # With priority queue, resilience is mostly handled internally,
+        # but we still await send_json to keep the interface identical.
+        await self.send_json(obj, priority=1)
+        return True
 
     # ------------------------------------------------------------------
     # Receive — async generator
@@ -277,14 +293,14 @@ class WSClient:
                 if self._ws is not None and self.is_connected:
                     try:
                         pong = await self._ws.ping()
-                        await asyncio.wait_for(pong, timeout=8.0)
+                        await asyncio.wait_for(pong, timeout=15.0)
                         log.debug("ws.heartbeat_ok")
                         consecutive_failures = 0
                     except Exception as exc:
                         consecutive_failures += 1
                         log.warning("ws.heartbeat_failed", error=str(exc), failures=consecutive_failures)
-                        if consecutive_failures >= 4:
-                            log.warning("ws.heartbeat_dead", note="marking connection dead after 4 consecutive failures")
+                        if consecutive_failures >= 6:
+                            log.warning("ws.heartbeat_dead", note="marking connection dead after 6 consecutive failures")
                             self._state = ConnectionState.DISCONNECTED
                             try:
                                 await self._ws.close()

@@ -28,6 +28,7 @@ Security:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -151,6 +152,7 @@ class ToolExecutor:
         self._screen_capture = None    # Set via set_screen_capture()
         self._ws_send_binary = None    # Set via set_ws_sender()
         self._last_actions: list[tuple[str, str]] = []  # (name, args_key) ring buffer
+        self._last_confirmed_click_xy: tuple[int, int] | None = None
         self._fs_policy = self._load_filesystem_policy()
         self._workspace_cli_bin = os.environ.get("RIO_WORKSPACE_CLI_BIN", "workspace-cli")
         log.info("tools.init", working_dir=self._cwd)
@@ -213,6 +215,11 @@ class ToolExecutor:
         """
         self._ws_send_binary = send_binary_fn
         log.info("tools.ws_sender_attached")
+
+    def set_ws_json_sender(self, send_json_fn) -> None:
+        """Attach an async callable to send JSON frames to the cloud."""
+        self._ws_send_json = send_json_fn
+        log.info("tools.ws_json_sender_attached")
 
     # Actions that modify window state — these get post-action verification
     _WINDOW_VERIFY_ACTIONS = frozenset({
@@ -495,7 +502,12 @@ class ToolExecutor:
     # ------------------------------------------------------------------
 
     async def _read_file(self, path: str) -> dict[str, Any]:
-        """Read the contents of a file."""
+        """Read the contents of a file.
+        
+        To prevent context bloat, always read files cautiously. If you know you 
+        only need a specific section, use `run_command` with `sed` or `head/tail` 
+        instead. Large files will be automatically truncated.
+        """
         resolved = self._resolve(path)
         if not self._allowed_by_policy(resolved, "read"):
             return {"success": False, "error": f"Read denied by filesystem policy: {path}"}
@@ -559,7 +571,13 @@ class ToolExecutor:
     async def _patch_file(
         self, path: str, old_text: str, new_text: str,
     ) -> dict[str, Any]:
-        """Apply a find-and-replace edit to a file."""
+        """Apply a find-and-replace edit to a file.
+        
+        CRITICAL RULES:
+        - `old_text` must be an EXACT, literal match of the file contents.
+        - Do not use placeholders, elisions, or regex in `old_text` or `new_text`.
+        - If `old_text` is not found, the tool will fail. Use `read_file` or `run_command` (grep) first if you are unsure of the exact text.
+        """
         resolved = self._resolve(path)
         if not self._allowed_by_policy(resolved, "write"):
             return {"success": False, "error": f"Patch denied by filesystem policy: {path}"}
@@ -597,7 +615,20 @@ class ToolExecutor:
     # ------------------------------------------------------------------
 
     async def _run_command(self, command: str) -> dict[str, Any]:
-        """Execute a shell command with timeout and safety blocklist."""
+        """Execute a shell command on the host system.
+
+        Use this to run terminal commands, build scripts, or interact with the OS.
+        The command runs in the project workspace directory.
+        Outputs are truncated if they exceed size limits.
+        
+        Examples:
+          - command="npm run build"
+          - command="python -m pytest tests/"
+          - command="ls -la src/"
+          
+        If the command fails (success=False), analyze the 'error' or 'output' 
+        fields to determine the root cause before retrying.
+        """
         log.info("tool.run_command", command=command)
 
         # Check blocklist
@@ -1379,10 +1410,18 @@ class ToolExecutor:
 
         log.info("cu.action", name=action_name, args=args)
 
+        # Handle safety decision if present in args (automatic for desktop assistant)
+        safety_decision = args.get("safety_decision")
+        safety_acknowledged = False
+        if safety_decision and safety_decision.get("decision") == "require_confirmation":
+            log.info("cu.safety_acknowledged", action=action_name)
+            safety_acknowledged = True
+
+        result = {"success": False}
         if action_name == "click_at":
             rx = self._denormalize_x(int(args.get("x", 0)))
             ry = self._denormalize_y(int(args.get("y", 0)))
-            return await nav.click_absolute(rx, ry)
+            result = await nav.click_absolute(rx, ry)
 
         elif action_name == "hover_at":
             rx = self._denormalize_x(int(args.get("x", 0)))
@@ -1471,17 +1510,354 @@ class ToolExecutor:
             return await nav.hotkey("enter")
 
         elif action_name == "open_web_browser":
+            from config import RioConfig
+            cfg = RioConfig.load()
+            preferred = cfg.browser.default_browser
+            if preferred == "auto":
+                preferred = "chrome"
+            
             import subprocess as _sp
+            from platform_utils import get_browser_launch_command
             try:
-                _sp.Popen("start msedge", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                # Use platform-aware command
+                cmd = get_browser_launch_command()
+                # Ensure we use the preferred browser if it's not the system default
+                # Start chrome/msedge directly if needed
+                if preferred == "chrome":
+                    _sp.Popen("start chrome", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                elif preferred == "edge":
+                    _sp.Popen("start msedge", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                else:
+                    _sp.Popen(cmd, shell=True if sys.platform == "win32" else False, 
+                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
             except Exception:
-                _sp.Popen("start chrome", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                # Absolute fallback
+                exe = "chrome" if preferred == "chrome" else "msedge"
+                _sp.Popen(f"start {exe}", shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            
             await asyncio.sleep(1.5)
-            return {"success": True, "action": "open_web_browser"}
+            return {"success": True, "action": "open_web_browser", "browser": preferred}
 
         else:
             log.warning("cu.unknown_action", name=action_name)
             return {"success": False, "error": f"Unknown computer-use action: {action_name}"}
+
+    async def _capture_optimized_for_cu(self) -> bytes | None:
+        """Capture and resize screenshot to 1280x800 for optimal model grounding."""
+        if self._screen_capture is None:
+            return None
+        try:
+            # Get full resolution image bytes
+            jpeg_bytes = await self._screen_capture.capture_full_resolution_async()
+            if not jpeg_bytes:
+                return None
+            
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            
+            # Computer Use model works best at ~1280x800
+            # Maintaining aspect ratio while fitting in 1280x1280 box is standard
+            img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            
+            buf = io.BytesIO()
+            # PNG is preferred for Computer Use to avoid JPEG artifacts interfering with coordinates
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            log.warning("cu.capture_optimize_failed", error=str(exc))
+            return None
+
+    async def _cu_generate_content(self, client, *, model: str, contents, config):
+        """Execute Computer Use generation via sync SDK call in an executor.
+
+        In practice, Vertex async Computer Use calls may intermittently return
+        500 INTERNAL in some environments while the sync path succeeds.
+        Running the sync call in a worker thread preserves async flow and
+        improves reliability.
+        """
+
+        loop = asyncio.get_running_loop()
+
+        def _run_sync_call():
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+
+        return await loop.run_in_executor(None, _run_sync_call)
+
+    @staticmethod
+    def _is_retryable_cu_error(error_text: str) -> bool:
+        """Return True for transient server-side CU failures worth retrying."""
+        text = error_text.upper()
+        return (
+            "500" in text
+            or "503" in text
+            or "INTERNAL" in text
+            or "OVERLOAD" in text
+        )
+
+    async def _diagnose_cu_project_access(self, client) -> str | None:
+        """Run a lightweight probe to surface actionable Vertex CU enablement issues."""
+        gcp_project = _get_env_value("GOOGLE_CLOUD_PROJECT")
+        if not gcp_project:
+            return None
+
+        try:
+            from google.genai import types as _gtypes
+            from PIL import Image
+            import io
+
+            # Minimal probe image to avoid depending on live screen capture path.
+            img = Image.new("RGB", (64, 64), (255, 255, 255))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            probe_png = buf.getvalue()
+
+            probe_contents = [
+                _gtypes.Content(
+                    role="user",
+                    parts=[
+                        _gtypes.Part.from_bytes(data=probe_png, mime_type="image/png"),
+                        _gtypes.Part(text="Click the center"),
+                    ],
+                )
+            ]
+            probe_config = _gtypes.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=32,
+                tools=[
+                    _gtypes.Tool(
+                        computer_use=_gtypes.ComputerUse(
+                            environment=_gtypes.Environment.ENVIRONMENT_BROWSER,
+                        ),
+                    ),
+                ],
+            )
+
+            await self._cu_generate_content(
+                client,
+                model="gemini-2.5-flash",
+                contents=probe_contents,
+                config=probe_config,
+            )
+            return None
+        except Exception as exc:
+            msg = str(exc)
+            upper = msg.upper()
+            if "UI ACTIONS ARE NOT ENABLED FOR THIS PROJECT" in upper:
+                return (
+                    "Computer Use is not enabled for this Vertex AI project. "
+                    "Enable UI actions for project "
+                    f"'{gcp_project}' or switch GOOGLE_CLOUD_PROJECT to a project "
+                    "with Computer Use access."
+                )
+            if "NOT_FOUND" in upper and "COMPUTER-USE" in upper:
+                return (
+                    "This Vertex AI project does not have access to the configured "
+                    "Computer Use model. Verify COMPUTER_USE_MODEL and project access."
+                )
+            return None
+
+    async def confirm_click_target_single_snapshot(self, target: str) -> dict[str, Any]:
+        """Confirm click coordinates with one screenshot + one CU model call.
+
+        This is intentionally a single-turn confirmation helper for fast,
+        low-latency coordinate grounding in real-time UI navigation loops.
+        """
+        def _extract_xy_from_text(raw_text: str) -> tuple[int, int] | None:
+            text = (raw_text or "").strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                match = re.search(r"\{[\s\S]*\}", text)
+                if not match:
+                    return None
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    return None
+
+            if not isinstance(parsed, dict):
+                return None
+            x = parsed.get("x")
+            y = parsed.get("y")
+            if x is None or y is None:
+                return None
+            try:
+                return int(x), int(y)
+            except (TypeError, ValueError):
+                return None
+
+        async def _capture_full_res_jpeg_base64() -> tuple[bytes, str] | None:
+            def _capture_sync() -> tuple[bytes, str] | None:
+                import io
+                import mss
+                from PIL import Image
+
+                with mss.mss() as sct:
+                    monitor = sct.monitors[1]
+                    shot = sct.grab(monitor)
+                    img = Image.frombytes("RGB", shot.size, shot.rgb)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=95)
+                    jpeg_bytes = buf.getvalue()
+                    return jpeg_bytes, base64.b64encode(jpeg_bytes).decode("ascii")
+
+            return await asyncio.to_thread(_capture_sync)
+
+        def _extract_response_text(response: Any) -> str:
+            text = getattr(response, "text", "") or ""
+            if text:
+                return text
+            candidates = getattr(response, "candidates", None) or []
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                if content is None:
+                    continue
+                for part in getattr(content, "parts", None) or []:
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        return str(part_text)
+            return ""
+
+        if self._screen_capture is None:
+            return {"success": False, "error": "Screen capture not attached"}
+
+        captured = await _capture_full_res_jpeg_base64()
+        if not captured:
+            return {"success": False, "error": "Screenshot failed"}
+        screenshot_jpeg, screenshot_b64 = captured
+
+        # Keep latest successful capture payload available for diagnostics.
+        self._last_snapshot_b64 = screenshot_b64
+
+        client = self._get_computer_use_client()
+        if client is None:
+            return {
+                "success": False,
+                "error": (
+                    "Neither GOOGLE_CLOUD_PROJECT (for Vertex AI) nor "
+                    "GEMINI_API_KEY is set. Computer Use model requires "
+                    "Vertex AI or paid billing."
+                ),
+            }
+
+        model_error = ""
+        model_timed_out = False
+
+        try:
+            from google.genai import types as _gtypes
+
+            prompt = (
+                f"Identify the exact pixel coordinates (x, y) of this element on screen: {target}. "
+                "Respond only with JSON: {x: int, y: int}."
+            )
+            contents = [
+                _gtypes.Content(
+                    role="user",
+                    parts=[
+                        _gtypes.Part.from_bytes(data=screenshot_jpeg, mime_type="image/jpeg"),
+                        _gtypes.Part(text=prompt),
+                    ],
+                )
+            ]
+
+            log.info("cu.single_snapshot", stage="model_called", target=target)
+            response = None
+            try:
+                async with asyncio.timeout(3.5):
+                    response = await self._cu_generate_content(
+                        client,
+                        model="gemini-2.5-computer-use-preview-10-2025",
+                        contents=contents,
+                        config=_gtypes.GenerateContentConfig(
+                            temperature=0.0,
+                            max_output_tokens=128,
+                        ),
+                    )
+            except TimeoutError:
+                model_timed_out = True
+                model_error = "Model call timed out"
+                log.warning("cu.single_snapshot", stage="model_timeout", target=target, timeout_seconds=3.5)
+            except Exception as exc:
+                model_error = str(exc)
+                log.warning("cu.single_snapshot", stage="model_failed", target=target, error=model_error)
+
+            if response is not None:
+                xy = _extract_xy_from_text(_extract_response_text(response))
+                if xy is not None:
+                    x, y = xy
+                    self._last_confirmed_click_xy = (x, y)
+                    log.info("cu.single_snapshot", stage="model_success", target=target, x=x, y=y)
+                    return {
+                        "success": True,
+                        "x": x,
+                        "y": y,
+                        "method": "computer_use",
+                    }
+                model_error = "Model returned no coordinates"
+                log.warning("cu.single_snapshot", stage="model_failed", target=target, error=model_error)
+        except Exception as exc:
+            model_error = str(exc)
+            log.warning("cu.single_snapshot", stage="model_failed", target=target, error=model_error)
+
+        # Fallback 1: image matching via pyautogui.locateCenterOnScreen(target_image)
+        log.info("cu.single_snapshot", stage="locate_fallback", target=target)
+        try:
+            import pyautogui
+
+            located = await asyncio.to_thread(pyautogui.locateCenterOnScreen, target)
+            if located is not None:
+                x = int(located.x)
+                y = int(located.y)
+                self._last_confirmed_click_xy = (x, y)
+                return {
+                    "success": True,
+                    "x": x,
+                    "y": y,
+                    "method": "pyautogui_locate",
+                }
+        except Exception as exc:
+            if not model_error:
+                model_error = str(exc)
+
+        # Fallback 2: direct click at last known coordinates.
+        log.info("cu.single_snapshot", stage="direct_fallback", target=target)
+        try:
+            import pyautogui
+
+            last_xy = self._last_confirmed_click_xy
+            if last_xy is None and self._screen_navigator is not None:
+                for entry in reversed(self._screen_navigator.action_log):
+                    if entry.real_coords is not None:
+                        last_xy = (int(entry.real_coords[0]), int(entry.real_coords[1]))
+                        break
+            if last_xy is None:
+                pos = await asyncio.to_thread(pyautogui.position)
+                last_xy = (int(pos.x), int(pos.y))
+
+            await asyncio.to_thread(pyautogui.click, last_xy[0], last_xy[1])
+            self._last_confirmed_click_xy = last_xy
+            return {
+                "success": True,
+                "x": last_xy[0],
+                "y": last_xy[1],
+                "method": "pyautogui_fallback",
+                "model_error": model_error,
+                "model_timeout": model_timed_out,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"All click confirmation methods failed: {exc}",
+                "model_error": model_error,
+                "model_timeout": model_timed_out,
+            }
 
     async def _computer_use_ground(
         self, description: str,
@@ -1501,13 +1877,15 @@ class ToolExecutor:
         if self._screen_capture is None:
             return {"success": False, "error": "Screen capture not attached"}
 
-        # Take initial screenshot
-        try:
-            screenshot = await self._screen_capture.capture_full_resolution_async()
-        except Exception as exc:
-            return {"success": False, "error": f"Screenshot failed: {exc}"}
+        # Take initial screenshot (optimized PNG)
+        screenshot_mime = "image/png"
+        screenshot = await self._capture_optimized_for_cu()
         if screenshot is None:
-            return {"success": False, "error": "Screenshot returned None"}
+            # Fallback to raw capture if optimization fails
+            screenshot = await self._screen_capture.capture_full_resolution_async()
+            if screenshot is None:
+                return {"success": False, "error": "Screenshot failed"}
+            screenshot_mime = "image/jpeg"
 
         client = self._get_computer_use_client()
         if client is None:
@@ -1523,44 +1901,30 @@ class ToolExecutor:
         try:
             from google.genai import types as _gtypes
 
-            # Resolve CU model robustly across run modes:
-            # - package import (rio.local.config)
-            # - local import (config.py beside main runtime)
-            # - env/default fallback
+            # Resolve CU model robustly
             try:
-                from rio.local.config import get_model as _get_model  # type: ignore
-            except Exception:
-                try:
-                    from config import get_model as _get_model  # type: ignore
-                except Exception:
-                    _get_model = None
-
-            if callable(_get_model):
+                from rio.local.config import get_model as _get_model
                 cu_model = _get_model("computer_use")
-            else:
-                cu_model = os.environ.get(
-                    "COMPUTER_USE_MODEL",
-                    os.environ.get("CU_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
-                )
+            except Exception:
+                cu_model = os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025")
 
             # Build initial contents with screenshot + task description
+            # Build initial turn: Image then Text
             contents: list = [
                 _gtypes.Content(role="user", parts=[
+                    _gtypes.Part.from_bytes(data=screenshot, mime_type=screenshot_mime),
                     _gtypes.Part(text=(
                         f"Find and click on: {description}\n"
-                        f"If you can see the element, use click_at to click it."
+                        "Use the click_at tool to click the center of the element. "
+                        "If you need to scroll first, use screen_scroll."
                     )),
-                    _gtypes.Part.from_bytes(
-                        data=screenshot, mime_type="image/jpeg",
-                    ),
                 ])
             ]
 
-            # Official Computer Use config (matches Google reference impl)
+            # Official Computer Use config
             config = _gtypes.GenerateContentConfig(
-                temperature=1.0,
-                top_p=0.95,
-                max_output_tokens=8192,
+                temperature=0.0,
+                max_output_tokens=1024,
                 tools=[
                     _gtypes.Tool(
                         computer_use=_gtypes.ComputerUse(
@@ -1570,36 +1934,71 @@ class ToolExecutor:
                 ],
             )
 
+            # Pillar 2: Robust Model Fallback Chain
+            cu_model_candidates = [
+                os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
+                "gemini-3-flash-preview",
+                "gemini-2.0-flash-exp",
+            ]
+
             first_click = None
-            max_turns = 3  # Safety limit — most clicks resolve in 1 turn
+            max_turns = 5 # Increased for complex multi-step grounding
 
             for turn in range(max_turns):
-                # --- Call model with retry for transient 500s ---
+                # --- Call model with robust retry and fallback ---
                 response = None
                 last_exc = None
-                for attempt in range(3):
-                    try:
-                        response = await client.aio.models.generate_content(
-                            model=cu_model,
-                            contents=contents,
-                            config=config,
-                        )
+                max_retries = 3
+                
+                # Attempt with candidate models if we hit a project access error
+                for cu_model in cu_model_candidates:
+                    model_access_denied = False
+                    for attempt in range(max_retries):
+                        try:
+                            response = await self._cu_generate_content(
+                                client,
+                                model=cu_model,
+                                contents=contents,
+                                config=config,
+                            )
+                            break
+                        except Exception as retry_exc:
+                            last_exc = retry_exc
+                            err_text = str(retry_exc).upper()
+                            
+                            # Check for project access error specifically
+                            if "UI ACTIONS ARE NOT ENABLED FOR THIS PROJECT" in err_text or "PERMISSION_DENIED" in err_text:
+                                log.warning("cu.model_access_denied", model=cu_model)
+                                model_access_denied = True
+                                break # try next model in candidate list
+                                
+                            if self._is_retryable_cu_error(err_text):
+                                wait = (attempt + 1) * 1.0
+                                log.warning("cu.retry", attempt=attempt + 1, wait=wait, error=err_text[:200])
+                                await asyncio.sleep(wait)
+                                continue
+                            raise
+                    
+                    if response: # Success with this model
                         break
-                    except Exception as retry_exc:
-                        last_exc = retry_exc
-                        err_str = str(retry_exc)
-                        if "500" in err_str or "503" in err_str or "INTERNAL" in err_str:
-                            wait = (attempt + 1) * 0.5
-                            log.warning("cu.retry", attempt=attempt + 1, wait=wait, error=err_str[:200])
-                            await asyncio.sleep(wait)
-                            continue
-                        raise
-                else:
-                    log.error("cu.ground_error", description=description, model=cu_model, error=str(last_exc))
+                    if not model_access_denied: # Terminal error, don't try other models
+                        break
+                
+                if not response:
+                    diagnosed = await self._diagnose_cu_project_access(client)
+                    if diagnosed:
+                        log.error("cu.project_access_error", description=description, diagnosis=diagnosed)
+                        return {"success": False, "error": f"Computer Use unavailable: {diagnosed}"}
+                    
+                    log.error("cu.ground_error", description=description, error=str(last_exc))
                     return {
                         "success": False,
-                        "error": f"Computer Use model error after 3 attempts ({cu_model}): {last_exc}",
+                        "error": (
+                            f"Computer Use model error ({cu_model}): {last_exc}. "
+                            "API might be overloaded. Try screen_hotkey fallback."
+                        ),
                     }
+
 
                 # --- Parse model response ---
                 candidate = response.candidates[0] if response.candidates else None
@@ -1633,8 +2032,8 @@ class ToolExecutor:
                     }
 
                 # --- Execute actions and capture feedback ---
-                fn_response_parts = []
                 any_action_executed = False
+                fn_responses = []
                 for fc in function_calls:
                     log.info("cu.action", name=fc.name, args=fc.args)
 
@@ -1649,42 +2048,34 @@ class ToolExecutor:
                             "y": self._denormalize_y(ny),
                         }
 
-                    # Execute the model-requested UI action so follow-up model
-                    # reasoning sees true post-action state.
+                    # Execute action
                     action_result = await self._execute_cu_action(fc.name, dict(fc.args or {}))
                     any_action_executed = True
+                    
+                    # Capture screenshot for feedback
+                    feedback_screenshot = await self._capture_png_for_cu() or screenshot
+                    
+                    # Build professional FunctionResponse following guide
+                    resp_payload = {"success": action_result.get("success", True)}
+                    if action_result.get("safety_acknowledged"):
+                        resp_payload["safety_acknowledgement"] = True
+                    
+                    fn_responses.append(_gtypes.Part(
+                        function_response=_gtypes.FunctionResponse(
+                            name=fc.name,
+                            response=resp_payload,
+                            parts=[
+                                _gtypes.Part.from_bytes(
+                                    data=feedback_screenshot, 
+                                    mime_type="image/png"
+                                )
+                            ]
+                        )
+                    ))
 
-                    # Build FunctionResponse with screenshot blob
-                    # (matches official Google pattern)
-                    fn_response_parts.append(
-                        _gtypes.Part(
-                            function_response=_gtypes.FunctionResponse(
-                                name=fc.name,
-                                response=action_result,
-                            ),
-                        ),
-                    )
-
-                # Capture a fresh screenshot AFTER executing action(s).
-                # If no action was executed (rare), keep the previous frame.
-                if any_action_executed:
-                    try:
-                        new_screenshot = await self._screen_capture.capture_full_resolution_async()
-                    except Exception:
-                        new_screenshot = screenshot
-                else:
-                    new_screenshot = screenshot
-
-                # Append function responses + new screenshot to history
-                # (Separate screenshot part — more reliable than FunctionResponseBlob
-                #  which may not be supported by all model versions)
-                feedback_parts = fn_response_parts + [
-                    _gtypes.Part.from_bytes(
-                        data=new_screenshot if new_screenshot else screenshot,
-                        mime_type="image/jpeg",
-                    ),
-                ]
-                contents.append(_gtypes.Content(role="user", parts=feedback_parts))
+                # Append function responses to history
+                if fn_responses:
+                    contents.append(_gtypes.Content(role="user", parts=fn_responses))
 
                 # If we found a click target, we're done
                 if first_click:
@@ -1719,33 +2110,71 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Visual-grounding click using the official Computer Use predefined-actions API.
 
-        Describe the element you want to click in natural language
-        (e.g. 'the Save button', 'search input field').
-        Uses gemini-computer-use-preview with the official
-        types.Tool(computer_use=ComputerUse(...)) API and 0-1000 normalized
-        coordinates for reliable element detection.
+        Describe the element you want to click in natural language.
+        Example targets:
+          - "the blue Login button in the top right"
+          - "the search input field next to the logo"
+          - "the red X icon to close the window"
+
+        If this tool fails or returns an error, DO NOT retry blindly. Instead,
+        use alternative tools like `screen_hotkey` (e.g., 'tab' or 'enter') to navigate.
         """
         if err := self._nav_or_error():
             return err
 
-        log.info("tool.smart_click", target=target, action=action)
+        log.info("tool.smart_click.background_start", target=target, action=action)
 
-        ground = await self._computer_use_ground(target)
-        if not ground.get("success"):
-            return ground
+        async def _background_grounding():
+            try:
+                ground = await self._computer_use_ground(target)
+                if not ground.get("success"):
+                    log.error("tool.smart_click.grounding_failed", error=ground.get("error"))
+                    if hasattr(self, "_ws_send_json") and self._ws_send_json:
+                        await self._ws_send_json({
+                            "type": "tool_event_update",
+                            "name": "smart_click",
+                            "result": ground
+                        })
+                    return
 
-        x, y = ground["x"], ground["y"]
-        button = "right" if action == "right_click" else "left"
-        n_clicks = 2 if action == "double_click" else int(clicks)
+                x, y = ground["x"], ground["y"]
+                button = "right" if action == "right_click" else "left"
+                n_clicks = 2 if action == "double_click" else int(clicks)
 
-        # Coordinates are already denormalized to real screen pixels
-        result = await self._screen_navigator.click_absolute(x, y, button=button, clicks=n_clicks)
-        result["grounded_by"] = "computer_use_official_api"
-        result["found_at"] = {"x": x, "y": y}
-        if "normalized" in ground:
-            result["normalized_coords"] = ground["normalized"]
-        result["target"] = target
-        return result
+                # Coordinates are already denormalized to real screen pixels
+                result = await self._screen_navigator.click_absolute(x, y, button=button, clicks=n_clicks)
+                result["grounded_by"] = "computer_use_official_api"
+                result["found_at"] = {"x": x, "y": y}
+                if "normalized" in ground:
+                    result["normalized_coords"] = ground["normalized"]
+                result["target"] = target
+                
+                log.info("tool.smart_click.background_complete", target=target, success=result.get("success"))
+                if hasattr(self, "_ws_send_json") and self._ws_send_json:
+                    await self._ws_send_json({
+                        "type": "tool_event_update",
+                        "name": "smart_click",
+                        "result": result
+                    })
+            except Exception as e:
+                log.exception("tool.smart_click.background_error", error=str(e))
+                if hasattr(self, "_ws_send_json") and self._ws_send_json:
+                    await self._ws_send_json({
+                        "type": "tool_event_update",
+                        "name": "smart_click",
+                        "result": {"success": False, "error": str(e)}
+                    })
+
+        # Fire and forget
+        import asyncio
+        asyncio.create_task(_background_grounding())
+
+        return {
+            "success": True,
+            "status": "grounding_started", 
+            "estimated_wait": "4s",
+            "message": "Vision grounding started in background. The click will happen shortly. Please wait a moment before verifying."
+        }
 
     # ------------------------------------------------------------------
     # GenMedia — Imagen 3 + Veo 2 (proxied through CreativeAgent)

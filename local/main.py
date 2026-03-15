@@ -75,6 +75,11 @@ except ImportError:
     ScreenNavigator = None
 
 try:
+    from ui_navigator import UINavigator
+except ImportError:
+    UINavigator = None
+
+try:
     from struggle_detector import StruggleDetector
 except ImportError:
     StruggleDetector = None
@@ -88,6 +93,11 @@ try:
     from ocr import OCREngine
 except ImportError:
     OCREngine = None
+
+try:
+    from google import genai as _genai
+except ImportError:
+    _genai = None
 
 try:
     from wake_word import WakeWordDetector, WakeWordState
@@ -453,26 +463,33 @@ async def _run_autonomous_task(
 # Tool names that modify the filesystem / execute commands and need approval
 _DANGEROUS_TOOLS = frozenset({"write_file", "patch_file", "run_command"})
 
-_CONFIRM_TIMEOUT = 15  # seconds to wait before auto-declining
+_CONFIRM_TIMEOUT = float(os.environ.get("RIO_CONFIRM_TIMEOUT_SECONDS", "0") or 0)
 
 
 async def _confirm_tool_call(tool_name: str, tool_args: dict) -> bool:
     """Prompt user for confirmation before executing a dangerous tool.
 
     Returns True if approved, False otherwise.
-    Auto-**approves** after ``_CONFIRM_TIMEOUT`` seconds of silence so
-    tool chains aren't stalled while the user is away or in voice mode.
+
+    If ``RIO_CONFIRM_TIMEOUT_SECONDS`` is <= 0 (default), waits indefinitely
+    for explicit user approval/denial.
     """
     summary = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
     print(f"\n    Rio wants to run: {tool_name}({summary})")
-    print(f"  Approve? [Y/n] (auto-approve in {_CONFIRM_TIMEOUT}s): ", end="", flush=True)
+    if _CONFIRM_TIMEOUT <= 0:
+        print("  Approve? [Y/n] (waiting for your response): ", end="", flush=True)
+    else:
+        print(f"  Approve? [Y/n] (auto-approve in {int(_CONFIRM_TIMEOUT)}s): ", end="", flush=True)
 
     loop = asyncio.get_running_loop()
     try:
-        answer = await asyncio.wait_for(
-            loop.run_in_executor(None, sys.stdin.readline),
-            timeout=_CONFIRM_TIMEOUT,
-        )
+        if _CONFIRM_TIMEOUT <= 0:
+            answer = await loop.run_in_executor(None, sys.stdin.readline)
+        else:
+            answer = await asyncio.wait_for(
+                loop.run_in_executor(None, sys.stdin.readline),
+                timeout=_CONFIRM_TIMEOUT,
+            )
         return answer.strip().lower() not in ("n", "no")
     except asyncio.TimeoutError:
         print("  (timed out — auto-approved)")
@@ -1151,6 +1168,33 @@ async def screen_capture_loop(
             await asyncio.sleep(1)
 
 
+async def ui_navigator_loop(
+    screen: "ScreenCapture",
+    autonomous_mode: asyncio.Event,
+    ui_navigator,
+    screen_navigator=None,
+) -> None:
+    """Feed the UI Navigator with continuous 10fps JPEG frames in autonomous mode."""
+    interval = 1.0 / max(0.1, float(getattr(ui_navigator, "fps", 10.0)))
+
+    while True:
+        await autonomous_mode.wait()
+        tick_start = time.monotonic()
+        try:
+            jpeg = await screen.capture_async(force=True)
+            if jpeg is not None:
+                if screen_navigator is not None:
+                    cr = screen.get_last_capture_result()
+                    if cr is not None:
+                        screen_navigator.update_monitor_offset(cr.monitor_left, cr.monitor_top)
+                await ui_navigator.enqueue_frame(jpeg)
+        except Exception:
+            log.exception("ui_navigator.frame_error")
+
+        elapsed = time.monotonic() - tick_start
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+
 # ---------------------------------------------------------------------------
 # Screenshot hotkey loop — captures on F3 press
 # ---------------------------------------------------------------------------
@@ -1666,6 +1710,7 @@ async def _shutdown_runtime(
     orchestrator=None,
     browser_agent=None,
     session_memory=None,
+    ui_navigator=None,
 ) -> None:
     """Stop background work and persist session state."""
     log.info("rio.shutting_down", goodbye=send_goodbye)
@@ -1720,6 +1765,12 @@ async def _shutdown_runtime(
         capture.stop()
     if playback is not None:
         playback.stop()
+
+    if ui_navigator is not None:
+        try:
+            await ui_navigator.stop()
+        except Exception:
+            log.debug("ui_navigator.stop_failed")
 
     task_list = [task for task in tasks if task is not asyncio.current_task()]
 
@@ -2043,6 +2094,27 @@ async def main() -> None:
     elif struggle_detector is not None and config.struggle.demo_mode:
         print("  Demo trigger: unavailable (pynput not installed)")
 
+    # -- Initialize shared genai client (L4+) ---------------------------------
+    shared_genai_client = None
+    if _genai is not None:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+        if gcp_project:
+            try:
+                shared_genai_client = _genai.Client(
+                    vertexai=True,
+                    project=gcp_project,
+                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+                )
+            except Exception:
+                log.warning("genai.client_init_failed_vertex")
+        
+        if shared_genai_client is None and api_key:
+            try:
+                shared_genai_client = _genai.Client(api_key=api_key)
+            except Exception:
+                log.warning("genai.client_init_failed_api_key")
+
     # -- Initialize memory store (L5) ------------------------------------------
     memory_store = None
     if MemoryStore is not None:
@@ -2050,6 +2122,7 @@ async def main() -> None:
             memory_store = MemoryStore(
                 db_path=config.memory.db_path,
                 max_recall=config.memory.max_recall,
+                genai_client=shared_genai_client,
             )
             log.info("memory.ready", db_path=config.memory.db_path, entries=memory_store.count())
             print(f"  Memory: {memory_store.count()} entries in {config.memory.db_path}")
@@ -2156,6 +2229,42 @@ async def main() -> None:
         on_disconnect=lambda: log.warning("event.disconnected"),
     )
 
+    # -- Initialize UI Navigator (Live API at 10fps) -------------------------
+    ui_navigator = None
+    if (
+        UINavigator is not None
+        and tool_executor is not None
+        and screen_navigator is not None
+        and screen is not None
+        and config.ui_navigator.enabled
+    ):
+        try:
+            ui_navigator = UINavigator(
+                tool_executor=tool_executor,
+                screen_navigator=screen_navigator,
+                model=config.ui_navigator.model,
+                fps=config.ui_navigator.fps,
+                confidence_threshold=config.ui_navigator.confidence_threshold,
+                analyze_every_n_frames=config.ui_navigator.analyze_every_n_frames,
+                emit_action=lambda payload: client.send_json_resilient(payload),
+                genai_client=shared_genai_client,
+                click_tool=config.ui_navigator.click_tool,
+            )
+            await ui_navigator.start()
+            print(
+                "  UI Navigator: enabled "
+                f"({config.ui_navigator.fps:.1f}fps, model={config.ui_navigator.model}, "
+                f"threshold={config.ui_navigator.confidence_threshold:.2f})"
+            )
+        except Exception:
+            log.exception("ui_navigator.init_failed")
+            print("  UI Navigator: init failed")
+            ui_navigator = None
+    elif config.ui_navigator.enabled:
+        print("  UI Navigator: unavailable (missing screen/tools/navigator modules)")
+    else:
+        print("  UI Navigator: disabled (config)")
+
     # -- Initialize sub-agents & orchestrator (L4+) ----------------------------
     browser_agent = None
     if BrowserAgent is not None:
@@ -2201,6 +2310,7 @@ async def main() -> None:
     # -- Attach WebSocket sender to tool executor for auto-capture ---------
     if tool_executor is not None:
         tool_executor.set_ws_sender(client.send_binary)
+        tool_executor.set_ws_json_sender(client.send_json)
 
     # -- Attach WebSocket client to orchestrator --------------------------------
     if orchestrator is not None:
@@ -2335,6 +2445,17 @@ async def main() -> None:
             name="screen",
         ))
 
+    if screen is not None and ui_navigator is not None:
+        tasks.add(asyncio.create_task(
+            ui_navigator_loop(
+                screen,
+                autonomous_mode,
+                ui_navigator,
+                screen_navigator=screen_navigator,
+            ),
+            name="ui_navigator",
+        ))
+
     if screenshot_trigger is not None and screen is not None:
         tasks.add(asyncio.create_task(
             screenshot_hotkey_loop(client, screen, screenshot_trigger),
@@ -2383,22 +2504,28 @@ async def main() -> None:
             ))
 
     send_goodbye = False
+    send_startup_greeting = os.environ.get("RIO_SEND_STARTUP_GREETING", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     try:
         # -- Send startup greeting ---------------------------------------------
-        try:
-            await asyncio.wait_for(session_ready.wait(), timeout=30.0)
-            log.info("startup.session_ready")
-            # Brief pause to let the Live session fully stabilise
-            await asyncio.sleep(2.0)
-            await client.send_json({
-                "type": "text",
-                "content": "Hey Rio, say hello and introduce yourself briefly!",
-            })
-            log.info("startup.greeting_sent")
-        except asyncio.TimeoutError:
-            log.warning("startup.session_not_ready", note="Gemini session did not connect within 30s")
-        except ConnectionError:
-            log.warning("startup.greeting_failed", reason="not connected")
+        if send_startup_greeting:
+            try:
+                await asyncio.wait_for(session_ready.wait(), timeout=30.0)
+                log.info("startup.session_ready")
+                # Brief pause to let the Live session fully stabilise
+                await asyncio.sleep(2.0)
+                await client.send_json({
+                    "type": "text",
+                    "content": "Hey Rio, say hello and introduce yourself briefly!",
+                })
+                log.info("startup.greeting_sent")
+            except asyncio.TimeoutError:
+                log.warning("startup.session_not_ready", note="Gemini session did not connect within 30s")
+            except ConnectionError:
+                log.warning("startup.greeting_failed", reason="not connected")
+        else:
+            log.info("startup.greeting_skipped", reason="disabled_by_default")
 
         # Wait until any task exits, user presses Ctrl+C, or shutdown_event is set
         while not shutdown_event.is_set():
@@ -2429,6 +2556,7 @@ async def main() -> None:
             orchestrator=orchestrator,
             browser_agent=browser_agent,
             session_memory=session_memory,
+            ui_navigator=ui_navigator,
         ))
 
 

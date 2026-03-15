@@ -1,6 +1,6 @@
 """
 Rio Local — RAG Memory (L5)
-ChromaDB + Gemini Embeddings (text-embedding-004) for cross-session recall.
+ChromaDB + Gemini Embeddings for cross-session recall.
 
 Stores summaries of meaningful interactions and retrieves relevant past context
 on struggle triggers or user questions.
@@ -38,10 +38,11 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "memory")
-# Dimension change (384 -> 768) requires a new collection
-DEFAULT_COLLECTION = "rio_interactions_gemini"
-DEFAULT_MODEL_NAME = "text-embedding-004"
-MAX_RECALL = 5
+# Dimension change (768 -> 3072) requires a new v2 collection
+DEFAULT_COLLECTION = "rio_interactions_gemini_v2"
+# Gemini API-supported text embedding model (Gemini 2.0 era)
+DEFAULT_MODEL_NAME = os.environ.get("RIO_EMBEDDING_MODEL", "gemini-embedding-2-preview")
+MAX_RECALL = 8 # Higher recall possible with 3072 dims
 
 # Minimum content length to store (skip trivial exchanges)
 MIN_CONTENT_LENGTH = 20
@@ -85,7 +86,7 @@ class EntityExtractor:
 class MemoryStore:
     """
     Persistent RAG memory using ChromaDB for vector storage and
-    Gemini text-embedding-004 for embeddings.
+    Gemini embedding models for embeddings.
     """
 
     def __init__(
@@ -103,6 +104,13 @@ class MemoryStore:
         self.collection_name = collection_name
         self.max_recall = max_recall
         self._model_name = model_name
+        # Fallbacks for accounts/regions where a model is unavailable.
+        # Keep order deterministic and prefer stable over preview.
+        self._embedding_model_fallbacks = [
+            "gemini-embedding-2-preview",
+            "text-embedding-004",
+            "gemini-embedding-001",
+        ]
         self._client_ref = genai_client
         self._extractor = EntityExtractor()
 
@@ -138,27 +146,59 @@ class MemoryStore:
 
     # ── Embedding logic (Gemini API) ───────────────────────────────
 
-    def _get_embedding(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-        """Call Gemini API to generate embeddings for a single text chunk."""
+    def _get_embedding(self, contents: Any, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+        """Call Gemini API to generate embeddings for multimodal contents."""
         if not self._client_ref:
             # Fallback to dummy zero vector if no client (should not happen in prod)
             log.warning("memory.no_client_for_embedding")
-            return [0.0] * 768
+            return [0.0] * 3072
 
-        try:
-            # text-embedding-004 supports task_type
-            result = self._client_ref.models.embed_content(
-                model=self._model_name,
-                contents=text,
-                config={
-                    "task_type": task_type,
-                    "output_dimensionality": 768
-                }
-            )
-            return result.embeddings[0].values
-        except Exception as exc:
-            log.error("memory.embedding_failed", error=str(exc))
-            return [0.0] * 768
+        candidate_models: list[str] = [self._model_name]
+        for fallback in self._embedding_model_fallbacks:
+            if fallback not in candidate_models:
+                candidate_models.append(fallback)
+
+        last_exc: Exception | None = None
+        for idx, model_name in enumerate(candidate_models):
+            try:
+                result = self._client_ref.models.embed_content(
+                    model=model_name,
+                    contents=contents,
+                    config={
+                        "task_type": task_type,
+                        "output_dimensionality": 3072,
+                    },
+                )
+                # Persist the working model to avoid repeated failed attempts.
+                if model_name != self._model_name:
+                    prev = self._model_name
+                    self._model_name = model_name
+                    log.warning(
+                        "memory.embedding_model_switched",
+                        from_model=prev,
+                        to_model=model_name,
+                    )
+                return result.embeddings[0].values
+            except Exception as exc:
+                last_exc = exc
+                err = str(exc)
+                retriable = (
+                    "NOT_FOUND" in err
+                    or "not found" in err.lower()
+                    or "INVALID_ARGUMENT" in err
+                    or "not supported" in err.lower()
+                )
+                log.error(
+                    "memory.embedding_attempt_failed",
+                    model=model_name,
+                    attempt=idx + 1,
+                    error=err,
+                )
+                if not retriable:
+                    break
+
+        log.error("memory.embedding_failed", error=str(last_exc) if last_exc else "unknown")
+        return [0.0] * 768
 
     # ── Store ─────────────────────────────────────────────────────
 
@@ -167,9 +207,10 @@ class MemoryStore:
         content: str,
         entry_type: str = "interaction",
         metadata: Optional[dict] = None,
+        media_parts: Optional[list[Any]] = None,
     ) -> Optional[str]:
         """
-        Embed and store a memory entry.
+        Embed and store a memory entry, optionally with multimodal media parts.
         """
         if not content or len(content.strip()) < MIN_CONTENT_LENGTH:
             log.debug("memory.skip_short", length=len(content) if content else 0)
@@ -192,6 +233,7 @@ class MemoryStore:
             "timestamp": now,
             "content_hash": content_hash,
             "entities": entities_str,
+            "has_media": bool(media_parts),
         }
         if metadata:
             for k, v in metadata.items():
@@ -212,10 +254,16 @@ class MemoryStore:
         except Exception:
             pass
 
-        # Embed using RETRIEVAL_DOCUMENT task type
-        embedding = self._get_embedding(content, task_type="RETRIEVAL_DOCUMENT")
+        # Prepare multimodal contents for embedding
+        embed_contents = [content]
+        if media_parts:
+            embed_contents.extend(media_parts)
 
-        # Store in ChromaDB
+        # Embed using RETRIEVAL_DOCUMENT task type
+        embedding = self._get_embedding(embed_contents, task_type="RETRIEVAL_DOCUMENT")
+
+        # Store in ChromaDB (only the text content is stored as the document for hybrid search,
+        # but the embedding represents the multimodal combination)
         self._collection.add(
             ids=[entry_id],
             embeddings=[embedding],
@@ -233,7 +281,7 @@ class MemoryStore:
         except Exception:
             pass
 
-        log.info("memory.stored", id=entry_id, type=entry_type, length=len(content))
+        log.info("memory.stored", id=entry_id, type=entry_type, length=len(content), has_media=bool(media_parts))
         return entry_id
 
     # ── Retrieve ──────────────────────────────────────────────────

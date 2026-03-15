@@ -150,8 +150,8 @@ def _build_base_instruction() -> str:
         "you MUST execute it autonomously to completion. Do NOT stop after one action "
         "and ask the user what to do next. Complete the ENTIRE task yourself.\n\n"
         "THE LOOP — follow this for EVERY computer task:\n"
-        "1. PLAN: THINK and state your plan clearly in text BEFORE calling any tools. "
-        "Explain exactly what steps you will take to achieve the goal.\n"
+        "1. PLAN: You MUST wrap all your internal reasoning, planning, and strategy inside `<thinking>` and `</thinking>` tags BEFORE calling any tools.\n"
+        "   Example: `<thinking>I need to open Edge. I will call open_application.</thinking>`\n"
         "2. CAPTURE: If you don't have a recent screenshot, call capture_screen first.\n"
         "3. ANALYZE: Look at the screenshot. Identify what needs to be clicked/typed/scrolled.\n"
         "4. ACT: Call ONE screen action tool. Only ONE per turn.\n"
@@ -267,10 +267,10 @@ RIO_TOOL_DECLARATIONS = [
                     "Use this to examine code, config files, logs, or any text file."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "path": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Absolute or relative path to the file to read",
                         },
                     },
@@ -285,14 +285,14 @@ RIO_TOOL_DECLARATIONS = [
                     "Use this to create new files or completely rewrite existing ones."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "path": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Absolute or relative path to the file to write",
                         },
                         "content": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The full content to write to the file",
                         },
                     },
@@ -307,18 +307,18 @@ RIO_TOOL_DECLARATIONS = [
                     "created before patching. old_text must match exactly."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "path": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Path to the file to patch",
                         },
                         "old_text": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The exact text to find (must match exactly)",
                         },
                         "new_text": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The replacement text",
                         },
                     },
@@ -333,10 +333,10 @@ RIO_TOOL_DECLARATIONS = [
                     "Use this for running tests, builds, git operations, etc."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "command": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The shell command to execute",
                         },
                     },
@@ -354,7 +354,7 @@ RIO_TOOL_DECLARATIONS = [
                     "context window."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {},
                     "required": [],
                 },
@@ -368,30 +368,30 @@ RIO_TOOL_DECLARATIONS = [
                     "needs follow-up. The ticket is saved locally for tracking."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "title": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Brief ticket title summarizing the issue",
                         },
                         "category": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Issue category: bug, feature, how-to, billing, or account",
                         },
                         "priority": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Priority level: low, medium, high, or critical",
                         },
                         "description": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Full description with context, steps to reproduce, and current state",
                         },
                         "customer_id": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Optional customer identifier for tracking",
                         },
                         "tags": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Comma-separated tags for categorization",
                         },
                     },
@@ -406,26 +406,26 @@ RIO_TOOL_DECLARATIONS = [
                     "resolved tickets, or log follow-up actions."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "ticket_id": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The ticket ID to update (e.g., 'TKT-abc123')",
                         },
                         "status": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "New status: open, in-progress, escalated, resolved, closed",
                         },
                         "priority": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "New priority: low, medium, high, critical",
                         },
                         "escalation_tier": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Escalation tier: tier_0, tier_1, tier_2, tier_3",
                         },
                         "notes": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Notes about the update (reason for escalation, resolution details, etc.)",
                         },
                     },
@@ -443,26 +443,26 @@ RIO_TOOL_DECLARATIONS = [
                     "learning."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "topic": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The subject topic (e.g., 'quadratic equations', 'python loops', 'cell biology')",
                         },
                         "difficulty": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Difficulty level: novice, intermediate, or advanced",
                         },
                         "num_questions": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Number of questions to generate (default: 5)",
                         },
                         "question_types": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Comma-separated types: multiple-choice, short-answer, problem-solving, true-false",
                         },
                         "focus_areas": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Comma-separated subtopics to focus on (from student's weak areas)",
                         },
                     },
@@ -477,30 +477,30 @@ RIO_TOOL_DECLARATIONS = [
                     "generate progress reports, or update study plans."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "action": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Action: record (save progress), report (generate report), update (modify plan), or status (current state)",
                         },
                         "subject": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Subject area (e.g., 'math', 'programming', 'science')",
                         },
                         "topic": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Specific topic within the subject",
                         },
                         "score": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Quiz score or performance metric (e.g., '4/5', '80%')",
                         },
                         "notes": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Additional context (struggles, breakthroughs, patterns noticed)",
                         },
                         "student_id": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Optional student identifier for multi-student tracking",
                         },
                     },
@@ -516,18 +516,18 @@ RIO_TOOL_DECLARATIONS = [
                     "or 'explain' or when they're struggling with fundamentals."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "concept": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The concept to explain (e.g., 'recursion', 'photosynthesis', 'derivatives')",
                         },
                         "level": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Student level: novice, intermediate, or advanced",
                         },
                         "context": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "What the student is working on that prompted this explanation",
                         },
                     },
@@ -543,22 +543,22 @@ RIO_TOOL_DECLARATIONS = [
                     "automatically maps them to real screen coordinates."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "x": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "X coordinate in the screenshot image",
                         },
                         "y": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Y coordinate in the screenshot image",
                         },
                         "button": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Mouse button: left, right, or middle (default: left)",
                         },
                         "clicks": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Number of clicks: 1=single, 2=double (default: 1)",
                         },
                     },
@@ -573,14 +573,14 @@ RIO_TOOL_DECLARATIONS = [
                     "like Ctrl+S, use screen_hotkey instead."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "text": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "The text to type",
                         },
                         "interval": {
-                            "type": "NUMBER",
+                            "type": "number",
                             "description": "Delay between keystrokes in seconds (default: 0.02)",
                         },
                     },
@@ -594,18 +594,18 @@ RIO_TOOL_DECLARATIONS = [
                     "scroll up, negative scroll down. Position the cursor first."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "x": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "X coordinate in the screenshot image",
                         },
                         "y": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Y coordinate in the screenshot image",
                         },
                         "clicks": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Scroll amount: positive=up, negative=down (e.g. 3 or -5)",
                         },
                     },
@@ -620,10 +620,10 @@ RIO_TOOL_DECLARATIONS = [
                     "Examples: 'ctrl+s', 'alt+tab', 'ctrl+shift+t', 'enter', 'escape'."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "keys": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Key combination, e.g. 'ctrl+s', 'alt+f4', 'enter'",
                         },
                     },
@@ -637,14 +637,14 @@ RIO_TOOL_DECLARATIONS = [
                     "clicking. Useful for hovering over elements to reveal tooltips."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "x": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "X coordinate in the screenshot image",
                         },
                         "y": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Y coordinate in the screenshot image",
                         },
                     },
@@ -658,26 +658,26 @@ RIO_TOOL_DECLARATIONS = [
                     "Useful for selecting text, moving elements, or drawing."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "start_x": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Start X coordinate in the screenshot image",
                         },
                         "start_y": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "Start Y coordinate in the screenshot image",
                         },
                         "end_x": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "End X coordinate in the screenshot image",
                         },
                         "end_y": {
-                            "type": "INTEGER",
+                            "type": "integer",
                             "description": "End Y coordinate in the screenshot image",
                         },
                         "duration": {
-                            "type": "NUMBER",
+                            "type": "number",
                             "description": "Duration of drag in seconds (default: 0.5)",
                         },
                     },
@@ -691,10 +691,10 @@ RIO_TOOL_DECLARATIONS = [
                     "windows with their position and size."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "title": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Substring to search for in window titles",
                         },
                     },
@@ -708,10 +708,10 @@ RIO_TOOL_DECLARATIONS = [
                     "Restores minimized windows automatically."
                 ),
                 parameters={
-                    "type": "OBJECT",
+                    "type": "object",
                     "properties": {
                         "title": {
-                            "type": "STRING",
+                            "type": "string",
                             "description": "Substring to search for in window titles",
                         },
                     },

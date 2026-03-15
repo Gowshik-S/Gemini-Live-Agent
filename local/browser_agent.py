@@ -132,18 +132,46 @@ class BrowserAgent:
 
         try:
             self._client = genai.Client(api_key=self._api_key)
-            self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(headless=self._headless)
-            ctx = await self._browser.new_context(
-                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-            )
-            self._page = await ctx.new_page()
-            self._running = True
-            self._log.info("browser_agent.started",
-                           headless=self._headless,
-                           model=MODEL_COMPUTER_USE,
-                           viewport=f"{VIEWPORT_W}x{VIEWPORT_H}")
-            return True
+            
+            # Use shared logic from browser_tools to attach or launch with profile
+            try:
+                from browser_tools import get_browser_context
+                from config import RioConfig
+                cfg = RioConfig.load()
+                
+                pref_browser = cfg.browser.default_browser
+                if pref_browser == "auto":
+                    pref_browser = "chrome"
+                pref_profile = cfg.browser.default_profile
+                
+                self._context = await get_browser_context(browser=pref_browser, profile=pref_profile)
+                
+                # Get the first page or create one
+                pages = self._context.pages
+                if pages:
+                    self._page = pages[0]
+                else:
+                    self._page = await self._context.new_page()
+                
+                # Ensure viewport is set correctly for Computer Use model
+                await self._page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
+                
+                self._running = True
+                self._log.info("browser_agent.started",
+                               mode="shared_context",
+                               model=MODEL_COMPUTER_USE,
+                               viewport=f"{VIEWPORT_W}x{VIEWPORT_H}")
+                return True
+            except ImportError:
+                # Fallback to legacy fresh-launch if browser_tools missing (unlikely)
+                self._pw = await async_playwright().start()
+                self._browser = await self._pw.chromium.launch(headless=self._headless)
+                self._context = await self._browser.new_context(
+                    viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+                )
+                self._page = await self._context.new_page()
+                self._running = True
+                return True
         except Exception:
             self._log.exception("browser_agent.start_failed")
             await self.stop()
@@ -152,18 +180,10 @@ class BrowserAgent:
     async def stop(self) -> None:
         """Shut down browser and clean up resources."""
         self._running = False
-        if self._browser is not None:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._pw is not None:
-            try:
-                await self._pw.stop()
-            except Exception:
-                pass
-            self._pw = None
+        # Note: we don't close the shared _context here as it might be used by other tools
+        # Just clear local refs
+        self._browser = None
+        self._pw = None
         self._page = None
         self._client = None
         self._log.info("browser_agent.stopped")

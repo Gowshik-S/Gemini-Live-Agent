@@ -53,6 +53,17 @@ class VisionConfig:
     quality: int = 85
     resize_factor: float = 0.75
     default_mode: str = "on_demand"  # on_demand | autonomous
+    backend: str = "pyautogui"  # pyautogui | pywin32
+
+
+@dataclass
+class UINavigatorConfig:
+    enabled: bool = False
+    fps: float = 2.0
+    model: str = "gemini-2.5-flash-native-audio-preview-12-2025"
+    confidence_threshold: float = 0.85
+    analyze_every_n_frames: int = 3
+    click_tool: str = "smart_click"  # smart_click | screen_click
 
 
 @dataclass
@@ -114,6 +125,12 @@ class SkillsConfig:
     tutor: TutorConfig = field(default_factory=TutorConfig)
 
 
+@dataclass
+class BrowserConfig:
+    default_browser: str = "chrome"  # "chrome" | "edge" | "auto"
+    default_profile: str = "Default"  # "Default" or empty for shared Rio profile
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -128,11 +145,13 @@ class RioConfig:
     hotkeys: HotkeyConfig = field(default_factory=HotkeyConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    ui_navigator: UINavigatorConfig = field(default_factory=UINavigatorConfig)
     struggle: StruggleConfig = field(default_factory=StruggleConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    browser: BrowserConfig = field(default_factory=BrowserConfig)
 
     # ------------------------------------------------------------------
     # Factory: load from YAML
@@ -182,6 +201,7 @@ class RioConfig:
             hotkeys=_build(HotkeyConfig, d.get("hotkeys")),
             vad=_build(VadConfig, d.get("vad")),
             vision=_build(VisionConfig, d.get("vision")),
+            ui_navigator=_build(UINavigatorConfig, d.get("ui_navigator")),
             struggle=_build(StruggleConfig, d.get("struggle")),
             memory=_build(MemoryConfig, d.get("memory")),
             models=_build(ModelConfig, d.get("models")),
@@ -208,6 +228,18 @@ class RioConfig:
             raise ValueError(f"vision.quality must be in [1, 100], got: {self.vision.quality}")
         if not (0.0 < self.vision.resize_factor <= 1.0):
             raise ValueError(f"vision.resize_factor must be in (0, 1], got: {self.vision.resize_factor}")
+        if not (0.0 < self.ui_navigator.fps <= 30.0):
+            raise ValueError(f"ui_navigator.fps must be in (0, 30], got: {self.ui_navigator.fps}")
+        if not (0.0 <= self.ui_navigator.confidence_threshold <= 1.0):
+            raise ValueError(
+                "ui_navigator.confidence_threshold must be in [0, 1], "
+                f"got: {self.ui_navigator.confidence_threshold}"
+            )
+        if self.ui_navigator.analyze_every_n_frames <= 0:
+            raise ValueError(
+                "ui_navigator.analyze_every_n_frames must be > 0, "
+                f"got: {self.ui_navigator.analyze_every_n_frames}"
+            )
         if self.struggle.cooldown_seconds < 0:
             raise ValueError(f"struggle.cooldown_seconds must be >= 0, got: {self.struggle.cooldown_seconds}")
         if self.models.pro_rpm_budget < 0:

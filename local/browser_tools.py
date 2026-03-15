@@ -222,6 +222,28 @@ async def _ensure_connection(cdp_url: str = "http://127.0.0.1:9222") -> Any | No
         return None
 
 
+async def get_browser_context(
+    cdp_url: str = "http://127.0.0.1:9222",
+    browser: str = "auto",
+    profile: str = "",
+) -> Any:
+    """High-level helper to get a shared BrowserContext.
+    
+    1. Tries to connect to an existing browser via CDP.
+    2. Falls back to launching a persistent context.
+    """
+    global _context, _page
+    
+    # Try reusing existing page/context
+    page = await _ensure_connection(cdp_url)
+    if page is not None:
+        return _context
+
+    # Launch new persistent context
+    await _launch_with_playwright(browser=browser, profile=profile)
+    return _context
+
+
 async def _launch_with_playwright(
     browser: str = "auto",
     profile: str = "",
@@ -229,9 +251,8 @@ async def _launch_with_playwright(
     """Launch a browser via Playwright's launch_persistent_context.
 
     Strategy:
-    1. If ``profile`` is set, try to find and use the user's actual Chrome
-       profile (reads Chrome's Local State to match display name → dir name).
-       This gives full access to bookmarks, cookies, and extensions.
+    1. If ``profile`` is set (or Default), try to find and use the user's actual Chrome
+       profile. This gives full access to bookmarks, cookies, and extensions.
     2. If the actual Chrome profile is locked (Chrome already running) or not
        found, fall back to a Playwright-managed Rio profile directory — which
        always works regardless of whether Chrome is running.
@@ -248,49 +269,52 @@ async def _launch_with_playwright(
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
+        "--remote-debugging-port=9222", # Enable CDP for future connections
     ]
 
     # ── Strategy 1: Try actual Chrome user profile ─────────────────────────
-    if profile:
-        actual_dir, profile_dir_name = _find_actual_chrome_profile(profile)
-        if actual_dir:
-            args = list(base_launch_args)
-            if profile_dir_name:
-                args.append(f"--profile-directory={profile_dir_name}")
+    # If no profile specified, we default to "Default" to use the user's main profile
+    target_profile = profile or "Default"
+    
+    actual_dir, profile_dir_name = _find_actual_chrome_profile(target_profile)
+    if actual_dir:
+        args = list(base_launch_args)
+        if profile_dir_name:
+            args.append(f"--profile-directory={profile_dir_name}")
 
-            log.info(
-                "browser.launching_actual_chrome_profile",
-                browser=browser,
-                exe=exe or "playwright-bundled",
-                profile=profile,
-                user_data_dir=str(actual_dir),
-                profile_dir=profile_dir_name or "(not found in Local State)",
+        log.info(
+            "browser.launching_actual_chrome_profile",
+            browser=browser,
+            exe=exe or "playwright-bundled",
+            profile=target_profile,
+            user_data_dir=str(actual_dir),
+            profile_dir=profile_dir_name or "(not found in Local State)",
+        )
+        try:
+            kwargs: dict[str, Any] = {
+                "headless": False,
+                "no_viewport": True,
+                "args": args,
+            }
+            if exe:
+                kwargs["executable_path"] = exe
+            _context = await pw.chromium.launch_persistent_context(
+                str(actual_dir), **kwargs,
             )
-            try:
-                kwargs: dict[str, Any] = {
-                    "headless": False,
-                    "no_viewport": True,
-                    "args": args,
-                }
-                if exe:
-                    kwargs["executable_path"] = exe
-                _context = await pw.chromium.launch_persistent_context(
-                    str(actual_dir), **kwargs,
-                )
-                _page = _context.pages[0] if _context.pages else await _context.new_page()
-                log.info("browser.launched_actual_profile", title=await _page.title(), url=_page.url)
-                return _page
-            except Exception as exc:
-                log.warning(
-                    "browser.actual_profile_failed_fallback",
-                    error=str(exc),
-                    note="Chrome may be running and locking its user-data-dir. "
-                         "Falling back to Rio-managed profile. "
-                         "For best results, launch Chrome with --remote-debugging-port=9222.",
-                )
-                # Reset context so fallback starts clean
-                _context = None
-                _page = None
+            _page = _context.pages[0] if _context.pages else await _context.new_page()
+            log.info("browser.launched_actual_profile", title=await _page.title(), url=_page.url)
+            return _page
+        except Exception as exc:
+            log.warning(
+                "browser.actual_profile_failed_fallback",
+                error=str(exc),
+                note="Chrome may be running and locking its user-data-dir. "
+                     "Falling back to Rio-managed profile. "
+                     "For best results, launch Chrome with --remote-debugging-port=9222.",
+            )
+            # Reset context so fallback starts clean
+            _context = None
+            _page = None
 
     # ── Strategy 2: Rio-managed profile (always works) ─────────────────────
     user_data_dir = _get_persistent_user_data_dir(profile)

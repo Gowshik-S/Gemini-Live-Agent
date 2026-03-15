@@ -123,7 +123,7 @@ class UnifiedMemory:
     # Save helpers
     # ------------------------------------------------------------------
 
-    def save_note(self, key: str, value: str, persist_vector: bool = False) -> None:
+    def save_note(self, key: str, value: str, persist_vector: bool = False, media_parts: list[Any] | None = None) -> None:
         """Save to session notes (and optionally to long-term vector store).
 
         Caps the in-memory dict at 200 entries to bound RAM usage.
@@ -143,6 +143,7 @@ class UnifiedMemory:
                     f"{key}: {value}",
                     entry_type="user_note",
                     metadata={"key": key},
+                    media_parts=media_parts,
                 )
             except Exception:
                 pass

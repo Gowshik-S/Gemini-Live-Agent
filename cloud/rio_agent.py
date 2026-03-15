@@ -16,11 +16,92 @@ import uuid
 from typing import Any, Optional
 
 import structlog
+from pydantic import BaseModel, ValidationError
 
 try:
     from .gemini_session import build_system_instruction
 except ImportError:
     from gemini_session import build_system_instruction
+
+logger = structlog.get_logger(__name__)
+
+# --- Pydantic Schemas for ToolBridge Validation ---
+class BaseResult(BaseModel):
+    success: bool
+    error: Optional[str] = None
+
+class CommandResult(BaseResult):
+    output: Optional[str] = None
+    exit_code: Optional[int] = None
+    command: Optional[str] = None
+    path: Optional[str] = None
+    warning: Optional[str] = None
+
+class FileResult(BaseResult):
+    path: Optional[str] = None
+    content: Optional[str] = None
+    bytes_written: Optional[int] = None
+    replaced: Optional[bool] = None
+
+class WindowInfo(BaseResult):
+    title: Optional[str] = None
+    minimized: Optional[bool] = None
+    maximized: Optional[bool] = None
+    verification: Optional[str] = None
+    verification_warning: Optional[str] = None
+    windows: Optional[list] = None
+
+class ComputerUseResult(BaseResult):
+    method: Optional[str] = None
+    x: Optional[int] = None
+    y: Optional[int] = None
+    status: Optional[str] = None
+    target: Optional[str] = None
+    estimated_wait: Optional[str] = None
+    message: Optional[str] = None
+    grounded_by: Optional[str] = None
+
+SCHEMA_MAP = {
+    "run_command": CommandResult,
+    "read_file": FileResult,
+    "write_file": FileResult,
+    "patch_file": FileResult,
+    "list_all_windows": WindowInfo,
+    "focus_window": WindowInfo,
+    "minimize_window": WindowInfo,
+    "maximize_window": WindowInfo,
+    "close_window": WindowInfo,
+    "smart_click": ComputerUseResult,
+    "screen_click": ComputerUseResult,
+}
+
+def validate_tool_result(name: str, result: dict) -> dict:
+    """Validate incoming tool results from the local client against schemas."""
+    if not isinstance(result, dict):
+        return {"success": False, "error": "Result is not a dictionary"}
+        
+    schema_cls = SCHEMA_MAP.get(name)
+    if schema_cls:
+        try:
+            validated = schema_cls(**result)
+            return validated.model_dump(exclude_none=True)
+        except ValidationError as e:
+            return {
+                "success": False, 
+                "error": f"Tool '{name}' returned invalid schema from local client: {e.errors()[0]['msg']}"
+            }
+    
+    # Fallback validation for unmapped tools
+    try:
+        validated = BaseResult(**result)
+        out = dict(result)
+        out["success"] = validated.success
+        if validated.error:
+            out["error"] = validated.error
+        return out
+    except ValidationError:
+        return {"success": False, "error": f"Tool '{name}' returned invalid base schema"}
+
 
 # ADK Agent is only needed for the legacy create_rio_agent() factory.
 # Optional import so the module works even when google-adk is not installed
@@ -127,7 +208,11 @@ class ToolBridge:
 
         try:
             timeout_seconds = self._timeout_for_tool(name)
-            result = await asyncio.wait_for(future, timeout=timeout_seconds)
+            raw_result = await asyncio.wait_for(future, timeout=timeout_seconds)
+            
+            # Pillar 3: Strict Pydantic Enforcements
+            result = validate_tool_result(name, raw_result)
+            
             self._log.info(
                 "tool_bridge.result",
                 name=name, call_id=call_id,
@@ -179,6 +264,16 @@ def _make_tools(bridge: ToolBridge) -> list:
 
     Each function's docstring acts as the tool description for the model.
     """
+
+    # -- System triggers --
+
+    async def start_orchestrator_task(goal: str) -> dict:
+        """Execute a complex task on the user's computer. 
+        Call this when the user's request involves PC automation, file edits, 
+        web browsing, or any action that requires tools you don't have direct 
+        access to. Once called, the orchestrator will handle the execution.
+        """
+        return {"status": "TASK_INITIATED", "goal": goal}
 
     # -- Core dev tools --
 

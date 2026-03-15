@@ -25,11 +25,12 @@ import importlib
 import importlib.util
 import json
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Set
+from typing import Any, AsyncGenerator, Optional, Set
 
 import structlog
 import uvicorn
@@ -98,6 +99,31 @@ USE_VERTEX = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
 _DEFAULT_MODEL = "gemini-2.5-flash-native-audio-latest"
 
 
+async def _classify_intent_via_llm(client: genai.Client, text: str) -> bool:
+    """Fallback classifier: use Gemini 3 Flash to decide if utterance is a task."""
+    try:
+        prompt = (
+            f"User Utterance: \"{text}\"\n\n"
+            "Analyze if the user is asking the AI to perform a specific action on their computer "
+            "(e.g., opening an app, sending a message, researching a topic, writing code, "
+            "modifying files, or managing their calendar/email).\n"
+            "If it is a task request, reply exactly with: TASK\n"
+            "If it is just a greeting, a simple question, or casual conversation, reply exactly with: CONV"
+        )
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=5,
+            )
+        )
+        ans = response.text.strip().upper()
+        return "TASK" in ans
+    except Exception:
+        return False
+
+
 def _resolve_models() -> tuple[str, str]:
     """Resolve live/orchestrator models from config in a robust way.
 
@@ -135,6 +161,8 @@ LIVE_MODEL, ORCHESTRATOR_MODEL = _resolve_models()
 # Whether the live model itself can invoke function calls.
 # gemini-2.5-flash-native-audio-preview-12-2025 DOES support function calling
 # per https://ai.google.dev/gemini-api/docs/live-api/tools
+# Live mode should expose the full toolset by default.
+# Set RIO_LIVE_MODEL_TOOLS=0 only if you explicitly want orchestrator-only tools.
 LIVE_MODEL_TOOLS = _env_flag("RIO_LIVE_MODEL_TOOLS", True)
 
 ENABLE_SERVER_VAD = _env_flag("RIO_LIVE_ENABLE_SERVER_VAD", False)
@@ -213,6 +241,53 @@ def _start_new_conversation() -> str:
     _current_conversation_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     _current_conversation_messages = []
     return _current_conversation_id
+
+
+def _load_latest_conversation() -> None:
+    """Load the most recent conversation from disk on startup."""
+    global _current_conversation_id, _current_conversation_messages
+    try:
+        files = sorted(_conversations_dir.glob("*.json"), key=os.path.getmtime, reverse=True)
+        if files:
+            latest = files[0]
+            data = json.loads(latest.read_text(encoding="utf-8"))
+            _current_conversation_id = data.get("id")
+            _current_conversation_messages = data.get("messages", [])
+            logger.info("conversation.loaded", id=_current_conversation_id, messages=len(_current_conversation_messages))
+        else:
+            _start_new_conversation()
+    except Exception as exc:
+        logger.warning("conversation.load_failed", error=str(exc))
+        _start_new_conversation()
+
+
+def _get_history_contents() -> list[types.Content]:
+    """Convert stored transcript messages into SDK Content objects for restoration."""
+    contents = []
+    for msg in _current_conversation_messages:
+        speaker = msg.get("speaker", "user")
+        text = msg.get("text", "")
+        if not text:
+            continue
+        
+        # Map Rio internal speakers to Gemini roles
+        role = "model" if speaker == "rio" else "user"
+        contents.append(types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=text)]
+        ))
+    
+    # Filter to ensure alternating roles (required by some versions of the API)
+    # and that it doesn't end with a model turn if we're about to add a user turn.
+    cleaned = []
+    for c in contents:
+        if not cleaned or cleaned[-1].role != c.role:
+            cleaned.append(c)
+        else:
+            # Merge consecutive same-role turns
+            cleaned[-1].parts.extend(c.parts)
+            
+    return cleaned
 
 
 def _save_conversation() -> None:
@@ -483,6 +558,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Pre-warm memory store so first WS connection doesn't block 4-6s
     _get_shared_memory_store(genai_client=genai_client)
+
+    # Load latest conversation from disk to resume state
+    _load_latest_conversation()
 
     # A4+G2: Run startup maintenance (prune old conversations, vacuum DBs)
     try:
@@ -946,31 +1024,38 @@ async def new_conversation() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# WS /ws/dashboard
+# WS /ui/stream -- Dashboard & Mission Control feed
 # ---------------------------------------------------------------------------
 
-@app.websocket("/ws/dashboard")
-async def ws_dashboard(websocket: WebSocket) -> None:
+async def _ws_dashboard_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     async with dashboard_lock:
         dashboard_clients.add(websocket)
-    logger.info("dashboard.connected", total=len(dashboard_clients))
+    logger.info("ui_stream.connected", total=len(dashboard_clients))
     try:
         while True:
             msg = await websocket.receive_text()
             if msg == "ping":
                 await websocket.send_text("pong")
             else:
-                # B2: Dashboard approval responses
+                # B2: UI interaction responses
                 try:
                     frame = json.loads(msg)
                     if frame.get("type") == "approval_response":
-                        # Broadcast to all sessions — the right orchestrator
-                        # picks it up via its approval queue
+                        # Match OpenClaw UI naming: decision=approve/deny
+                        approved = frame.get("decision") == "approve" or frame.get("approved", False)
                         await _broadcast_dashboard({
                             "type": "dashboard",
                             "subtype": "approval_resolved",
-                            "approved": frame.get("approved", False),
+                            "approved": approved,
+                            "id": frame.get("id"),
+                        })
+                    elif frame.get("type") == "task_stop":
+                        # For single-user desktop, we stop all active tasks
+                        # In adk_server, orchestrator is session-scoped, so we broadcast a control event
+                        await _broadcast_dashboard({
+                            "type": "control",
+                            "action": "task_stop_requested",
                         })
                 except (json.JSONDecodeError, Exception):
                     pass
@@ -979,6 +1064,22 @@ async def ws_dashboard(websocket: WebSocket) -> None:
     finally:
         async with dashboard_lock:
             dashboard_clients.discard(websocket)
+        logger.info("ui_stream.disconnected", total=len(dashboard_clients))
+
+
+@app.websocket("/ui/stream")
+async def ws_ui_stream(websocket: WebSocket) -> None:
+    await _ws_dashboard_stream(websocket)
+
+
+@app.websocket("/ws/dashboard")
+async def ws_dashboard_compat(websocket: WebSocket) -> None:
+    """Backward-compatible dashboard stream endpoint.
+
+    Some clients still connect to /ws/dashboard. Route them to the
+    same dashboard stream handler used by /ui/stream.
+    """
+    await _ws_dashboard_stream(websocket)
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1156,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         count=sum(len(t.function_declarations or []) for t in tool_objects),
         live_model_tools=LIVE_MODEL_TOOLS,
     )
+    if LIVE_MODEL_TOOLS:
+        log.warning(
+            "live_model_tools.enabled",
+            note="Direct Live tool execution can duplicate orchestrator actions and increase latency",
+        )
 
     # ---- Tool Orchestrator — parallel agentic executor ----
     # Uses ORCHESTRATOR_MODEL (gemini-2.5-flash by default) with full
@@ -1185,6 +1291,16 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         return
                 else:
                     log.info("live.session.started")
+                    
+                    # Restore history on fresh connection
+                    if _current_conversation_messages:
+                        history = _get_history_contents()
+                        if history:
+                            log.info("live.restoring_history", turns=len(history))
+                            try:
+                                await session.send_client_content(turns=history, turn_complete=False)
+                            except Exception as h_exc:
+                                log.warning("live.history_restore_failed", error=str(h_exc))
 
                 try:
                     await websocket.send_text(json.dumps({
@@ -1267,29 +1383,96 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                     "success": result.get("success"),
                                 })
 
+                            elif frame_type == "tool_event_update":
+                                name = frame.get("name", "unknown")
+                                result = frame.get("result", {})
+                                log.info("client.tool_event_update", name=name, success=result.get("success"))
+                                
+                                # Broadcast to dashboard
+                                await _broadcast_dashboard({
+                                    "type": "dashboard",
+                                    "subtype": "tool_event_update",
+                                    "client_id": client_id,
+                                    "name": name,
+                                    "success": result.get("success"),
+                                    "result": result
+                                })
+                                
+                                # Inject back to orchestrator if running, or live session
+                                msg = f"[SYSTEM: Async background tool '{name}' has completed its operation. Result: {json.dumps(result)}]"
+                                if orchestrator._active_tasks:
+                                    orchestrator.inject_user_message(msg)
+                                elif session:
+                                    # Inform Live Voice session so it can comment on it if needed
+                                    try:
+                                        await session.send_client_content(
+                                            turns=types.Content(
+                                                role="user",
+                                                parts=[types.Part.from_text(text=msg)]
+                                            ),
+                                            turn_complete=True
+                                        )
+                                    except Exception as e:
+                                        log.warning("tool_event_update.live_inject_failed", error=str(e))
+
                             elif frame_type == "text":
                                 content = frame.get("content", "")
                                 if content:
-                                    await session.send_client_content(
-                                        turns=types.Content(
-                                            role="user",
-                                            parts=[types.Part(text=content)],
-                                        ),
-                                        turn_complete=True,
-                                    )
                                     _buffer_transcript({
                                         "speaker": "user",
                                         "text": content,
                                         "timestamp": datetime.now(
                                             timezone.utc,
                                         ).isoformat(),
+                                        "source": "text",
                                     })
                                     await _broadcast_dashboard({
                                         "type": "transcript",
                                         "speaker": "user",
                                         "text": content,
                                         "client_id": client_id,
+                                        "source": "text",
                                     })
+
+                                    # Route typed chat with the same orchestration logic
+                                    # used for transcribed speech turns.
+                                    if orchestrator._active_tasks:
+                                        orchestrator.inject_user_message(content)
+                                        log.info(
+                                            "orchestrator.user_message_injected",
+                                            source="text",
+                                            utterance=content[:60],
+                                        )
+                                    elif _is_task_request(content):
+                                        log.info(
+                                            "orchestrator.task_detected",
+                                            source="text",
+                                            utterance=content[:100],
+                                        )
+                                        await websocket.send_text(json.dumps({
+                                            "type": "control",
+                                            "action": "task_mode",
+                                            "active": True,
+                                            "goal": content[:100],
+                                        }))
+                                        await orchestrator.spawn_task(content, inject_context)
+                                        await _broadcast_dashboard({
+                                            "type": "dashboard",
+                                            "subtype": "orchestrator",
+                                            "event": "task_started",
+                                            "goal": content[:100],
+                                            "model": ORCHESTRATOR_MODEL,
+                                            "client_id": client_id,
+                                            "source": "text",
+                                        })
+                                    else:
+                                        await session.send_client_content(
+                                            turns=types.Content(
+                                                role="user",
+                                                parts=[types.Part(text=content)],
+                                            ),
+                                            turn_complete=True,
+                                        )
 
                             elif frame_type == "context":
                                 content = frame.get("content", "")
@@ -1365,6 +1548,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     is_heartbeat = (
                         "[SYSTEM: Still working" in msg
                         or "[SYSTEM: Approval required" in msg
+                        or "[REASONING]" in msg
                     )
 
                     if _ws_is_open():
@@ -1638,7 +1822,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                     except Exception:
                                         pass
 
-                        orchestrator.spawn_task(
+                        await orchestrator.spawn_task(
                             f"[From Telegram] {text}", _tg_inject,
                         )
                         await _draft_update(f"▶️ Starting task: _{text[:120]}_", final=False)
@@ -1682,7 +1866,9 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 async def downstream_task() -> None:
                     nonlocal session_handle
                     # Buffer partial transcription fragments until turn complete
-                    _utterance_buf: list[str] = []
+                    _user_utterance_buf: list[str] = []
+                    _rio_utterance_buf: list[str] = []
+                    
                     try:
                         async for response in session.receive():
                             sc = response.server_content
@@ -1690,9 +1876,6 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             # ---- Audio / text from model ----
                             if sc and sc.model_turn:
                                 for part in sc.model_turn.parts or []:
-                                    # Skip internal reasoning tokens — they
-                                    # cause 1011 crashes if the model leaks
-                                    # them and should never reach the client.
                                     if getattr(part, "thought", False):
                                         continue
                                     if part.inline_data and part.inline_data.data:
@@ -1700,18 +1883,13 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                             b"\x01" + part.inline_data.data,
                                         )
                                     if part.text:
+                                        _rio_utterance_buf.append(part.text)
                                         await websocket.send_text(json.dumps({
                                             "type": "transcript",
                                             "speaker": "rio",
                                             "text": part.text,
                                         }))
-                                        _buffer_transcript({
-                                            "speaker": "rio",
-                                            "text": part.text,
-                                            "timestamp": datetime.now(
-                                                timezone.utc,
-                                            ).isoformat(),
-                                        })
+                                        # Broadcast partial to dashboard
                                         await _broadcast_dashboard({
                                             "type": "transcript",
                                             "speaker": "rio",
@@ -1724,21 +1902,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 tx = sc.input_transcription
                                 text = getattr(tx, "text", "")
                                 if text:
-                                    _utterance_buf.append(text)
-                                    _buffer_transcript({
-                                        "speaker": "user",
-                                        "text": text,
-                                        "timestamp": datetime.now(
-                                            timezone.utc,
-                                        ).isoformat(),
-                                        "source": "transcription",
-                                    })
+                                    _user_utterance_buf.append(text)
+                                    # Send partial to client UI
                                     await websocket.send_text(json.dumps({
                                         "type": "transcript",
                                         "speaker": "user",
                                         "text": text,
                                         "source": "transcription",
                                     }))
+                                    # Broadcast partial to dashboard
                                     await _broadcast_dashboard({
                                         "type": "transcript",
                                         "speaker": "user",
@@ -1762,72 +1934,73 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             # ---- Interrupted by user ----
                             if sc and getattr(sc, "interrupted", False):
                                 log.info("live.interrupted")
-                                _utterance_buf.clear()  # Discard partial utterance
+                                _user_utterance_buf.clear()  # Discard partial
+                                _rio_utterance_buf.clear()
                                 await websocket.send_text(json.dumps({
                                     "type": "control",
                                     "action": "interrupted",
                                 }))
 
                             # ---- Turn complete ----
-                            # The model finished responding → the user's full
-                            # utterance is now finalised in _utterance_buf.
-                            # Check if it's an executable task and defer to
-                            # the ToolOrchestrator if so.
                             if sc and getattr(sc, "turn_complete", False):
                                 await websocket.send_text(json.dumps({
                                     "type": "control",
                                     "action": "turn_complete",
                                 }))
 
-                                # Flush buffered transcription
-                                full_utterance = " ".join(_utterance_buf).strip()
-                                _utterance_buf.clear()
-
-                                # ── ORCHESTRATOR BUSY — steer / cancel ──
-                                # Voice model keeps responding normally.
-                                # We only route the utterance to the
-                                # orchestrator's message queue so it can
-                                # handle cancel / steer commands while
-                                # the task continues in the background.
-                                if full_utterance and orchestrator._active_tasks:
-                                    orchestrator.inject_user_message(full_utterance)
-                                    log.info(
-                                        "orchestrator.user_message_injected",
-                                        utterance=full_utterance[:60],
-                                    )
-
-                                elif full_utterance and _is_task_request(full_utterance):
-                                    log.info(
-                                        "orchestrator.task_detected",
-                                        utterance=full_utterance[:100],
-                                    )
-                                    # Notify client the orchestrator is running
-                                    await websocket.send_text(json.dumps({
-                                        "type": "control",
-                                        "action": "task_mode",
-                                        "active": True,
-                                        "goal": full_utterance[:100],
-                                    }))
-                                    # Spawn the orchestrator as a background task.
-                                    # Tool results flow through ToolBridge → client
-                                    # transparently, just like before.
-                                    orchestrator.spawn_task(
-                                        full_utterance, inject_context,
-                                    )
-                                    await _broadcast_dashboard({
-                                        "type": "dashboard",
-                                        "subtype": "orchestrator",
-                                        "event": "task_started",
-                                        "goal": full_utterance[:100],
-                                        "model": ORCHESTRATOR_MODEL,
-                                        "client_id": client_id,
+                                # 1. Finalise User Turn
+                                full_user_text = " ".join(_user_utterance_buf).strip()
+                                if full_user_text:
+                                    _buffer_transcript({
+                                        "speaker": "user",
+                                        "text": full_user_text,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "source": "transcription",
                                     })
+                                _user_utterance_buf.clear()
+
+                                # 2. Finalise Rio Turn
+                                full_rio_text = "".join(_rio_utterance_buf).strip()
+                                if full_rio_text:
+                                    _buffer_transcript({
+                                        "speaker": "rio",
+                                        "text": full_rio_text,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                _rio_utterance_buf.clear()
+
+                                # 3. Check for Task Execution
+                                if full_user_text and orchestrator._active_tasks:
+                                    orchestrator.inject_user_message(full_user_text)
+                                elif full_user_text:
+                                    is_task = _is_task_request(full_user_text)
+                                    if not is_task and len(full_user_text.split()) > 5:
+                                        is_task = await _classify_intent_via_llm(genai_client, full_user_text)
+                                    
+                                    if is_task:
+                                        log.info("orchestrator.task_detected", utterance=full_user_text[:100])
+                                        await websocket.send_text(json.dumps({
+                                            "type": "control",
+                                            "action": "task_mode",
+                                            "active": True,
+                                            "goal": full_user_text[:100],
+                                        }))
+                                        await orchestrator.spawn_task(full_user_text, inject_context)
+                                        await _broadcast_dashboard({
+                                            "type": "dashboard",
+                                            "subtype": "orchestrator",
+                                            "event": "task_started",
+                                            "goal": full_user_text[:100],
+                                            "model": ORCHESTRATOR_MODEL,
+                                            "client_id": client_id,
+                                        })
                                 # else: normal voice conversation — no action needed
 
                                 # C5: Check keyword triggers on every utterance
-                                if full_utterance and _trigger_engine is not None:
-                                    _trigger_engine.check_utterance(full_utterance)
-                                    scheduled = _trigger_engine.try_schedule_from_utterance(full_utterance)
+                                utterance_for_triggers = full_user_text
+                                if utterance_for_triggers and _trigger_engine is not None:
+                                    _trigger_engine.check_utterance(utterance_for_triggers)
+                                    scheduled = _trigger_engine.try_schedule_from_utterance(utterance_for_triggers)
                                     if scheduled:
                                         mode = scheduled.get("mode", "schedule")
                                         goal = scheduled.get("goal", "")
@@ -1874,6 +2047,26 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             # ---- Tool calls from model ----
                             tc = getattr(response, "tool_call", None)
                             if tc and tc.function_calls:
+                                if orchestrator._active_tasks:
+                                    log.warning(
+                                        "live.tool_call.ignored_during_orchestrator_task",
+                                        names=[fc.name for fc in tc.function_calls],
+                                    )
+                                    await session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fc.name,
+                                                response={
+                                                    "success": False,
+                                                    "error": "Live model tool call skipped while orchestrator task is active",
+                                                },
+                                                id=fc.id,
+                                            )
+                                            for fc in tc.function_calls
+                                        ],
+                                    )
+                                    continue
+
                                 # Screen-action tools that change what's on screen.
                                 # When the model batches multiple screen actions in
                                 # one turn, execute ONLY the first one and return
@@ -1911,6 +2104,31 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                                 fn_responses = []
                                 for fc in calls_to_run:
+                                    # Intercept start_orchestrator_task
+                                    if fc.name == "start_orchestrator_task":
+                                        log.info("live.start_orchestrator_task_triggered", args=fc.args)
+                                        goal = fc.args.get("goal", "unspecified task")
+                                        
+                                        # Spawn the task
+                                        await orchestrator.spawn_task(goal, inject_context)
+                                        
+                                        # Notify client
+                                        await websocket.send_text(json.dumps({
+                                            "type": "control",
+                                            "action": "task_mode",
+                                            "active": True,
+                                            "goal": goal[:100],
+                                        }))
+                                        
+                                        fn_responses.append(
+                                            types.FunctionResponse(
+                                                name=fc.name,
+                                                response={"status": "TASK_SPAWNED", "goal": goal},
+                                                id=fc.id,
+                                            ),
+                                        )
+                                        continue
+
                                     fn = tool_map.get(fc.name)
                                     if fn:
                                         log.info(

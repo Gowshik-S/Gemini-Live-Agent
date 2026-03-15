@@ -77,6 +77,27 @@ def _get_hostapi_name(device_info: dict | None) -> str | None:
         return None
 
 
+def _find_wasapi_input_device() -> int | None:
+    """Return a WASAPI input device index when available on Windows."""
+    if not _IS_WINDOWS:
+        return None
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels", 0)) <= 0:
+                continue
+            try:
+                hostapi_name = hostapis[int(dev["hostapi"])].get("name", "")
+            except Exception:
+                hostapi_name = ""
+            if hostapi_name == "Windows WASAPI":
+                return idx
+    except Exception as exc:
+        log.debug("audio.wasapi_device_scan_failed", error=str(exc))
+    return None
+
+
 class AudioCapture:
     """Captures audio from the microphone as PCM 16-bit 16kHz mono chunks.
 
@@ -127,8 +148,21 @@ class AudioCapture:
         self._loop = asyncio.get_running_loop()
 
         # WASAPI exclusive mode for lowest latency on Windows
+        selected_input_device = self._input_device
         extra_settings = None
-        device_info = _get_device_info(self._input_device, kind="input")
+        device_info = _get_device_info(selected_input_device, kind="input")
+        if self._use_wasapi and _IS_WINDOWS and selected_input_device is None:
+            hostapi_name = _get_hostapi_name(device_info)
+            if hostapi_name != "Windows WASAPI":
+                wasapi_idx = _find_wasapi_input_device()
+                if wasapi_idx is not None:
+                    selected_input_device = wasapi_idx
+                    device_info = _get_device_info(selected_input_device, kind="input")
+                    log.info(
+                        "audio.input_device_selected",
+                        strategy="prefer_wasapi",
+                        selected_device=selected_input_device,
+                    )
         hostapi_name = _get_hostapi_name(device_info)
         if self._use_wasapi and _IS_WINDOWS:
             if hostapi_name == "Windows WASAPI":
@@ -137,14 +171,14 @@ class AudioCapture:
                     log.info(
                         "audio.wasapi_enabled",
                         exclusive=False,
-                        device=self._input_device,
+                        device=selected_input_device,
                         hostapi=hostapi_name,
                     )
             elif hostapi_name:
                 log.info(
                     "audio.wasapi_skipped",
                     reason="non_wasapi_device",
-                    device=self._input_device,
+                        device=selected_input_device,
                     hostapi=hostapi_name,
                 )
 
@@ -152,7 +186,7 @@ class AudioCapture:
             "audio.starting",
             sample_rate=self._sample_rate,
             block_size=self._block_size,
-            device=self._input_device,
+            device=selected_input_device,
             latency="low",
             wasapi=extra_settings is not None,
             hostapi=hostapi_name,
@@ -164,7 +198,7 @@ class AudioCapture:
                 blocksize=self._block_size,
                 dtype="int16",
                 channels=1,
-                device=self._input_device,
+                device=selected_input_device,
                 latency="low",
                 extra_settings=extra_settings,
                 callback=self._audio_callback,
@@ -177,14 +211,14 @@ class AudioCapture:
                 log.warning(
                     "audio.wasapi_failed_retrying",
                     error=str(_pa_err),
-                    device=self._input_device,
+                    device=selected_input_device,
                 )
                 self._stream = sd.InputStream(
                     samplerate=self._sample_rate,
                     blocksize=self._block_size,
                     dtype="int16",
                     channels=1,
-                    device=self._input_device,
+                    device=selected_input_device,
                     latency="low",
                     callback=self._audio_callback,
                 )
@@ -304,7 +338,7 @@ class AudioPlayback:
         sample_rate: int = 24_000,
         channels: int = 1,
         output_device: Optional[str | int] = None,
-        max_queue_size: int = 300,
+        max_queue_size: int = 120,
         use_wasapi: bool = True,  # kept for API compat, not used by PyAudio path
     ) -> None:
         self._input_sample_rate = sample_rate   # rate of incoming audio (Gemini)
@@ -315,6 +349,7 @@ class AudioPlayback:
         self._running = False
         self._interrupted = False  # set during interrupt to skip queued chunks
         self._resample_ratio: float = 1.0
+        self._frames_per_buffer: int = 480  # ~20ms at 24kHz
 
         # Thread-safe queue: enqueue() writes, drain_loop() reads
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_queue_size)
@@ -351,7 +386,43 @@ class AudioPlayback:
         else:
             dev_info = self._pa.get_default_output_device_info()
 
-        self._output_sample_rate = int(dev_info["defaultSampleRate"])
+        default_device_rate = int(dev_info["defaultSampleRate"])
+
+        # Prefer Gemini-native 24kHz output rate first to avoid resampling latency.
+        # Fall back to the device default rate if the device/driver rejects 24kHz.
+        preferred_rates = [self._input_sample_rate]
+        if default_device_rate != self._input_sample_rate:
+            preferred_rates.append(default_device_rate)
+
+        stream = None
+        selected_rate = None
+        last_error = None
+        for candidate_rate in preferred_rates:
+            try:
+                fpb = max(256, min(960, int(candidate_rate * 0.02)))
+                stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=self._channels,
+                    rate=candidate_rate,
+                    output=True,
+                    output_device_index=(
+                        int(self._output_device) if self._output_device is not None else None
+                    ),
+                    frames_per_buffer=fpb,
+                )
+                selected_rate = candidate_rate
+                self._frames_per_buffer = fpb
+                break
+            except Exception as exc:
+                last_error = exc
+
+        if stream is None or selected_rate is None:
+            raise RuntimeError(
+                f"Failed to open playback stream for rates {preferred_rates}: {last_error}"
+            )
+
+        self._stream = stream
+        self._output_sample_rate = selected_rate
         self._resample_ratio = self._output_sample_rate / self._input_sample_rate
 
         log.info(
@@ -360,21 +431,8 @@ class AudioPlayback:
             input_rate=self._input_sample_rate,
             output_rate=self._output_sample_rate,
             resample_ratio=round(self._resample_ratio, 4),
+            frames_per_buffer=self._frames_per_buffer,
             engine="pyaudio_blocking_write",
-        )
-
-        # Open the stream at the device's native rate.
-        # frames_per_buffer=1024 is a good default — the OS driver
-        # handles the rest.  No callback needed.
-        self._stream = self._pa.open(
-            format=pyaudio.paInt16,
-            channels=self._channels,
-            rate=self._output_sample_rate,
-            output=True,
-            output_device_index=(
-                int(self._output_device) if self._output_device is not None else None
-            ),
-            frames_per_buffer=1024,
         )
 
         self._running = True
@@ -446,7 +504,7 @@ class AudioPlayback:
                 output_device_index=(
                     int(self._output_device) if self._output_device is not None else None
                 ),
-                frames_per_buffer=1024,
+                frames_per_buffer=self._frames_per_buffer,
             )
             log.info("playback.stream_recreated")
         except Exception:
