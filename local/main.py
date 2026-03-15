@@ -26,6 +26,24 @@ import sys
 import time
 from pathlib import Path
 
+
+def _configure_openmp_runtime() -> None:
+    """Set conservative OpenMP defaults to reduce startup OMP failures.
+
+    On Windows, mixed native stacks (torch/sklearn/vosk/onnx) can spin up large
+    thread pools and occasionally fail with OMP memory allocation errors during
+    initialization. We only set defaults when values are not already provided by
+    the user.
+    """
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+
+
+_configure_openmp_runtime()
+
 import structlog
 
 from config import RioConfig

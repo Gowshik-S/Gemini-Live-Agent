@@ -2346,9 +2346,30 @@ class ToolOrchestrator:
     ) -> None:
         """Run the agentic loop to completion and inject the result.
 
-        Uses multi-agent routing to select the best agent (model + tools)
-        for the task. Falls back to the default task_executor if routing fails.
+        Uses IntentRouter to route to deterministic pipelines if applicable.
+        Otherwise falls back to dynamic multi-agent routing.
         """
+        # 1. Intent Routing (Fast Lane vs Slow Lane)
+        try:
+            from orchestrator_core.intent_router import IntentRouter
+            from orchestrator_core.registry import execute_pipeline
+            router = IntentRouter()
+            lane = await router.route(goal, self._client)
+            
+            if lane != "dynamic":
+                self._log.info("orchestrator.deterministic_lane", pipeline=lane)
+                await inject_context(f"[SYSTEM: Executing deterministic pipeline '{lane}']")
+                
+                # Execute the strict DAG pipeline
+                final_result = await execute_pipeline(lane, goal, self._client)
+                
+                await inject_context(f"Task completed via strict pipeline: {lane}\n\nI have finished the structured workflow. Here is the result:\n{_format_for_voice(final_result)}")
+                return
+
+        except Exception as e:
+            self._log.error("orchestrator.routing_failed", error=str(e))
+            # Fall through to dynamic lane
+
         # Select the best agent for this task (semantic routing when available)
         agent_name = _select_agent(goal, self._agent_configs, self._memory_store)
         agent_cfg = self._agent_configs.get(agent_name, {})
