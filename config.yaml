@@ -3,42 +3,26 @@ rio:
   agent_role: assistant
   agent_tagline: Your Virtual Friend & Assistant
   agents:
-    browser_agent:
-      enabled: true
-      max_iterations: 10
-      model: gemini-3-flash-preview
-      tools: browser
-      description: "Web automation using Playwright/CDP - navigate URLs, fill forms, extract content, click elements, search the web"
     code_agent:
       enabled: true
       max_iterations: 15
       model: gemini-3-flash-preview
       tools: dev
-      description: "Coding, debugging, writing code, fixing bugs, refactoring, git operations, file editing, build and test"
-    computer_use_agent:
-      enabled: true
-      max_iterations: 25
-      model: gemini-3-flash-preview
-      tools: screen
-      description: "Screen interaction, clicking UI elements, opening applications, navigating windows, typing in apps, scrolling, browser navigation, GUI automation"
     creative_agent:
       enabled: true
       max_iterations: 5
-      model: gemini-3.1-pro-preview
+      model: ''
       tools: creative
-      description: "Image generation, video creation, design, illustration, drawing, creative content"
     research_agent:
       enabled: true
       max_iterations: 10
-      model: gemini-2.5-pro
+      model: gemini-2.5-pro-preview-06-05
       tools: memory
-      description: "Deep research, complex analysis, reasoning, explaining concepts, investigating topics, studying, comparing alternatives"
     task_executor:
       enabled: true
       max_iterations: 25
       model: gemini-3-flash-preview
       tools: all
-      description: "General task execution, multi-step workflows, coordinating actions across tools"
   audio:
     block_size: 320
     input_device: null
@@ -59,7 +43,7 @@ rio:
     - .
   gcp:
     location: global
-    project_id: 'rio-agent-45'
+    project_id: rio-agent-45
     use_vertex_ai: true
   global_deny_tools: []
   hotkeys:
@@ -161,6 +145,12 @@ rio:
     demo_mode: false
     enabled: true
     threshold: 0.85
+  ui_navigator:
+    analyze_every_n_frames: 3
+    confidence_threshold: 0.85
+    enabled: false
+    fps: 10.0
+    model: gemini-2.5-flash
   vad:
     enabled: true
     threshold: 0.5
@@ -169,12 +159,6 @@ rio:
     fps: 0.33
     quality: 85
     resize_factor: 0.75
-  ui_navigator:
-    enabled: false
-    fps: 10.0
-    model: gemini-2.5-flash
-    confidence_threshold: 0.85
-    analyze_every_n_frames: 3
   voice:
     default_name: Puck
     plugin:

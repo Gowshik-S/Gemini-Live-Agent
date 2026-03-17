@@ -92,6 +92,10 @@ _SHOW_AUTOMATION_BANNER = os.environ.get("RIO_BROWSER_SHOW_AUTOMATION_BANNER", "
     "1", "true", "yes", "on",
 }
 
+# Navigation latency knobs (tuned for faster interactive agent loops).
+_NAV_GOTO_TIMEOUT_MS = int(os.environ.get("RIO_BROWSER_NAV_GOTO_TIMEOUT_MS", "15000") or 15000)
+_NAV_POST_WAIT_MS = int(os.environ.get("RIO_BROWSER_NAV_POST_WAIT_MS", "1200") or 1200)
+
 
 def _find_browser_exe(browser: str) -> str | None:
     """Return the first existing executable path for the given browser name."""
@@ -570,10 +574,10 @@ async def browser_navigate(
         page = await _ensure_connection(cdp_url)
         if page is None:
             return {"success": False, "error": "No browser connected. Call browser_connect first."}
-        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await page.goto(url, timeout=_NAV_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
         # Verify page state after navigation
         try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
+            await page.wait_for_load_state("networkidle", timeout=_NAV_POST_WAIT_MS)
         except Exception:
             pass
         return {

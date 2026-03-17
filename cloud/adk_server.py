@@ -1112,6 +1112,74 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     )
     log = logger.bind(client_id=client_id, user_id=user_id)
 
+    # Session isolation key:
+    # - If client provides a stable session_id, it can be used for explicit
+    #   continuity (when persistent sessions are enabled).
+    # - Otherwise, default to this websocket's unique client_id so every new
+    #   connection starts with clean in-memory context.
+    raw_session_id = (
+        websocket.query_params.get("session_id")
+        or websocket.headers.get("x-rio-session-id")
+        or ""
+    )
+    client_session_id = _sanitize_user_id(raw_session_id) if raw_session_id else client_id
+    session_key = f"{user_id}:{client_session_id}"
+
+    # Per-live-session conversation state (kept during this WS session and
+    # across transient Live API reconnects inside the same WS lifecycle).
+    session_conversation_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        + "-"
+        + uuid.uuid4().hex[:6]
+    )
+    session_conversation_messages: list[dict] = []
+
+    def _save_session_conversation() -> None:
+        if not session_conversation_messages:
+            return
+        filepath = _conversations_dir / f"{session_conversation_id}.json"
+        data = {
+            "id": session_conversation_id,
+            "session_key": session_key,
+            "user_id": user_id,
+            "created_at": session_conversation_messages[0].get("timestamp", ""),
+            "updated_at": session_conversation_messages[-1].get("timestamp", ""),
+            "message_count": len(session_conversation_messages),
+            "preview": session_conversation_messages[0].get("text", "")[:100],
+            "messages": session_conversation_messages,
+        }
+        filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _buffer_session_transcript(entry: dict) -> None:
+        _transcript_buffer.append(entry)
+        if len(_transcript_buffer) > _TRANSCRIPT_BUFFER_MAX:
+            _transcript_buffer.pop(0)
+
+        session_conversation_messages.append(entry)
+        if len(session_conversation_messages) > _CONVERSATION_MESSAGES_MAX:
+            _save_session_conversation()
+            session_conversation_messages[:] = session_conversation_messages[-(_CONVERSATION_MESSAGES_MAX // 2):]
+        if len(session_conversation_messages) % 5 == 0:
+            _save_session_conversation()
+
+    def _get_session_history_contents() -> list[types.Content]:
+        contents: list[types.Content] = []
+        for msg in session_conversation_messages:
+            speaker = msg.get("speaker", "user")
+            text = msg.get("text", "")
+            if not text:
+                continue
+            role = "model" if speaker == "rio" else "user"
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text)]))
+
+        cleaned: list[types.Content] = []
+        for c in contents:
+            if not cleaned or cleaned[-1].role != c.role:
+                cleaned.append(c)
+            else:
+                cleaned[-1].parts.extend(c.parts)
+        return cleaned
+
     # ---- Authentication ----
     if WS_AUTH_TOKEN:
         try:
@@ -1157,7 +1225,6 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
     # ---- Create ToolBridge + tool functions ----
     # Check for existing session to facilitate auto-resumption (Persistent Lane)
-    session_key = f"{user_id}"
     
     # We define a deferred inject proxy because the actual inject_context
     # is defined further down, inside the active session block.
@@ -1165,7 +1232,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         pass # Will be swapped later
     
     if ENABLE_PERSISTENT_CLIENT_SESSION and session_key in _active_sessions_by_user:
-        log.info("live.client.resuming_session", user_id=user_id)
+        log.info("live.client.resuming_session", user_id=user_id, session_key=session_key)
         bridge, orchestrator = _active_sessions_by_user[session_key]
         bridge.rebind(websocket, _broadcast_dashboard)
         # Update inject_context for running tasks
@@ -1282,6 +1349,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     # ---- Session with auto-reconnect ----
     session_handle: str | None = None
     active = True
+    rapid_reconnects = 0
 
     def _ws_is_open() -> bool:
         return (
@@ -1289,6 +1357,31 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             and websocket.client_state == WebSocketState.CONNECTED
             and websocket.application_state == WebSocketState.CONNECTED
         )
+
+    def _normalize_user_command(text: str) -> str:
+        return " ".join((text or "").strip().lower().split())
+
+    def _strip_wake_prefix(cleaned: str) -> str:
+        prefixes = (
+            "rio ",
+            "hey rio ",
+            "ok rio ",
+            "okay rio ",
+        )
+        for p in prefixes:
+            if cleaned.startswith(p):
+                return cleaned[len(p):].strip()
+        return cleaned
+
+    def _is_explicit_stop_task_command(text: str) -> bool:
+        """Only explicit stop/cancel task commands may interrupt active tasks."""
+        cleaned = _strip_wake_prefix(_normalize_user_command(text))
+        if not cleaned:
+            return False
+
+        verbs = ("stop", "cancel", "abort", "quit", "end")
+        task_nouns = ("task", "job", "work")
+        return any(v in cleaned for v in verbs) and any(n in cleaned for n in task_nouns)
 
     # Silent 20ms chunk for heartbeat (320 samples × 2 bytes = 640 bytes)
     silent_chunk = b"\x00" * 640
@@ -1326,8 +1419,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     log.info("live.session.started")
                     
                     # Restore history on fresh connection only when explicitly enabled.
-                    if ENABLE_HISTORY_RESTORE and _current_conversation_messages:
-                        history = _get_history_contents()
+                    if ENABLE_HISTORY_RESTORE and session_conversation_messages:
+                        history = _get_session_history_contents()
                         if history:
                             log.info("live.restoring_history", turns=len(history))
                             try:
@@ -1451,7 +1544,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             elif frame_type == "text":
                                 content = frame.get("content", "")
                                 if content:
-                                    _buffer_transcript({
+                                    _buffer_session_transcript({
                                         "speaker": "user",
                                         "text": content,
                                         "timestamp": datetime.now(
@@ -1470,12 +1563,33 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                     # Route typed chat with the same orchestration logic
                                     # used for transcribed speech turns.
                                     if orchestrator._active_tasks:
-                                        orchestrator.inject_user_message(content)
-                                        log.info(
-                                            "orchestrator.user_message_injected",
-                                            source="text",
-                                            utterance=content[:60],
-                                        )
+                                        if _is_explicit_stop_task_command(content):
+                                            orchestrator.inject_user_message("cancel")
+                                            log.info(
+                                                "orchestrator.user_message_injected",
+                                                source="text_active_task_stop",
+                                                utterance=content[:60],
+                                            )
+                                        elif session:
+                                            try:
+                                                await session.send_client_content(
+                                                    turns=types.Content(
+                                                        role="user",
+                                                        parts=[types.Part.from_text(text=(
+                                                            "[SYSTEM: A background task is still running. "
+                                                            "Reply briefly: 'I'm still working on it. What do you need?' "
+                                                            "Do not stop the background task unless the user explicitly says stop/cancel task.]"
+                                                        ))],
+                                                    ),
+                                                    turn_complete=True,
+                                                )
+                                            except Exception:
+                                                pass
+                                            log.info(
+                                                "orchestrator.user_message_ignored_active_task",
+                                                source="text",
+                                                utterance=content[:60],
+                                            )
                                     elif _is_task_request(content):
                                         log.info(
                                             "orchestrator.task_detected",
@@ -2004,7 +2118,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 # 1. Finalise User Turn
                                 full_user_text = " ".join(_user_utterance_buf).strip()
                                 if full_user_text:
-                                    _buffer_transcript({
+                                    _buffer_session_transcript({
                                         "speaker": "user",
                                         "text": full_user_text,
                                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2015,7 +2129,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 # 2. Finalise Rio Turn
                                 full_rio_text = "".join(_rio_utterance_buf).strip()
                                 if full_rio_text:
-                                    _buffer_transcript({
+                                    _buffer_session_transcript({
                                         "speaker": "rio",
                                         "text": full_rio_text,
                                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2024,7 +2138,40 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
                                 # 3. Check for Task Execution
                                 if full_user_text and orchestrator._active_tasks:
-                                    orchestrator.inject_user_message(full_user_text)
+                                    if _is_explicit_stop_task_command(full_user_text):
+                                        orchestrator.inject_user_message("cancel")
+                                        log.info(
+                                            "orchestrator.user_message_injected",
+                                            source="transcription_active_task_stop",
+                                            utterance=full_user_text[:80],
+                                        )
+                                    elif session:
+                                        try:
+                                            await session.send_client_content(
+                                                turns=types.Content(
+                                                    role="user",
+                                                    parts=[types.Part.from_text(text=(
+                                                        "[SYSTEM: A background task is still running. "
+                                                        "Reply briefly: 'I'm still working on it. What do you need?' "
+                                                        "Do not stop the background task unless the user explicitly says stop/cancel task.]"
+                                                    ))],
+                                                ),
+                                                turn_complete=True,
+                                            )
+                                        except Exception:
+                                            pass
+                                        log.info(
+                                            "orchestrator.user_message_ignored_active_task",
+                                            source="transcription",
+                                            utterance=full_user_text[:80],
+                                        )
+                                    else:
+                                        # Ignore ambient/noisy transcriptions while a task is running.
+                                        log.info(
+                                            "orchestrator.user_message_ignored_active_task",
+                                            source="transcription_active_task",
+                                            utterance=full_user_text[:80],
+                                        )
                                 elif full_user_text:
                                     is_task = _is_task_request(full_user_text)
                                     if not is_task and len(full_user_text.split()) > 5:
@@ -2247,6 +2394,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 downstream_handle = asyncio.create_task(downstream_task(), name="downstream")
                 heartbeat_handle = asyncio.create_task(heartbeat_task(), name="heartbeat")
                 tasks = [upstream_handle, heartbeat_handle, downstream_handle]
+                session_started_monotonic = time.monotonic()
                 try:
                     done, pending = await asyncio.wait(
                         {upstream_handle, downstream_handle},
@@ -2263,6 +2411,30 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     for t in done:
                         if t.exception():
                             log.error("task.error", task=t.get_name(), exc=t.exception())
+
+                    # If one stream ends cleanly while WS is still open, this
+                    # is usually a transient Live API close; reconnect, but back
+                    # off when it happens repeatedly in a short window.
+                    completed = [t.get_name() for t in done]
+                    elapsed = time.monotonic() - session_started_monotonic
+                    log.info(
+                        "live.session.stream_ended",
+                        completed=completed,
+                        elapsed_seconds=round(elapsed, 2),
+                    )
+                    if elapsed < 20:
+                        rapid_reconnects += 1
+                    else:
+                        rapid_reconnects = 0
+
+                    if rapid_reconnects > 0 and active and _ws_is_open():
+                        delay = min(2 * rapid_reconnects, 10)
+                        log.warning(
+                            "live.session.churn_backoff",
+                            rapid_reconnects=rapid_reconnects,
+                            delay_seconds=delay,
+                        )
+                        await asyncio.sleep(delay)
                 except Exception:
                     log.exception("live.session.error")
                     for t in tasks:
@@ -2319,7 +2491,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             app.state.telegram_active_client_id = None
 
     # Persist conversation on disconnect
-    _save_conversation()
+    _save_session_conversation()
     log.info("live.client.cleanup_done", client_id=client_id)
     await _broadcast_dashboard({
         "type": "dashboard", "subtype": "client_event",

@@ -2974,7 +2974,7 @@ class ToolOrchestrator:
                         last_exc = api_exc
                         err_str = str(api_exc).lower()
                         # Only fallback on transient/quota errors
-                        if any(code in err_str for code in ("429", "503", "500", "quota", "exhausted", "limit")):
+                        if any(code in err_str for code in ("429", "500", "502", "503", "504", "quota", "exhausted", "limit", "bad gateway", "gateway timeout")):
                             self._log.warning("orchestrator.model_fallback", attempted=model_name, error=str(api_exc))
                             if inject_context:
                                 asyncio.create_task(inject_context(f"[SYSTEM: Model {model_name} busy. Trying fallback...]"))
@@ -3013,8 +3013,24 @@ class ToolOrchestrator:
                             pass
                     return "Task cancelled by user."
             except asyncio.CancelledError:
-                cancel_task.cancel()
+                # Ensure no background task is left with an unobserved exception.
+                for t in (model_task, cancel_task):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(model_task, cancel_task, return_exceptions=True)
                 raise
+            except Exception as model_exc:
+                err_str = str(model_exc).lower()
+                if any(code in err_str for code in ("429", "500", "502", "503", "504", "quota", "exhausted", "limit", "bad gateway", "gateway timeout")):
+                    self._log.warning("orchestrator.model_transient_error", error=str(model_exc))
+                    return "I hit a temporary upstream service issue. Please retry in a few seconds."
+                raise
+            finally:
+                # Always drain tasks to prevent "Task exception was never retrieved" warnings.
+                for t in (model_task, cancel_task):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(model_task, cancel_task, return_exceptions=True)
 
             # --- Parse response into function calls + text ---
             function_calls: list[Any] = []

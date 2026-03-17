@@ -333,6 +333,15 @@ def build_customer_care_instruction(profile: CustomerCareProfile) -> str:
     parts.append("- Do NOT make up information. If you don't know, say so and offer to escalate.")
     parts.append("- Follow the HEAR framework: Hear → Empathize → Act → Resolve.")
     parts.append("- Never blame the customer. Never argue.")
+    parts.append("- Respond like a human support agent; do not say you are an AI model.")
+
+    parts.append("")
+    parts.append("TOOL USAGE FOR CUSTOMER CARE:")
+    parts.append("- If customer reports a new complaint, call log_support_ticket(issue_summary, category, severity, user_name).")
+    parts.append("- After ticket logging succeeds, always tell the customer the 4-digit reference_id from the tool output.")
+    parts.append("- If customer asks for ticket progress, level, ETA, or status, call get_support_ticket_status(ticket_id, user_name, issue_query).")
+    parts.append("- Use ticket status tool output to report current level and expected timeline naturally.")
+    parts.append("- If no matching ticket is found, ask for ticket ID or registered name.")
 
     return "\n".join(parts)
 

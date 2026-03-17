@@ -65,6 +65,7 @@ class SileroVAD:
         self._model = None
         self._torch = None  # cached torch module reference
         self._available = False
+        self._warned_runtime_failure = False
         self._load_model()
 
     # ------------------------------------------------------------------
@@ -156,7 +157,19 @@ class SileroVAD:
         tensor = self._torch.from_numpy(audio_float)
 
         # Run inference (single forward pass, <5ms)
-        prob = self._model(tensor, self._sample_rate).item()
+        try:
+            prob = self._model(tensor, self._sample_rate).item()
+        except Exception as exc:
+            # Runtime TorchScript errors can occur on malformed/tiny chunks
+            # from specific devices. Do not crash voice flow; pass through.
+            if not self._warned_runtime_failure:
+                self._warned_runtime_failure = True
+                log.warning(
+                    "vad.runtime_error",
+                    error=str(exc),
+                    note="Falling back to pass-through for this chunk",
+                )
+            return VadResult(probability=0.5, is_speech=True)
 
         return VadResult(
             probability=prob,

@@ -381,6 +381,25 @@ def _make_tools(bridge: ToolBridge) -> list:
             },
         )
 
+    async def get_support_ticket_status(
+        ticket_id: str = "",
+        user_name: str = "",
+        issue_query: str = "",
+    ) -> dict:
+        """Retrieve support ticket status from the support Google Sheet.
+
+        Use when a customer asks for ticket progress, escalation level,
+        or expected resolution time.
+        """
+        return await bridge.dispatch(
+            "get_support_ticket_status",
+            {
+                "ticket_id": ticket_id,
+                "user_name": user_name,
+                "issue_query": issue_query,
+            },
+        )
+
     async def create_ticket(
         title: str, category: str, priority: str, description: str,
         customer_id: str = "", tags: str = "",
@@ -768,6 +787,7 @@ def _make_tools(bridge: ToolBridge) -> list:
         browser_wait_for, browser_navigate,
         # Customer care
         log_support_ticket,
+        get_support_ticket_status,
         create_ticket, update_ticket,
         # Tutor
         generate_quiz, track_progress, explain_concept,

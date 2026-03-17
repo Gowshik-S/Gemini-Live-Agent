@@ -55,7 +55,7 @@ echo "==> Building container image via Cloud Build"
 
 # Submit from the cloud/ directory where the Dockerfile lives
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLOUD_DIR="${SCRIPT_DIR}/cloud"
+CLOUD_DIR="${SCRIPT_DIR}/../cloud"
 
 if [[ ! -d "${CLOUD_DIR}" ]]; then
     echo "ERROR: cloud/ directory not found at ${CLOUD_DIR}"

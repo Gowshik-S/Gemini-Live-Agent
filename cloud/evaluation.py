@@ -19,8 +19,10 @@ SyntheticDataGenerator : Generates test scenarios for cold-start
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any
@@ -326,6 +328,48 @@ Respond ONLY with a JSON object (no markdown, no explanation):
         self._client = genai_client
         self._model = model
 
+    @staticmethod
+    def _extract_json_object(text: str) -> str:
+        """Extract first JSON object from model text, tolerating markdown/prose."""
+        cleaned = (text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        # Fast path: already pure JSON object
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            return cleaned
+
+        # Fallback: find first JSON object in surrounding prose
+        match = re.search(r"\{[\s\S]*\}", cleaned)
+        if match:
+            return match.group(0)
+        return cleaned
+
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            marker in msg
+            for marker in (
+                "429",
+                "500",
+                "502",
+                "503",
+                "504",
+                "quota",
+                "exhausted",
+                "rate",
+                "limit",
+                "timeout",
+                "temporar",
+                "unavailable",
+                "bad gateway",
+                "gateway timeout",
+                "connection",
+                "reset",
+            )
+        )
+
     async def evaluate(
         self,
         eval_result: EvaluationResult,
@@ -359,34 +403,47 @@ Respond ONLY with a JSON object (no markdown, no explanation):
             recalled_context=recalled_context[:500] or "(none)",
         )
 
-        try:
-            from google.genai import types as _types
-            response = await self._client.aio.models.generate_content(
-                model=self._model,
-                contents=prompt,
-                config=_types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=256,
-                ),
-            )
-            text = response.text.strip()
-            # Parse JSON from response (handle markdown code fences)
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        raw_text: str = ""
+        from google.genai import types as _types
 
-            scores_dict = json.loads(text)
-            return JudgeScores(
-                task_completion=float(scores_dict.get("task_completion", 0)),
-                efficiency=float(scores_dict.get("efficiency", 0)),
-                safety=float(scores_dict.get("safety", 0)),
-                output_quality=float(scores_dict.get("output_quality", 0)),
-                reasoning_quality=float(scores_dict.get("reasoning_quality", 0)),
-                hallucination_risk=float(scores_dict.get("hallucination_risk", 0)),
-                memory_relevance=float(scores_dict.get("memory_relevance", 0)),
-            )
-        except Exception as exc:
-            logger.warning("llm_judge.failed", error=str(exc))
-            return JudgeScores()  # Return zeros on failure
+        for attempt in range(3):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=self._model,
+                    contents=prompt,
+                    config=_types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=256,
+                    ),
+                )
+                # response.text can raise or be empty when candidate is blocked/invalid.
+                raw_text = (getattr(response, "text", None) or "").strip()
+                if not raw_text:
+                    raise ValueError("empty judge response text")
+
+                scores_dict = json.loads(self._extract_json_object(raw_text))
+                return JudgeScores(
+                    task_completion=float(scores_dict.get("task_completion", 0)),
+                    efficiency=float(scores_dict.get("efficiency", 0)),
+                    safety=float(scores_dict.get("safety", 0)),
+                    output_quality=float(scores_dict.get("output_quality", 0)),
+                    reasoning_quality=float(scores_dict.get("reasoning_quality", 0)),
+                    hallucination_risk=float(scores_dict.get("hallucination_risk", 0)),
+                    memory_relevance=float(scores_dict.get("memory_relevance", 0)),
+                )
+            except Exception as exc:
+                is_last = attempt == 2
+                if self._is_transient_error(exc) and not is_last:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                logger.warning(
+                    "llm_judge.failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    attempt=attempt + 1,
+                    response_preview=raw_text[:300],
+                )
+                return JudgeScores()  # Return zeros on failure
 
 
 # ---------------------------------------------------------------------------

@@ -95,14 +95,6 @@ def _build_base_instruction() -> str:
         "be specific and actionable. You have access to tools that can read files, "
         "write files, patch files, and run shell commands on the user's machine. "
         "Use them when the user asks you to examine, edit, or run code.\n\n"
-        "SUPPORT TICKET INTENT: When a user reports a complaint or unresolved issue "
-        "in voice/text (for example billing charge problems, delayed delivery, app "
-        "errors, login failures, broken features), proactively treat it as support "
-        "ticket intent. Extract issue_summary, category (billing/delivery/technical/other), "
-        "severity (low/medium/high), and user_name if mentioned. Then call "
-        "log_support_ticket. If the tool succeeds, confirm exactly: 'Your ticket "
-        "#<id> has been logged.' If it fails, apologize briefly and say you could "
-        "not log the ticket right now.\n\n"
         "SCREEN CAPTURE: You are NOT always seeing the user's screen. Screen "
         "vision is on-demand by default to save API credits. When the user asks "
         "you to look at their screen, check their code visually, or says anything "
@@ -252,13 +244,10 @@ def build_system_instruction() -> str:
     except ImportError:
         # profiles.py not available — use fallback generic instructions
         parts.append(
-            "\n\nCUSTOMER CARE MODE: When the user is handling customer support, you can "
-            "create and track support tickets using create_ticket and update_ticket. "
-            "When a customer complaint is detected from voice/text, extract issue_summary, "
-            "category (billing/delivery/technical/other), severity (low/medium/high), "
-            "and user_name if present, then call log_support_ticket. On success confirm "
-            "'Your ticket #<id> has been logged.' On failure, clearly say ticket logging "
-            "failed and apologize. Follow the HEAR "
+            "\n\nCUSTOMER CARE MODE: Apply these rules only when the customer care profile is enabled. "
+            "When enabled, create and track support tickets using create_ticket, update_ticket, "
+            "log_support_ticket, and get_support_ticket_status. For non-customer-care questions, "
+            "politely say you can only access customer support information. Follow the HEAR "
             "framework: Hear (listen fully), Empathize (validate), Act (resolve), "
             "Resolve (confirm). Use empathetic language. Never blame the customer. "
             "Detect frustration through voice/text signals and escalate when needed. "
@@ -422,6 +411,31 @@ RIO_TOOL_DECLARATIONS = [
                         },
                     },
                     "required": ["issue_summary", "category", "severity"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="get_support_ticket_status",
+                description=(
+                    "Retrieve support ticket status from Google Sheets, including "
+                    "current level and approximate resolution timeline."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "ticket_id": {
+                            "type": "string",
+                            "description": "Ticket ID if the user has it",
+                        },
+                        "user_name": {
+                            "type": "string",
+                            "description": "Customer name used to search matching tickets",
+                        },
+                        "issue_query": {
+                            "type": "string",
+                            "description": "Optional short issue description to narrow matches",
+                        },
+                    },
+                    "required": [],
                 },
             ),
             types.FunctionDeclaration(

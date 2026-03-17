@@ -51,6 +51,28 @@ function arrayToLines(id, arr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Toggle-driven config visibility
+// ═══════════════════════════════════════════════════════════════════════════
+function setProfileConfigVisibility(formId, enabled) {
+  const form = document.getElementById(formId);
+  if (!form) return;
+
+  form.querySelectorAll('.form-section').forEach(section => {
+    section.style.display = enabled ? '' : 'none';
+  });
+}
+
+function syncCustomerCareVisibility() {
+  const enabled = document.getElementById('cc-enabled').checked;
+  setProfileConfigVisibility('form-customer-care', enabled);
+}
+
+function syncTutorVisibility() {
+  const enabled = document.getElementById('tutor-enabled').checked;
+  setProfileConfigVisibility('form-tutor', enabled);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FAQ dynamic list
 // ═══════════════════════════════════════════════════════════════════════════
 let faqItems = [];
@@ -171,6 +193,7 @@ function populateCustomerCare(data) {
   // FAQ
   faqItems = (b.faq || []).map(f => ({ q: f.q || '', a: f.a || '' }));
   renderFaq();
+  syncCustomerCareVisibility();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -223,6 +246,7 @@ function populateTutor(data) {
   const mode = s.homework_help_mode || 'guide';
   const radio = document.querySelector(`input[name="homework-mode"][value="${mode}"]`);
   if (radio) radio.checked = true;
+  syncTutorVisibility();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -444,6 +468,10 @@ document.getElementById('form-agents').addEventListener('submit', async (e) => {
 // Init — load existing profiles on page load
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
+  // Keep config sections hidden until the corresponding skill is enabled.
+  document.getElementById('cc-enabled').addEventListener('change', syncCustomerCareVisibility);
+  document.getElementById('tutor-enabled').addEventListener('change', syncTutorVisibility);
+
   const [cc, tutor, , , agents] = await Promise.all([
     loadProfile('customer_care'),
     loadProfile('tutor'),
@@ -454,6 +482,10 @@ document.getElementById('form-agents').addEventListener('submit', async (e) => {
   if (cc) populateCustomerCare(cc);
   if (tutor) populateTutor(tutor);
   if (agents) populateAgents(agents);
+
+  // Apply initial visibility when no profile is loaded or defaults are active.
+  syncCustomerCareVisibility();
+  syncTutorVisibility();
 
   // Initialize FAQ list (render empty or loaded)
   renderFaq();

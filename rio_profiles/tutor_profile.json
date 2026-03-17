@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "enabled": false,
+  "student": {
+    "student_name": "Aarav",
+    "grade_level": "11th grade",
+    "age_group": "16-18",
+    "subjects": [
+      "Mathematics",
+      "Physics",
+      "Computer Science"
+    ],
+    "current_courses": [
+      "Calculus",
+      "Mechanics",
+      "Python Programming"
+    ],
+    "learning_goals": [
+      "Improve problem-solving speed",
+      "Build strong fundamentals in calculus",
+      "Prepare for engineering entrance exams"
+    ],
+    "strengths": [
+      "Logical reasoning",
+      "Pattern recognition"
+    ],
+    "weaknesses": [
+      "Word problems",
+      "Time management under exam pressure"
+    ],
+    "learning_style": "visual",
+    "preferred_difficulty": "intermediate",
+    "language": "English",
+    "topics_off_limits": [],
+    "homework_help_mode": "guide"
+  },
+  "socratic_mode": true
+}

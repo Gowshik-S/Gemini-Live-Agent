@@ -1065,7 +1065,12 @@ async def audio_capture_loop(
 
         # -- VAD gate (async to avoid blocking audio I/O) --------------------
         if has_vad:
-            result = await vad.process_async(chunk)
+            try:
+                result = await vad.process_async(chunk)
+            except Exception as exc:
+                # Keep voice loop alive on intermittent model/runtime failures.
+                log.warning("vad.process_failed", error=str(exc))
+                continue
             if not result.is_speech:
                 vad_was_speaking = False
                 continue
@@ -1133,7 +1138,10 @@ async def screen_capture_loop(
         """Drain the bounded queue and send frames to cloud."""
         nonlocal frames_sent
         while True:
-            jpeg = await pending_frames.get()
+            try:
+                jpeg = await pending_frames.get()
+            except asyncio.CancelledError:
+                return
             try:
                 await client.send_binary(IMAGE_PREFIX + jpeg)
                 frames_sent += 1
@@ -1149,45 +1157,49 @@ async def screen_capture_loop(
                 log.exception("screen_loop.send_error")
 
     # Start sender task
-    asyncio.create_task(_sender())
+    sender_task = asyncio.create_task(_sender(), name="screen_capture_sender")
 
-    while True:
-        # Block here until autonomous mode is activated
-        await autonomous_mode.wait()
-        await asyncio.sleep(interval)
+    try:
+        while True:
+            # Block here until autonomous mode is activated
+            await autonomous_mode.wait()
+            await asyncio.sleep(interval)
 
-        # Skip periodic capture during autonomous task — auto-capture handles it
-        if task_active is not None and task_active.is_set():
-            continue
+            # Skip periodic capture during autonomous task — auto-capture handles it
+            if task_active is not None and task_active.is_set():
+                continue
 
-        if not client.is_connected:
-            log.debug("screen_loop.waiting_reconnect")
-            await asyncio.sleep(2)
-            continue
+            if not client.is_connected:
+                log.debug("screen_loop.waiting_reconnect")
+                await asyncio.sleep(2)
+                continue
 
-        try:
-            jpeg = await screen.capture_async()
-            if jpeg is None:
-                continue  # unchanged frame — delta detected
-
-            # Sync monitor offset to screen navigator for coordinate mapping
-            if screen_navigator is not None:
-                cr = screen.get_last_capture_result()
-                if cr is not None:
-                    screen_navigator.update_monitor_offset(cr.monitor_left, cr.monitor_top)
-
-            # Backpressure: drop frame if queue is full (processing too slow)
             try:
-                pending_frames.put_nowait(jpeg)
-            except asyncio.QueueFull:
-                log.debug("screen_loop.frame_dropped", reason="backpressure")
+                jpeg = await screen.capture_async()
+                if jpeg is None:
+                    continue  # unchanged frame — delta detected
 
-        except ConnectionError:
-            log.debug("screen_loop.send_failed", reason="disconnected")
-            await asyncio.sleep(2)
-        except Exception:
-            log.exception("screen_loop.error")
-            await asyncio.sleep(1)
+                # Sync monitor offset to screen navigator for coordinate mapping
+                if screen_navigator is not None:
+                    cr = screen.get_last_capture_result()
+                    if cr is not None:
+                        screen_navigator.update_monitor_offset(cr.monitor_left, cr.monitor_top)
+
+                # Backpressure: drop frame if queue is full (processing too slow)
+                try:
+                    pending_frames.put_nowait(jpeg)
+                except asyncio.QueueFull:
+                    log.debug("screen_loop.frame_dropped", reason="backpressure")
+
+            except ConnectionError:
+                log.debug("screen_loop.send_failed", reason="disconnected")
+                await asyncio.sleep(2)
+            except Exception:
+                log.exception("screen_loop.error")
+                await asyncio.sleep(1)
+    finally:
+        sender_task.cancel()
+        await asyncio.gather(sender_task, return_exceptions=True)
 
 
 async def ui_navigator_loop(

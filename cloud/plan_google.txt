@@ -1,0 +1,12 @@
+For common users and one sign-in
+
+1 .Yes, you should move away from gcloud auth application-default login for end users.
+Use Google OAuth in Rio UI with one Sign in with Google button.
+Request minimal scopes:
+spreadsheets
+drive.file
+Store user refresh token securely per user session, then auto-refresh access tokens in backend.
+On first ticket action:
+If no sheet mapped for that user, create one automatically.
+Save user_id to sheet_id mapping in your app database.
+After that, every ticket write is automatic with no manual setup.

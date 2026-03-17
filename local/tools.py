@@ -74,6 +74,67 @@ def _get_env_value(name: str) -> str:
 
     return ""
 
+
+def _persist_env_value(name: str, value: str) -> bool:
+    """Persist an env var into rio/cloud/.env and process environment."""
+    env_file = Path(__file__).resolve().parent.parent / "cloud" / ".env"
+    existing_lines: list[str] = []
+    if env_file.is_file():
+        try:
+            existing_lines = env_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            log.warning("tools.env_write_read_failed", path=str(env_file), error=str(exc))
+            return False
+
+    updated_lines: list[str] = []
+    replaced = False
+    for raw_line in existing_lines:
+        line = raw_line.strip()
+        if line.startswith(f"{name}="):
+            updated_lines.append(f"{name}={value}")
+            replaced = True
+        else:
+            updated_lines.append(raw_line)
+
+    if not replaced:
+        if updated_lines and updated_lines[-1].strip():
+            updated_lines.append("")
+        updated_lines.append(f"{name}={value}")
+
+    try:
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
+        os.environ[name] = value
+        return True
+    except OSError as exc:
+        log.warning("tools.env_write_failed", path=str(env_file), error=str(exc))
+        return False
+
+
+def _is_customer_care_enabled() -> bool:
+    """Return whether customer care profile is enabled from setup profile JSON."""
+    profile_path = Path(__file__).resolve().parent.parent / "rio_profiles" / "customer_care_profile.json"
+    if not profile_path.is_file():
+        # Backward-compatible default when no profile exists.
+        return True
+    try:
+        raw = json.loads(profile_path.read_text(encoding="utf-8"))
+        return bool(raw.get("enabled", True))
+    except Exception:
+        return True
+
+
+def _format_support_reference_id(ticket_id: Any) -> str:
+    """Return a stable 4-digit reference ID for customer-facing ticket updates."""
+    try:
+        n = int(str(ticket_id).strip())
+        if n <= 0:
+            raise ValueError("ticket_id must be positive")
+        return str(((n - 1) % 9000) + 1000).zfill(4)
+    except Exception:
+        # Fallback: still provide a 4-digit code if ticket_id is unexpected.
+        return str((uuid.uuid4().int % 9000) + 1000).zfill(4)
+
 # ---------------------------------------------------------------------------
 # Safety constants
 # ---------------------------------------------------------------------------
@@ -106,6 +167,15 @@ COMMAND_BLOCKLIST = [
 COMMAND_TIMEOUT = 30  # seconds
 MAX_OUTPUT_SIZE = 100_000  # bytes — truncate large outputs
 MAX_FILE_READ = 100_000  # chars — truncate large file reads
+SUPPORT_SHEET_HEADERS = [
+    "Ticket ID",
+    "Timestamp",
+    "User",
+    "Category",
+    "Severity",
+    "Issue Summary",
+    "Status",
+]
 
 # Tool output truncation (B3) — prevent single tool calls from
 # consuming the entire model context window.
@@ -394,6 +464,7 @@ class ToolExecutor:
             "patch_file": self._patch_file,
             "run_command": self._run_command,
             "log_support_ticket": self._log_support_ticket,
+            "get_support_ticket_status": self._get_support_ticket_status,
             "create_ticket": self._create_ticket,
             "update_ticket": self._update_ticket,
             "generate_quiz": self._generate_quiz,
@@ -707,13 +778,14 @@ class ToolExecutor:
 
         Ticket ID is computed as last row number + 1 by reading the sheet first.
         """
-        sheet_id = _get_env_value("SUPPORT_SHEET_ID")
-        if not sheet_id:
+        if not _is_customer_care_enabled():
             return {
                 "success": False,
-                "error": "SUPPORT_SHEET_ID is not configured",
-                "user_message": "I couldn't log the ticket because support sheet configuration is missing.",
+                "error": "Customer care profile is disabled",
+                "user_message": "Customer care is currently disabled in setup, so I cannot access support tickets right now.",
             }
+
+        sheet_id = _get_env_value("SUPPORT_SHEET_ID")
 
         summary = (issue_summary or "").strip()
         if not summary:
@@ -737,6 +809,10 @@ class ToolExecutor:
         actor = (user_name or "").strip() or "Unknown"
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         sheet_range = os.environ.get("SUPPORT_SHEET_RANGE", "Sheet1!A:G").strip() or "Sheet1!A:G"
+        sheet_title = os.environ.get("SUPPORT_SHEET_TITLE", "Rio Support Tickets").strip() or "Rio Support Tickets"
+        auto_create_sheet = os.environ.get("SUPPORT_AUTO_CREATE_SHEET", "1").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -744,6 +820,8 @@ class ToolExecutor:
             self._log_support_ticket_sync,
             sheet_id,
             sheet_range,
+            sheet_title,
+            auto_create_sheet,
             actor,
             normalized_category,
             normalized_severity,
@@ -755,6 +833,8 @@ class ToolExecutor:
         self,
         sheet_id: str,
         sheet_range: str,
+        sheet_title: str,
+        auto_create_sheet: bool,
         user_name: str,
         category: str,
         severity: str,
@@ -780,13 +860,47 @@ class ToolExecutor:
             service = build("sheets", "v4", credentials=creds, cache_discovery=False)
             values_api = service.spreadsheets().values()
 
+            created_new_sheet = False
+            if not sheet_id:
+                if not auto_create_sheet:
+                    return {
+                        "success": False,
+                        "error": "SUPPORT_SHEET_ID is not configured",
+                        "user_message": "I couldn't log the ticket because support sheet configuration is missing.",
+                    }
+
+                create_resp = service.spreadsheets().create(
+                    body={"properties": {"title": sheet_title}},
+                    fields="spreadsheetId",
+                ).execute()
+                sheet_id = (create_resp or {}).get("spreadsheetId", "")
+                if not sheet_id:
+                    return {
+                        "success": False,
+                        "error": "Failed to create support sheet: missing spreadsheetId in response",
+                        "user_message": "I couldn't create the support ticket sheet automatically.",
+                    }
+
+                values_api.update(
+                    spreadsheetId=sheet_id,
+                    range="Sheet1!A1:G1",
+                    valueInputOption="RAW",
+                    body={"values": [SUPPORT_SHEET_HEADERS]},
+                ).execute()
+                _persist_env_value("SUPPORT_SHEET_ID", sheet_id)
+                created_new_sheet = True
+                log.info("tool.log_support_ticket.sheet_created", sheet_id=sheet_id, title=sheet_title)
+
             existing = values_api.get(
                 spreadsheetId=sheet_id,
                 range=sheet_range,
                 majorDimension="ROWS",
             ).execute()
             existing_rows = existing.get("values", [])
-            ticket_id = len(existing_rows) + 1
+            has_header = bool(existing_rows) and existing_rows[0][: len(SUPPORT_SHEET_HEADERS)] == SUPPORT_SHEET_HEADERS
+            data_rows = existing_rows[1:] if has_header else existing_rows
+            ticket_id = len(data_rows) + 1
+            reference_id = _format_support_reference_id(ticket_id)
 
             row = [
                 ticket_id,
@@ -809,6 +923,7 @@ class ToolExecutor:
             log.info(
                 "tool.log_support_ticket",
                 ticket_id=ticket_id,
+                reference_id=reference_id,
                 category=category,
                 severity=severity,
                 sheet_id=sheet_id,
@@ -817,13 +932,16 @@ class ToolExecutor:
             return {
                 "success": True,
                 "ticket_id": ticket_id,
+                "reference_id": reference_id,
                 "timestamp": timestamp,
                 "user": user_name,
                 "category": category,
                 "severity": severity,
                 "status": "OPEN",
+                "sheet_id": sheet_id,
+                "sheet_created": created_new_sheet,
                 "updated_range": append_result.get("updates", {}).get("updatedRange", ""),
-                "message": f"Your ticket #{ticket_id} has been logged.",
+                "message": f"Your ticket #{ticket_id} has been logged. Your reference ID is {reference_id}.",
             }
         except HttpError as exc:
             err_text = str(exc)
@@ -841,6 +959,241 @@ class ToolExecutor:
                 "error": f"Failed to log support ticket: {err_text}",
                 "user_message": "I couldn't log the ticket right now. Please try again in a moment.",
             }
+
+    # ------------------------------------------------------------------
+    # get_support_ticket_status  (Customer Care skill — Google Sheets)
+    # ------------------------------------------------------------------
+
+    async def _get_support_ticket_status(
+        self,
+        ticket_id: str = "",
+        user_name: str = "",
+        issue_query: str = "",
+    ) -> dict[str, Any]:
+        """Retrieve support ticket status from Google Sheets.
+
+        Matches by ticket_id first, then by user_name + issue_query fallback.
+        Returns ticket level, age in days, and a human-style summary.
+        """
+        if not _is_customer_care_enabled():
+            return {
+                "success": False,
+                "error": "Customer care profile is disabled",
+                "user_message": "Customer care is currently disabled in setup, so I cannot access support ticket status right now.",
+            }
+
+        sheet_id = _get_env_value("SUPPORT_SHEET_ID")
+        if not sheet_id:
+            return {
+                "success": False,
+                "error": "SUPPORT_SHEET_ID is not configured",
+                "user_message": "I couldn't find your ticket status because support sheet configuration is missing.",
+            }
+
+        sheet_range = os.environ.get("SUPPORT_SHEET_RANGE", "Sheet1!A:G").strip() or "Sheet1!A:G"
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            self._get_support_ticket_status_sync,
+            sheet_id,
+            sheet_range,
+            (ticket_id or "").strip(),
+            (user_name or "").strip(),
+            (issue_query or "").strip(),
+        )
+
+    def _get_support_ticket_status_sync(
+        self,
+        sheet_id: str,
+        sheet_range: str,
+        ticket_id: str,
+        user_name: str,
+        issue_query: str,
+    ) -> dict[str, Any]:
+        """Blocking Sheets lookup. Invoked via executor from async wrapper."""
+        try:
+            import google.auth
+            from googleapiclient.discovery import build
+            from googleapiclient.errors import HttpError
+        except ImportError as exc:
+            return {
+                "success": False,
+                "error": f"Google Sheets dependencies are missing: {exc}",
+                "user_message": "I couldn't check ticket status because Google Sheets dependencies are not installed.",
+            }
+
+        try:
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            )
+            service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            values_api = service.spreadsheets().values()
+
+            existing = values_api.get(
+                spreadsheetId=sheet_id,
+                range=sheet_range,
+                majorDimension="ROWS",
+            ).execute()
+            rows = existing.get("values", [])
+            if not rows:
+                return {
+                    "success": False,
+                    "error": "No tickets found in support sheet",
+                    "user_message": "I couldn't find any support tickets yet.",
+                }
+
+            data_rows = rows
+            if rows and rows[0][: len(SUPPORT_SHEET_HEADERS)] == SUPPORT_SHEET_HEADERS:
+                data_rows = rows[1:]
+
+            def _safe(row: list[str], idx: int) -> str:
+                if idx < len(row):
+                    return (row[idx] or "").strip()
+                return ""
+
+            normalized_ticket_id = ticket_id.strip().lstrip("#")
+            normalized_user = user_name.lower().strip()
+            normalized_query = issue_query.lower().strip()
+
+            matches: list[list[str]] = []
+            if normalized_ticket_id:
+                matches = [r for r in data_rows if _safe(r, 0) == normalized_ticket_id]
+
+            if not matches:
+                for r in data_rows:
+                    row_user = _safe(r, 2).lower()
+                    row_issue = _safe(r, 5).lower()
+                    user_ok = (not normalized_user) or (normalized_user in row_user)
+                    issue_ok = (not normalized_query) or (normalized_query in row_issue)
+                    if user_ok and issue_ok:
+                        matches.append(r)
+
+            if not matches:
+                return {
+                    "success": False,
+                    "error": "Ticket not found",
+                    "user_message": "I couldn't find a matching ticket. Please share your ticket ID or registered name.",
+                }
+
+            def _ticket_sort_key(row: list[str]) -> tuple[int, str]:
+                raw_tid = _safe(row, 0)
+                try:
+                    tid_num = int(raw_tid)
+                except ValueError:
+                    tid_num = 0
+                return (tid_num, _safe(row, 1))
+
+            ticket_row = sorted(matches, key=_ticket_sort_key)[-1]
+            row_ticket_id = _safe(ticket_row, 0)
+            row_timestamp = _safe(ticket_row, 1)
+            row_user = _safe(ticket_row, 2) or "Customer"
+            row_category = _safe(ticket_row, 3) or "other"
+            row_severity = _safe(ticket_row, 4) or "medium"
+            row_summary = _safe(ticket_row, 5)
+            row_status = (_safe(ticket_row, 6) or "OPEN").upper()
+
+            ticket_level = self._ticket_level_from_status(row_status)
+            age_days = self._ticket_age_days(row_timestamp)
+            eta_days = self._ticket_eta_days(row_severity, ticket_level, row_status)
+            human_summary = self._human_ticket_status_response(
+                row_user,
+                row_ticket_id,
+                row_status,
+                ticket_level,
+                age_days,
+                eta_days,
+            )
+
+            return {
+                "success": True,
+                "ticket_id": row_ticket_id,
+                "user": row_user,
+                "category": row_category,
+                "severity": row_severity,
+                "issue_summary": row_summary,
+                "status": row_status,
+                "level": ticket_level,
+                "age_days": age_days,
+                "eta_days": eta_days,
+                "message": human_summary,
+            }
+
+        except HttpError as exc:
+            err_text = str(exc)
+            log.warning("tool.get_support_ticket_status.http_error", error=err_text)
+            return {
+                "success": False,
+                "error": f"Google Sheets API error: {err_text}",
+                "user_message": "I couldn't check your ticket status right now due to a Google Sheets API issue.",
+            }
+        except Exception as exc:
+            err_text = f"{type(exc).__name__}: {exc}"
+            log.warning("tool.get_support_ticket_status.error", error=err_text)
+            return {
+                "success": False,
+                "error": f"Failed to check support ticket status: {err_text}",
+                "user_message": "I couldn't check your ticket status right now. Please try again shortly.",
+            }
+
+    @staticmethod
+    def _ticket_level_from_status(status: str) -> str:
+        s = (status or "").upper()
+        if "TIER_3" in s or "ENGINEERING" in s:
+            return "tier_3"
+        if "TIER_2" in s or "ESCALATED" in s:
+            return "tier_2"
+        if "RESOLVED" in s or "CLOSED" in s:
+            return "tier_0"
+        return "tier_1"
+
+    @staticmethod
+    def _ticket_age_days(timestamp: str) -> int:
+        if not timestamp:
+            return 0
+        try:
+            ts = timestamp.strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = now - dt.astimezone(timezone.utc)
+            return max(0, delta.days)
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _ticket_eta_days(severity: str, level: str, status: str) -> int:
+        s = (status or "").upper()
+        if s in {"RESOLVED", "CLOSED"}:
+            return 0
+
+        base = {"high": 1, "medium": 3, "low": 5}.get((severity or "medium").lower(), 3)
+        if level == "tier_2":
+            return base + 1
+        if level == "tier_3":
+            return base + 2
+        return base
+
+    @staticmethod
+    def _human_ticket_status_response(
+        user_name: str,
+        ticket_id: str,
+        status: str,
+        level: str,
+        age_days: int,
+        eta_days: int,
+    ) -> str:
+        age_text = "today" if age_days == 0 else f"{age_days} day(s) ago"
+        if status in {"RESOLVED", "CLOSED"}:
+            return (
+                f"{user_name}, your ticket #{ticket_id} is {status.lower()} at {level}. "
+                f"It was created {age_text}."
+            )
+        return (
+            f"{user_name}, your ticket #{ticket_id} is currently {status.lower()} at {level}. "
+            f"It was raised {age_text}, and the expected resolution window is about {eta_days} day(s)."
+        )
 
     # ------------------------------------------------------------------
     # create_ticket  (Customer Care skill)
@@ -1924,24 +2277,43 @@ class ToolExecutor:
 
             log.info("cu.single_snapshot", stage="model_called", target=target)
             response = None
-            try:
-                async with asyncio.timeout(3.5):
-                    response = await self._cu_generate_content(
-                        client,
-                        model="gemini-2.5-computer-use-preview-10-2025",
-                        contents=contents,
-                        config=_gtypes.GenerateContentConfig(
-                            temperature=0.0,
-                            max_output_tokens=128,
-                        ),
+            model_chain = [
+                os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
+                "gemini-2.5-flash",
+                "gemini-2.0-flash-exp",
+            ]
+            for candidate_model in model_chain:
+                try:
+                    async with asyncio.timeout(3.5):
+                        response = await self._cu_generate_content(
+                            client,
+                            model=candidate_model,
+                            contents=contents,
+                            config=_gtypes.GenerateContentConfig(
+                                temperature=0.0,
+                                max_output_tokens=128,
+                            ),
+                        )
+                    break
+                except TimeoutError:
+                    model_timed_out = True
+                    model_error = f"Model call timed out ({candidate_model})"
+                    log.warning(
+                        "cu.single_snapshot",
+                        stage="model_timeout",
+                        target=target,
+                        model=candidate_model,
+                        timeout_seconds=3.5,
                     )
-            except TimeoutError:
-                model_timed_out = True
-                model_error = "Model call timed out"
-                log.warning("cu.single_snapshot", stage="model_timeout", target=target, timeout_seconds=3.5)
-            except Exception as exc:
-                model_error = str(exc)
-                log.warning("cu.single_snapshot", stage="model_failed", target=target, error=model_error)
+                except Exception as exc:
+                    model_error = str(exc)
+                    log.warning(
+                        "cu.single_snapshot",
+                        stage="model_failed",
+                        target=target,
+                        model=candidate_model,
+                        error=model_error,
+                    )
 
             if response is not None:
                 xy = _extract_xy_from_text(_extract_response_text(response))
@@ -2017,245 +2389,29 @@ class ToolExecutor:
     async def _computer_use_ground(
         self, description: str,
     ) -> dict[str, Any]:
-        """Use the official Computer Use predefined-actions API to locate
-        an element on screen.
+        """Locate an element using text-only output from the CU model.
 
-        Follows the official Google agentic loop pattern:
-          1. Take screenshot → send with task description
-          2. Model returns predefined actions (click_at, type_text_at, etc.)
-             with 0-1000 normalized coordinates
-          3. Execute actions, capture new screenshot
-          4. Send FunctionResponse with screenshot as FunctionResponseBlob
-          5. Loop until model returns no more actions or max turns reached
-          6. Return coordinates of the first click_at action
+        This intentionally avoids Computer Use function/tool-calling and asks
+        the model to return plain JSON coordinates only.
         """
-        if self._screen_capture is None:
-            return {"success": False, "error": "Screen capture not attached"}
+        res = await self.confirm_click_target_single_snapshot(description)
+        if not res.get("success"):
+            return res
 
-        # Take initial screenshot (optimized PNG)
-        screenshot_mime = "image/png"
-        screenshot = await self._capture_optimized_for_cu()
-        if screenshot is None:
-            # Fallback to raw capture if optimization fails
-            screenshot = await self._screen_capture.capture_full_resolution_async()
-            if screenshot is None:
-                return {"success": False, "error": "Screenshot failed"}
-            screenshot_mime = "image/jpeg"
-
-        client = self._get_computer_use_client()
-        if client is None:
-            return {
-                "success": False,
-                "error": (
-                    "Neither GOOGLE_CLOUD_PROJECT (for Vertex AI) nor "
-                    "GEMINI_API_KEY is set. Computer Use model requires "
-                    "Vertex AI or paid billing."
-                ),
-            }
-
-        try:
-            from google.genai import types as _gtypes
-
-            # Resolve CU model robustly
-            try:
-                from rio.local.config import get_model as _get_model
-                cu_model = _get_model("computer_use")
-            except Exception:
-                cu_model = os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025")
-
-            # Build initial contents with screenshot + task description
-            # Build initial turn: Image then Text
-            contents: list = [
-                _gtypes.Content(role="user", parts=[
-                    _gtypes.Part.from_bytes(data=screenshot, mime_type=screenshot_mime),
-                    _gtypes.Part(text=(
-                        f"Find and click on: {description}\n"
-                        "Use the click_at tool to click the center of the element. "
-                        "If you need to scroll first, use screen_scroll."
-                    )),
-                ])
-            ]
-
-            # Official Computer Use config
-            config = _gtypes.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=1024,
-                tools=[
-                    _gtypes.Tool(
-                        computer_use=_gtypes.ComputerUse(
-                            environment=_gtypes.Environment.ENVIRONMENT_BROWSER,
-                        ),
-                    ),
-                ],
-            )
-
-            # Pillar 2: Robust Model Fallback Chain
-            cu_model_candidates = [
-                os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
-                "gemini-3-flash-preview",
-                "gemini-2.0-flash-exp",
-            ]
-
-            first_click = None
-            max_turns = 5 # Increased for complex multi-step grounding
-
-            for turn in range(max_turns):
-                # --- Call model with robust retry and fallback ---
-                response = None
-                last_exc = None
-                max_retries = 3
-                
-                # Attempt with candidate models if we hit a project access error
-                for cu_model in cu_model_candidates:
-                    model_access_denied = False
-                    for attempt in range(max_retries):
-                        try:
-                            response = await self._cu_generate_content(
-                                client,
-                                model=cu_model,
-                                contents=contents,
-                                config=config,
-                            )
-                            break
-                        except Exception as retry_exc:
-                            last_exc = retry_exc
-                            err_text = str(retry_exc).upper()
-                            
-                            # Check for project access error specifically
-                            if "UI ACTIONS ARE NOT ENABLED FOR THIS PROJECT" in err_text or "PERMISSION_DENIED" in err_text:
-                                log.warning("cu.model_access_denied", model=cu_model)
-                                model_access_denied = True
-                                break # try next model in candidate list
-                                
-                            if self._is_retryable_cu_error(err_text):
-                                wait = (attempt + 1) * 1.0
-                                log.warning("cu.retry", attempt=attempt + 1, wait=wait, error=err_text[:200])
-                                await asyncio.sleep(wait)
-                                continue
-                            raise
-                    
-                    if response: # Success with this model
-                        break
-                    if not model_access_denied: # Terminal error, don't try other models
-                        break
-                
-                if not response:
-                    diagnosed = await self._diagnose_cu_project_access(client)
-                    if diagnosed:
-                        log.error("cu.project_access_error", description=description, diagnosis=diagnosed)
-                        return {"success": False, "error": f"Computer Use unavailable: {diagnosed}"}
-                    
-                    log.error("cu.ground_error", description=description, error=str(last_exc))
-                    return {
-                        "success": False,
-                        "error": (
-                            f"Computer Use model error ({cu_model}): {last_exc}. "
-                            "API might be overloaded. Try screen_hotkey fallback."
-                        ),
-                    }
-
-
-                # --- Parse model response ---
-                candidate = response.candidates[0] if response.candidates else None
-                if candidate is None or candidate.content is None:
-                    return {"success": False, "error": "No response from Computer Use model"}
-
-                # Append model response to conversation history
-                contents.append(candidate.content)
-
-                # Extract function calls and thoughts
-                function_calls = []
-                thoughts = []
-                for part in candidate.content.parts or []:
-                    fc = getattr(part, "function_call", None)
-                    if fc:
-                        function_calls.append(fc)
-                    elif hasattr(part, "text") and part.text:
-                        thoughts.append(part.text)
-
-                if thoughts:
-                    log.debug("cu.reasoning", text=" ".join(thoughts)[:300])
-
-                # No actions → model is done (or element not found)
-                if not function_calls:
-                    if first_click:
-                        break  # We already found what we needed
-                    text = " ".join(thoughts) if thoughts else "(no explanation)"
-                    return {
-                        "success": False,
-                        "error": f"Element not found on screen: {description}. Model said: {text[:300]}",
-                    }
-
-                # --- Execute actions and capture feedback ---
-                any_action_executed = False
-                fn_responses = []
-                for fc in function_calls:
-                    log.info("cu.action", name=fc.name, args=fc.args)
-
-                    # Record first click_at coordinates
-                    if fc.name == "click_at" and first_click is None:
-                        nx = int(fc.args.get("x", 0))
-                        ny = int(fc.args.get("y", 0))
-                        first_click = {
-                            "normalized_x": nx,
-                            "normalized_y": ny,
-                            "x": self._denormalize_x(nx),
-                            "y": self._denormalize_y(ny),
-                        }
-
-                    # Execute action
-                    action_result = await self._execute_cu_action(fc.name, dict(fc.args or {}))
-                    any_action_executed = True
-                    
-                    # Capture screenshot for feedback
-                    feedback_screenshot = await self._capture_png_for_cu() or screenshot
-                    
-                    # Build professional FunctionResponse following guide
-                    resp_payload = {"success": action_result.get("success", True)}
-                    if action_result.get("safety_acknowledged"):
-                        resp_payload["safety_acknowledgement"] = True
-                    
-                    fn_responses.append(_gtypes.Part(
-                        function_response=_gtypes.FunctionResponse(
-                            name=fc.name,
-                            response=resp_payload,
-                            parts=[
-                                _gtypes.Part.from_bytes(
-                                    data=feedback_screenshot, 
-                                    mime_type="image/png"
-                                )
-                            ]
-                        )
-                    ))
-
-                # Append function responses to history
-                if fn_responses:
-                    contents.append(_gtypes.Content(role="user", parts=fn_responses))
-
-                # If we found a click target, we're done
-                if first_click:
-                    break
-
-            if first_click is None:
-                return {
-                    "success": False,
-                    "error": f"Element not found after {max_turns} turns: {description}",
-                }
-
-            return {
-                "success": True,
-                "x": first_click["x"],
-                "y": first_click["y"],
-                "normalized": {
-                    "x": first_click["normalized_x"],
-                    "y": first_click["normalized_y"],
-                },
-                "method": "computer_use_predefined_actions",
-            }
-
-        except Exception as exc:
-            log.exception("cu.ground_error", description=description, error=str(exc))
-            return {"success": False, "error": f"Computer Use model error: {exc}"}
+        x = int(res.get("x", 0))
+        y = int(res.get("y", 0))
+        return {
+            "success": True,
+            "x": x,
+            "y": y,
+            "normalized": {
+                "x": self._normalize_x(x),
+                "y": self._normalize_y(y),
+            },
+            "method": f"cu_text_coordinates:{res.get('method', 'unknown')}",
+            "model_timeout": bool(res.get("model_timeout", False)),
+            "model_error": res.get("model_error", ""),
+        }
 
     async def _smart_click(
         self,
@@ -2283,12 +2439,64 @@ class ToolExecutor:
             try:
                 ground = await self._computer_use_ground(target)
                 if not ground.get("success"):
-                    log.error("tool.smart_click.grounding_failed", error=ground.get("error"))
+                    log.warning("tool.smart_click.grounding_failed", error=ground.get("error"))
+                    # Fallback path: ask a general vision model for coordinates
+                    # and execute absolute click if available.
+                    fallback = await self.confirm_click_target_single_snapshot(target)
+                    if not fallback.get("success"):
+                        if hasattr(self, "_ws_send_json") and self._ws_send_json:
+                            await self._ws_send_json({
+                                "type": "tool_event_update",
+                                "name": "smart_click",
+                                "result": {
+                                    "success": False,
+                                    "error": ground.get("error") or "Smart click grounding failed",
+                                    "fallback_error": fallback.get("error"),
+                                },
+                            })
+                        return
+
+                    fx, fy = int(fallback["x"]), int(fallback["y"])
+                    fbutton = "right" if action == "right_click" else "left"
+                    fclicks = 2 if action == "double_click" else int(clicks)
+
+                    # If fallback already clicked directly, avoid duplicate click.
+                    if fallback.get("method") == "pyautogui_fallback":
+                        result = {
+                            "success": True,
+                            "action": "click_absolute",
+                            "found_at": {"x": fx, "y": fy},
+                            "target": target,
+                            "grounded_by": "single_snapshot_direct_fallback",
+                            "method": fallback.get("method"),
+                            "model_error": fallback.get("model_error"),
+                            "model_timeout": fallback.get("model_timeout"),
+                        }
+                    else:
+                        result = await self._screen_navigator.click_absolute(
+                            fx,
+                            fy,
+                            button=fbutton,
+                            clicks=fclicks,
+                        )
+                        result["target"] = target
+                        result["found_at"] = {"x": fx, "y": fy}
+                        result["grounded_by"] = "single_snapshot_fallback"
+                        result["method"] = fallback.get("method")
+                        result["model_error"] = fallback.get("model_error")
+                        result["model_timeout"] = fallback.get("model_timeout")
+
+                    log.info(
+                        "tool.smart_click.fallback_complete",
+                        target=target,
+                        success=result.get("success"),
+                        method=result.get("method"),
+                    )
                     if hasattr(self, "_ws_send_json") and self._ws_send_json:
                         await self._ws_send_json({
                             "type": "tool_event_update",
                             "name": "smart_click",
-                            "result": ground
+                            "result": result,
                         })
                     return
 
@@ -2548,7 +2756,65 @@ class ToolExecutor:
         mod = self._get_browser_mod()
         if mod is None:
             return {"success": False, "error": "Playwright not installed"}
-        return await mod["click_element"](selector, cdp_url)
+        primary = await mod["click_element"](selector, cdp_url)
+        if primary.get("success"):
+            return primary
+
+        if err := self._nav_or_error():
+            return {
+                "success": False,
+                "error": (
+                    f"Playwright click failed for selector '{selector}', and "
+                    f"screen fallback is unavailable: {err.get('error', 'screen navigator missing')}"
+                ),
+                "playwright_error": primary.get("error", ""),
+            }
+
+        # Browser architecture fallback: if DOM selector click fails,
+        # ask CU-text grounding for coordinates and click there.
+        grounded = await self.confirm_click_target_single_snapshot(
+            f"browser element matching CSS selector: {selector}"
+        )
+        if not grounded.get("success"):
+            return {
+                "success": False,
+                "error": (
+                    f"Playwright click failed and coordinate fallback failed for selector '{selector}'."
+                ),
+                "playwright_error": primary.get("error", ""),
+                "fallback_error": grounded.get("error", ""),
+            }
+
+        x, y = int(grounded["x"]), int(grounded["y"])
+        if grounded.get("method") == "pyautogui_fallback":
+            return {
+                "success": True,
+                "result": f"Clicked '{selector}' via coordinate fallback",
+                "current_url": primary.get("current_url", ""),
+                "fallback": True,
+                "method": grounded.get("method"),
+                "found_at": {"x": x, "y": y},
+                "playwright_error": primary.get("error", ""),
+            }
+
+        click_res = await self._screen_navigator.click_absolute(x, y, button="left", clicks=1)
+        if not click_res.get("success"):
+            return {
+                "success": False,
+                "error": "Playwright click failed and coordinate click execution failed",
+                "playwright_error": primary.get("error", ""),
+                "fallback_error": click_res.get("error", ""),
+            }
+
+        return {
+            "success": True,
+            "result": f"Clicked '{selector}' via coordinate fallback",
+            "current_url": primary.get("current_url", ""),
+            "fallback": True,
+            "method": grounded.get("method", "cu_text_coordinates"),
+            "found_at": {"x": x, "y": y},
+            "playwright_error": primary.get("error", ""),
+        }
 
     async def _browser_extract_text(self, selector: str, cdp_url: str = "http://localhost:9222") -> dict[str, Any]:
         mod = self._get_browser_mod()

@@ -1,0 +1,62 @@
+{
+  "version": "1.0",
+  "enabled": false,
+  "business": {
+    "business_name": "Rio Bank Customer Care",
+    "tagline": "Secure banking support, 24x7",
+    "industry": "",
+    "website": "https://www.riobank.example",
+    "products_services": [
+      "Savings Account",
+      "Current Account",
+      "Credit Card",
+      "Debit Card",
+      "Personal Loan",
+      "Home Loan",
+      "UPI and Net Banking"
+    ],
+    "return_policy": "Not applicable for banking services. Card replacement and charge dispute flows apply per policy.",
+    "refund_policy": "Erroneous charges are reversed after verification as per banking regulations.",
+    "shipping_policy": "Debit and credit cards are delivered within 5 to 7 business days.",
+    "warranty_policy": "Card and device token support as per bank service policy.",
+    "privacy_note": "",
+    "business_hours": "24x7 for card blocking and fraud reporting; general support Mon-Sat 8AM-10PM IST",
+    "support_channels": [
+      "email: support@riobank.example",
+      "phone: +1-800-555-0100",
+      "in-app chat"
+    ],
+    "escalation_email": "escalations@riobank.example",
+    "escalation_phone": "+1-800-555-0199",
+    "sla_response_time": "Critical fraud issues within 15 minutes; general queries within 4 hours",
+    "faq": [
+      {
+        "q": "How do I block my card immediately?",
+        "a": "Use the mobile app card controls or call emergency support to block your card instantly."
+      },
+      {
+        "q": "How do I raise a charge dispute?",
+        "a": "Share transaction date, amount, merchant name, and last 4 digits of card. We will register a dispute ticket."
+      },
+      {
+        "q": "I forgot my UPI PIN. What should I do?",
+        "a": "Use the app UPI settings to reset PIN with debit card verification. Never share OTP or PIN with anyone."
+      }
+    ],
+    "tone": "",
+    "language": "English",
+    "greeting": "Welcome to Rio Bank Customer Care. I am here to help you with your banking issue.",
+    "out_of_scope_topics": [
+      "investment advice",
+      "tax advice",
+      "legal advice"
+    ],
+    "redirect_message": "I can help only with Rio Bank customer support topics. For other questions, please contact the appropriate department."
+  },
+  "tier_rules": {
+    "tier_0": "Self-serve FAQs for simple information requests.",
+    "tier_1": "Agent handles account, card, and transaction support with ticket creation.",
+    "tier_2": "Escalate to specialist for unresolved disputes, KYC lockouts, or repeated transaction failures.",
+    "tier_3": "Escalate to fraud/risk or core banking engineering for confirmed incidents or outages."
+  }
+}
