@@ -95,6 +95,14 @@ def _build_base_instruction() -> str:
         "be specific and actionable. You have access to tools that can read files, "
         "write files, patch files, and run shell commands on the user's machine. "
         "Use them when the user asks you to examine, edit, or run code.\n\n"
+        "SUPPORT TICKET INTENT: When a user reports a complaint or unresolved issue "
+        "in voice/text (for example billing charge problems, delayed delivery, app "
+        "errors, login failures, broken features), proactively treat it as support "
+        "ticket intent. Extract issue_summary, category (billing/delivery/technical/other), "
+        "severity (low/medium/high), and user_name if mentioned. Then call "
+        "log_support_ticket. If the tool succeeds, confirm exactly: 'Your ticket "
+        "#<id> has been logged.' If it fails, apologize briefly and say you could "
+        "not log the ticket right now.\n\n"
         "SCREEN CAPTURE: You are NOT always seeing the user's screen. Screen "
         "vision is on-demand by default to save API credits. When the user asks "
         "you to look at their screen, check their code visually, or says anything "
@@ -184,6 +192,23 @@ def _build_base_instruction() -> str:
     )
 
 
+def load_prompt_from_markdown(filename: str) -> str:
+    """Load system prompt from a markdown file in the rio directory."""
+    import sys
+    from pathlib import Path
+    
+    # Path to rio/ directory
+    rio_dir = Path(__file__).resolve().parent.parent
+    md_path = rio_dir / filename
+    
+    if md_path.exists():
+        try:
+            return md_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return ""
+
+
 def build_system_instruction() -> str:
     """Build the full system instruction from base + loaded profiles.
 
@@ -193,7 +218,12 @@ def build_system_instruction() -> str:
     import sys
     from pathlib import Path as _Path
 
-    parts = [_build_base_instruction()]
+    # Load from markdown first, fallback to hardcoded base
+    base_instruction = load_prompt_from_markdown("agent_prompt.md")
+    if not base_instruction:
+        base_instruction = _build_base_instruction()
+        
+    parts = [base_instruction]
 
     # Attempt to load profiles — gracefully degrade if profiles module not available
     try:
@@ -223,7 +253,12 @@ def build_system_instruction() -> str:
         # profiles.py not available — use fallback generic instructions
         parts.append(
             "\n\nCUSTOMER CARE MODE: When the user is handling customer support, you can "
-            "create and track support tickets using create_ticket and update_ticket. Follow the HEAR "
+            "create and track support tickets using create_ticket and update_ticket. "
+            "When a customer complaint is detected from voice/text, extract issue_summary, "
+            "category (billing/delivery/technical/other), severity (low/medium/high), "
+            "and user_name if present, then call log_support_ticket. On success confirm "
+            "'Your ticket #<id> has been logged.' On failure, clearly say ticket logging "
+            "failed and apologize. Follow the HEAR "
             "framework: Hear (listen fully), Empathize (validate), Act (resolve), "
             "Resolve (confirm). Use empathetic language. Never blame the customer. "
             "Detect frustration through voice/text signals and escalate when needed. "
@@ -360,6 +395,35 @@ RIO_TOOL_DECLARATIONS = [
                 },
             ),
             # --- Customer Care Tools ---
+            types.FunctionDeclaration(
+                name="log_support_ticket",
+                description=(
+                    "Log a customer support complaint to the shared Google Sheet. "
+                    "Use when the user reports an issue that needs tracking."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "issue_summary": {
+                            "type": "string",
+                            "description": "Short summary of the customer's issue",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Issue category: billing, delivery, technical, or other",
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Severity level: low, medium, or high",
+                        },
+                        "user_name": {
+                            "type": "string",
+                            "description": "Customer or caller name if mentioned",
+                        },
+                    },
+                    "required": ["issue_summary", "category", "severity"],
+                },
+            ),
             types.FunctionDeclaration(
                 name="create_ticket",
                 description=(

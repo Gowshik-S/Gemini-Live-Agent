@@ -915,6 +915,30 @@ class ScreenNavigator:
             target = name_or_path.strip()
             resolved = _APP_ALIASES.get(target.lower(), target)
 
+            # Check for existing browser windows to reuse if possible
+            lower_target = target.lower()
+            if any(b in lower_target for b in ("chrome", "google chrome", "browser", "edge", "msedge", "brave")):
+                if _ensure_pygetwindow():
+                    try:
+                        all_windows = _pygetwindow.getAllWindows()
+                        # Simple heuristic: find window containing target name or browser keywords
+                        found = [w for w in all_windows if w.title and w.visible and any(
+                            b in w.title.lower() for b in ("chrome", "edge", "brave", "chromium")
+                        )]
+                        if found:
+                            log.info("open_application.reusing_window", title=found[0].title)
+                            # We can't easily await focus_window here as we are in a sync _open block
+                            # but we can do a best-effort activation.
+                            try:
+                                if found[0].isMinimized:
+                                    found[0].restore()
+                                found[0].activate()
+                            except Exception:
+                                pass
+                            return found[0].title, "reuse", None
+                    except Exception:
+                        pass
+
             # URLs or ms-* protocol links: use os.startfile on Windows
             if resolved.startswith(("http://", "https://", "ms-")):
                 if platform.system() == "Windows":

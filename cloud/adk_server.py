@@ -41,6 +41,7 @@ from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
 from starlette.websockets import WebSocketState
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 try:
     from .gemini_session import build_system_instruction
@@ -161,9 +162,9 @@ LIVE_MODEL, ORCHESTRATOR_MODEL = _resolve_models()
 # Whether the live model itself can invoke function calls.
 # gemini-2.5-flash-native-audio-preview-12-2025 DOES support function calling
 # per https://ai.google.dev/gemini-api/docs/live-api/tools
-# Live mode should expose the full toolset by default.
-# Set RIO_LIVE_MODEL_TOOLS=0 only if you explicitly want orchestrator-only tools.
-LIVE_MODEL_TOOLS = _env_flag("RIO_LIVE_MODEL_TOOLS", True)
+# Use orchestrator-mediated tools by default to avoid spontaneous direct
+# tool execution from residual model context during startup.
+LIVE_MODEL_TOOLS = _env_flag("RIO_LIVE_MODEL_TOOLS", False)
 
 ENABLE_SERVER_VAD = _env_flag("RIO_LIVE_ENABLE_SERVER_VAD", False)
 ENABLE_INPUT_AUDIO_TRANSCRIPTION = _env_flag(
@@ -174,6 +175,15 @@ ENABLE_OUTPUT_AUDIO_TRANSCRIPTION = _env_flag(
 )
 ENABLE_SESSION_RESUMPTION = _env_flag(
     "RIO_LIVE_ENABLE_SESSION_RESUMPTION", True,
+)
+ENABLE_HISTORY_RESTORE = _env_flag(
+    "RIO_LIVE_ENABLE_HISTORY_RESTORE", False,
+)
+ENABLE_PERSISTENT_CLIENT_SESSION = _env_flag(
+    "RIO_LIVE_ENABLE_PERSISTENT_CLIENT_SESSION", False,
+)
+ENABLE_RESUME_INTERRUPTED_TASKS = _env_flag(
+    "RIO_LIVE_ENABLE_RESUME_INTERRUPTED_TASKS", False,
 )
 
 # ---------------------------------------------------------------------------
@@ -215,6 +225,9 @@ dashboard_lock = asyncio.Lock()
 
 # Priority 4.4: basic user-scoped runtime registry
 _trigger_engines_by_user: dict[str, Any] = {}
+
+# Session continuity registry: user_id -> (ToolBridge, ToolOrchestrator)
+_active_sessions_by_user: dict[str, tuple[Any, Any]] = {}
 
 # Transcript buffer for dashboard
 _transcript_buffer: list[dict] = []
@@ -1143,9 +1156,47 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         return
 
     # ---- Create ToolBridge + tool functions ----
-    bridge = ToolBridge(websocket, broadcast_fn=_broadcast_dashboard)
-    tool_fns = _make_tools(bridge)
-    tool_map = {fn.__name__: fn for fn in tool_fns}
+    # Check for existing session to facilitate auto-resumption (Persistent Lane)
+    session_key = f"{user_id}"
+    
+    # We define a deferred inject proxy because the actual inject_context
+    # is defined further down, inside the active session block.
+    async def _deferred_inject(msg: str) -> None:
+        pass # Will be swapped later
+    
+    if ENABLE_PERSISTENT_CLIENT_SESSION and session_key in _active_sessions_by_user:
+        log.info("live.client.resuming_session", user_id=user_id)
+        bridge, orchestrator = _active_sessions_by_user[session_key]
+        bridge.rebind(websocket, _broadcast_dashboard)
+        # Update inject_context for running tasks
+        orchestrator.rebind(_deferred_inject)
+        tool_fns = _make_tools(bridge)
+        tool_map = {fn.__name__: fn for fn in tool_fns}
+    else:
+        bridge = ToolBridge(websocket, broadcast_fn=_broadcast_dashboard)
+        tool_fns = _make_tools(bridge)
+        tool_map = {fn.__name__: fn for fn in tool_fns}
+
+        # ---- Tool Orchestrator — parallel agentic executor ----
+        # Uses ORCHESTRATOR_MODEL (gemini-2.5-flash by default) with full
+        # function calling via generate_content while the live session handles
+        # voice I/O only.
+
+        # Wire long-term memory store (ChromaDB) for semantic search (A1)
+        # Use module-level singleton so the BGE model is loaded once at startup
+        # instead of blocking each WS connection for 4-6 seconds.
+        _mem_store = _get_shared_memory_store()
+
+        orchestrator = ToolOrchestrator(
+            genai_client=genai_client,
+            tool_fns=tool_fns,
+            model=ORCHESTRATOR_MODEL,
+            memory_store=_mem_store,
+            broadcast_fn=_broadcast_dashboard,
+        )
+        # Register in session registry only when explicit persistence is enabled.
+        if ENABLE_PERSISTENT_CLIENT_SESSION:
+            _active_sessions_by_user[session_key] = (bridge, orchestrator)
 
     # Convert callables → proper FunctionDeclaration objects.
     # Used ONLY when LIVE_MODEL_TOOLS=True (i.e. the live model supports tools).
@@ -1161,24 +1212,6 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             "live_model_tools.enabled",
             note="Direct Live tool execution can duplicate orchestrator actions and increase latency",
         )
-
-    # ---- Tool Orchestrator — parallel agentic executor ----
-    # Uses ORCHESTRATOR_MODEL (gemini-2.5-flash by default) with full
-    # function calling via generate_content while the live session handles
-    # voice I/O only.
-
-    # Wire long-term memory store (ChromaDB) for semantic search (A1)
-    # Use module-level singleton so the BGE model is loaded once at startup
-    # instead of blocking each WS connection for 4-6 seconds.
-    _mem_store = _get_shared_memory_store()
-
-    orchestrator = ToolOrchestrator(
-        genai_client=genai_client,
-        tool_fns=tool_fns,
-        model=ORCHESTRATOR_MODEL,
-        memory_store=_mem_store,
-        broadcast_fn=_broadcast_dashboard,
-    )
 
     # Priority 4.4: per-user workspace/policy overlay
     if shared_enabled:
@@ -1292,8 +1325,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 else:
                     log.info("live.session.started")
                     
-                    # Restore history on fresh connection
-                    if _current_conversation_messages:
+                    # Restore history on fresh connection only when explicitly enabled.
+                    if ENABLE_HISTORY_RESTORE and _current_conversation_messages:
                         history = _get_history_contents()
                         if history:
                             log.info("live.restoring_history", turns=len(history))
@@ -1466,12 +1499,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                             "source": "text",
                                         })
                                     else:
-                                        await session.send_client_content(
-                                            turns=types.Content(
-                                                role="user",
-                                                parts=[types.Part(text=content)],
-                                            ),
-                                            turn_complete=True,
+                                        await session.send_realtime_input(
+                                            text=content,
                                         )
 
                             elif frame_type == "context":
@@ -1543,12 +1572,30 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     cancellation) use turn_complete=True to trigger a
                     spoken response.
                     """
+                    import re
+
+                    # Strip machine-facing report schema so the voice model never
+                    # reads lines like "GROUNDED: true" or "INTERRUPT: false".
+                    voice_msg = re.sub(
+                        r"(?im)^\s*(SCREEN|USER_INPUT|INTERRUPT|CONTEXT|GROUNDED|AUTH_REQUIRED|AUTH_RESOLVED)\s*:\s*.*$",
+                        "",
+                        msg,
+                    )
+                    voice_msg = re.sub(
+                        r"(?i)\b(?:grounded|interrupt|auth_required|auth_resolved)\s*[:=]?\s*(?:true|false)\b",
+                        "",
+                        voice_msg,
+                    )
+                    voice_msg = re.sub(r"\n{3,}", "\n\n", voice_msg).strip()
+                    if not voice_msg:
+                        voice_msg = "[SYSTEM: I'm on it.]"
+
                     # Classify message: heartbeats are non-final context
                     # that should NOT interrupt the voice model.
                     is_heartbeat = (
-                        "[SYSTEM: Still working" in msg
-                        or "[SYSTEM: Approval required" in msg
-                        or "[REASONING]" in msg
+                        "[SYSTEM: Still working" in voice_msg
+                        or "[SYSTEM: Approval required" in voice_msg
+                        or "[REASONING]" in voice_msg
                     )
 
                     if _ws_is_open():
@@ -1567,7 +1614,7 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             await session.send_client_content(
                                 turns=types.Content(
                                     role="user",
-                                    parts=[types.Part(text=msg)],
+                                    parts=[types.Part(text=voice_msg)],
                                 ),
                                 # Heartbeats: turn_complete=False → voice
                                 # model treats this as background context
@@ -1576,6 +1623,11 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                 # model generates a spoken response.
                                 turn_complete=not is_heartbeat,
                             )
+                        except ConnectionClosedOK:
+                            # Normal close during reconnect/shutdown race.
+                            log.info("orchestrator.inject.skipped_closed_live_session")
+                        except ConnectionClosed:
+                            log.info("orchestrator.inject.skipped_closed_live_session")
                         except Exception:
                             log.warning("orchestrator.inject.failed", exc_info=True)
                     else:
@@ -1585,8 +1637,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     if _notifier and _notifier.is_enabled:
                         try:
                             # Only notify on actual task completions, not system messages
-                            if "task executor has completed" in msg.lower() or "task complete" in msg.lower():
-                                short_msg = msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
+                            if "task executor has completed" in voice_msg.lower() or "task complete" in voice_msg.lower():
+                                short_msg = voice_msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
                                 await _notifier.send(f"🤖 Rio: {short_msg}")
                         except Exception:
                             pass
@@ -1594,8 +1646,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     _channel_mgr = getattr(app.state, "channel_manager", None)
                     if _channel_mgr:
                         try:
-                            if "task executor has completed" in msg.lower() or "task complete" in msg.lower():
-                                short_msg = msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
+                            if "task executor has completed" in voice_msg.lower() or "task complete" in voice_msg.lower():
+                                short_msg = voice_msg[:200].replace("[SYSTEM:", "").strip().rstrip("]")
                                 await _channel_mgr.send_all(f"🤖 Rio: {short_msg}")
                         except Exception:
                             pass
@@ -1605,13 +1657,14 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     _trigger_engine._inject_fn = inject_context
                     await _trigger_engine.start()
 
-                # Resume any tasks that were interrupted by previous session disconnect
-                try:
-                    resumed = orchestrator.resume_interrupted_tasks(inject_context)
-                    if resumed:
-                        log.info("session.tasks_resumed", count=len(resumed))
-                except Exception:
-                    log.debug("session.resume_skip")
+                # Resume interrupted tasks only when explicitly enabled.
+                if ENABLE_RESUME_INTERRUPTED_TASKS:
+                    try:
+                        resumed = orchestrator.resume_interrupted_tasks(inject_context)
+                        if resumed:
+                            log.info("session.tasks_resumed", count=len(resumed))
+                    except Exception:
+                        log.debug("session.resume_skip")
 
                 # F6: Wire Telegram bot to route incoming messages as PC workspace tasks
                 _telegram_bot = getattr(app.state, "telegram_bot", None)
@@ -2189,16 +2242,21 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             log.exception("downstream.error")
                         raise
 
-                # ---- Run upstream + heartbeat + downstream concurrently ----
-                tasks = [
-                    asyncio.create_task(upstream_task(), name="upstream"),
-                    asyncio.create_task(heartbeat_task(), name="heartbeat"),
-                    asyncio.create_task(downstream_task(), name="downstream"),
-                ]
+                # ---- Run session tasks ----
+                upstream_handle = asyncio.create_task(upstream_task(), name="upstream")
+                downstream_handle = asyncio.create_task(downstream_task(), name="downstream")
+                heartbeat_handle = asyncio.create_task(heartbeat_task(), name="heartbeat")
+                tasks = [upstream_handle, heartbeat_handle, downstream_handle]
                 try:
                     done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED,
+                        {upstream_handle, downstream_handle},
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    # The heartbeat task is best-effort; it should not force
+                    # a full Live session reconnect when it exits.
+                    if not heartbeat_handle.done():
+                        pending.add(heartbeat_handle)
+
                     for t in pending:
                         t.cancel()
                     # Propagate exceptions from completed tasks
@@ -2230,6 +2288,8 @@ async def ws_rio_live(websocket: WebSocket) -> None:
 
     # Cancel any still-running orchestrator tasks for this session
     orchestrator.cancel_all()
+    if not ENABLE_PERSISTENT_CLIENT_SESSION:
+        _active_sessions_by_user.pop(session_key, None)
     # C5: Stop the trigger engine for this session
     if _trigger_engine is not None:
         try:

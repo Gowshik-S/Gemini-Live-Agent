@@ -3,6 +3,12 @@ rio:
   agent_role: assistant
   agent_tagline: Your Virtual Friend & Assistant
   agents:
+    browser_agent:
+      enabled: true
+      max_iterations: 10
+      model: gemini-3-flash-preview
+      tools: browser
+      description: "Web automation using Playwright/CDP - navigate URLs, fill forms, extract content, click elements, search the web"
     code_agent:
       enabled: true
       max_iterations: 15
@@ -18,7 +24,7 @@ rio:
     creative_agent:
       enabled: true
       max_iterations: 5
-      model: ''
+      model: gemini-3.1-pro-preview
       tools: creative
       description: "Image generation, video creation, design, illustration, drawing, creative content"
     research_agent:

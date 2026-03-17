@@ -60,12 +60,14 @@ const RioHealth = (() => {
     _uptimeStart = Date.now();
     _startUptime();
     _startLatencyPoll();
+    _setLatencyPillState('muted');
   }
 
   function _onDisconnect() {
     _stopUptime();
     _stopLatencyPoll();
     if (_latencyLabel) _latencyLabel.textContent = '-- ms';
+    _setLatencyPillState('muted');
   }
 
   function _onTranscript(data) {
@@ -84,10 +86,11 @@ const RioHealth = (() => {
   }
 
   function _onControl(data) {
+    if (!data || typeof data !== 'object') return;
     const action = data.action;
     if (action === 'session_mode') {
       const mode = data.actual_mode || data.requested_mode || '--';
-      if (_sessionLabel) _sessionLabel.textContent = mode;
+      if (_sessionLabel) _sessionLabel.textContent = String(mode);
 
       // Update session pill styling
       const pill = document.getElementById('session-pill');
@@ -104,7 +107,7 @@ const RioHealth = (() => {
     }
 
     if (action === 'live_ready') {
-      if (_modelLabel) _modelLabel.textContent = 'Live Flash';
+      if (_modelLabel) _modelLabel.textContent = data.model || 'Live Flash';
       const pill = document.getElementById('model-pill');
       if (pill) {
         pill.classList.remove('status-pill--info');
@@ -119,25 +122,38 @@ const RioHealth = (() => {
   }
 
   function _onHealth(data) {
+    if (!data || typeof data !== 'object') return;
     // Server-pushed health data
-    if (data.rpm !== undefined) _updateRPM(data.rpm);
-    if (data.model) {
-      if (_modelLabel) _modelLabel.textContent = data.model;
+    const rpm = _toFiniteNumber(data.rpm, data.current_rpm, data.requests_per_minute);
+    if (rpm !== null) _updateRPM(rpm);
+
+    const model = _coerceLabel(data.model, data.live_model, data.model_name);
+    if (model) _setModel(model);
+
+    const sessionMode = _coerceLabel(data.session_mode, data.mode, data.session);
+    if (sessionMode) _setSession(sessionMode);
+
+    const pushedLatency = _toFiniteNumber(data.latency_ms, data.latency, data.ping_ms);
+    if (pushedLatency !== null && _latencyLabel) {
+      _latencyLabel.textContent = `${Math.round(pushedLatency)} ms`;
     }
   }
 
   function _onRateLimit(data) {
-    if (data.current_rpm !== undefined) _updateRPM(data.current_rpm);
-    if (data.status) _updateRateLimitStatus(data.status);
+    if (!data || typeof data !== 'object') return;
+    const rpm = _toFiniteNumber(data.current_rpm, data.rpm);
+    if (rpm !== null) _updateRPM(rpm);
+    _updateRateLimitStatus(_coerceLabel(data.status, data.level, data.state) || 'unknown');
   }
 
   // ---- RPM ----
 
   function _updateRPM(value) {
-    _rpm = value;
-    if (_rpmCurrent) _rpmCurrent.textContent = value;
+    const safeValue = Math.max(0, Math.round(Number(value) || 0));
+    _rpm = safeValue;
+    if (_rpmCurrent) _rpmCurrent.textContent = safeValue;
 
-    const pct = Math.min(100, (value / RPM_BUDGET) * 100);
+    const pct = Math.min(100, (safeValue / RPM_BUDGET) * 100);
     if (_rpmBar) {
       _rpmBar.style.width = `${pct}%`;
       _rpmBar.classList.remove('progress-bar__fill--warning', 'progress-bar__fill--error');
@@ -152,21 +168,23 @@ const RioHealth = (() => {
   function _updateRateLimitStatus(status) {
     if (!_ratelimitValue) return;
 
+    const normalized = (status || 'unknown').toString().toLowerCase();
+
     _ratelimitValue.className = ''; // Reset
-    if (status === 'normal') {
+    if (normalized === 'normal') {
       _ratelimitValue.textContent = 'Normal';
       _ratelimitValue.classList.add('text-success');
-    } else if (status === 'caution') {
+    } else if (normalized === 'caution') {
       _ratelimitValue.textContent = 'Caution';
       _ratelimitValue.classList.add('text-warning');
-    } else if (status === 'emergency') {
+    } else if (normalized === 'emergency') {
       _ratelimitValue.textContent = 'Emergency';
       _ratelimitValue.classList.add('text-error');
-    } else if (status === 'critical') {
+    } else if (normalized === 'critical') {
       _ratelimitValue.textContent = 'Critical';
       _ratelimitValue.classList.add('text-error');
     } else {
-      _ratelimitValue.textContent = status;
+      _ratelimitValue.textContent = 'Unknown';
       _ratelimitValue.classList.add('text-muted');
     }
   }
@@ -214,16 +232,16 @@ const RioHealth = (() => {
       }
 
       // Update latency pill color
-      const pill = document.getElementById('latency-pill');
-      if (pill && lat !== null) {
-        pill.classList.remove('status-pill--muted', 'status-pill--connected', 'status-pill--connecting', 'status-pill--disconnected');
+      if (lat !== null) {
         if (lat < 2000) {
-          pill.classList.add('status-pill--connected');
+          _setLatencyPillState('connected');
         } else if (lat < 5000) {
-          pill.classList.add('status-pill--connecting');
+          _setLatencyPillState('connecting');
         } else {
-          pill.classList.add('status-pill--disconnected');
+          _setLatencyPillState('disconnected');
         }
+      } else {
+        _setLatencyPillState('muted');
       }
     }, 2000);
   }
@@ -233,6 +251,42 @@ const RioHealth = (() => {
       clearInterval(_latencyTimer);
       _latencyTimer = null;
     }
+  }
+
+  function _setModel(model) {
+    if (_modelLabel) _modelLabel.textContent = model;
+  }
+
+  function _setSession(mode) {
+    if (_sessionLabel) _sessionLabel.textContent = mode;
+  }
+
+  function _setLatencyPillState(state) {
+    const pill = document.getElementById('latency-pill');
+    if (!pill) return;
+    pill.classList.remove('status-pill--muted', 'status-pill--connected', 'status-pill--connecting', 'status-pill--disconnected');
+    if (state === 'connected') pill.classList.add('status-pill--connected');
+    else if (state === 'connecting') pill.classList.add('status-pill--connecting');
+    else if (state === 'disconnected') pill.classList.add('status-pill--disconnected');
+    else pill.classList.add('status-pill--muted');
+  }
+
+  function _coerceLabel(...values) {
+    for (const value of values) {
+      if (value !== undefined && value !== null) {
+        const text = String(value).trim();
+        if (text) return text;
+      }
+    }
+    return '';
+  }
+
+  function _toFiniteNumber(...values) {
+    for (const value of values) {
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
   }
 
   // Init on DOM ready

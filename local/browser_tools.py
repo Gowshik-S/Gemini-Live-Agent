@@ -84,7 +84,13 @@ _BROWSER_CANDIDATES: dict[str, list[str]] = {
     ],
 }
 
-_AUTO_ORDER = ["chrome", "edge", "chromium", "brave"]
+_AUTO_ORDER = ["chromium", "chrome", "edge", "brave"]
+_REQUIRE_CHROMIUM = os.environ.get("RIO_BROWSER_REQUIRE_CHROMIUM", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_SHOW_AUTOMATION_BANNER = os.environ.get("RIO_BROWSER_SHOW_AUTOMATION_BANNER", "1").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 def _find_browser_exe(browser: str) -> str | None:
@@ -98,13 +104,36 @@ def _find_browser_exe(browser: str) -> str | None:
 
 def _resolve_browser_exe(browser: str) -> str | None:
     """Resolve browser name to exe path, trying auto-detection order."""
-    if browser.lower() == "auto":
+    browser_lc = browser.lower()
+    if browser_lc == "auto":
+        if _REQUIRE_CHROMIUM:
+            exe = _find_browser_exe("chromium")
+            if exe:
+                log.info("browser.auto_resolved", requested="auto", resolved="chromium", exe=exe)
+                return exe
+            log.warning(
+                "browser.chromium_not_found",
+                requested="auto",
+                mode="require_chromium",
+                note="Falling back to Playwright bundled Chromium",
+            )
+            return None
         for name in _AUTO_ORDER:
             exe = _find_browser_exe(name)
             if exe:
+                log.info("browser.auto_resolved", requested="auto", resolved=name, exe=exe)
                 return exe
         return None
-    return _find_browser_exe(browser)
+
+    exe = _find_browser_exe(browser_lc)
+    if browser_lc == "chromium" and not exe:
+        log.warning(
+            "browser.chromium_not_found",
+            requested="chromium",
+            mode="explicit",
+            note="Using Playwright bundled Chromium",
+        )
+    return exe
 
 
 def _get_persistent_user_data_dir(profile: str) -> Path:
@@ -267,10 +296,15 @@ async def _launch_with_playwright(
     base_launch_args = [
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
         "--remote-debugging-port=9222", # Enable CDP for future connections
     ]
+    # Keep Chrome's automation infobar visible by default so users can
+    # verify the session is tool-controlled. Allow opt-out via env var.
+    if not _SHOW_AUTOMATION_BANNER:
+        base_launch_args.extend([
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+        ])
 
     # ── Strategy 1: Try actual Chrome user profile ─────────────────────────
     # If no profile specified, we default to "Default" to use the user's main profile
@@ -289,6 +323,7 @@ async def _launch_with_playwright(
             profile=target_profile,
             user_data_dir=str(actual_dir),
             profile_dir=profile_dir_name or "(not found in Local State)",
+            automation_banner_visible=_SHOW_AUTOMATION_BANNER,
         )
         try:
             kwargs: dict[str, Any] = {
@@ -334,6 +369,7 @@ async def _launch_with_playwright(
         exe=exe or "playwright-bundled",
         profile=profile or "default",
         user_data_dir=str(user_data_dir),
+        automation_banner_visible=_SHOW_AUTOMATION_BANNER,
     )
 
     _context = await pw.chromium.launch_persistent_context(
@@ -371,6 +407,8 @@ async def browser_connect(
                   the shared Rio automation profile.
     """
     cdp_url = cdp_url.replace("localhost", "127.0.0.1")
+    if browser.lower() == "auto" and _REQUIRE_CHROMIUM:
+        browser = "chromium"
 
     # Try CDP connect or reuse existing page
     page = await _ensure_connection(cdp_url)
@@ -454,7 +492,12 @@ async def browser_click_element(
         if page is None:
             return {"success": False, "error": "No browser connected. Call browser_connect first."}
         await page.click(selector, timeout=10000)
-        return {"success": True, "result": f"Clicked '{selector}'"}
+        # Verify page state after click
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass # It's okay if it doesn't trigger a full navigation
+        return {"success": True, "result": f"Clicked '{selector}'", "current_url": page.url}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -528,6 +571,11 @@ async def browser_navigate(
         if page is None:
             return {"success": False, "error": "No browser connected. Call browser_connect first."}
         await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        # Verify page state after navigation
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
         return {
             "success": True,
             "result": {

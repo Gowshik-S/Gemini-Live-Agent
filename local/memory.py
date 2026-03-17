@@ -40,8 +40,8 @@ except ImportError:
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "memory")
 # Dimension change (768 -> 3072) requires a new v2 collection
 DEFAULT_COLLECTION = "rio_interactions_gemini_v2"
-# Gemini API-supported text embedding model (Gemini 2.0 era)
-DEFAULT_MODEL_NAME = os.environ.get("RIO_EMBEDDING_MODEL", "gemini-embedding-2-preview")
+# Prefer a stable default unless explicitly overridden via env.
+DEFAULT_MODEL_NAME = os.environ.get("RIO_EMBEDDING_MODEL", "gemini-embedding-001")
 MAX_RECALL = 8 # Higher recall possible with 3072 dims
 
 # Minimum content length to store (skip trivial exchanges)
@@ -104,6 +104,7 @@ class MemoryStore:
         self.collection_name = collection_name
         self.max_recall = max_recall
         self._model_name = model_name
+        self._notes_kv: dict[str, str] = {}
         # Fallbacks for accounts/regions where a model is unavailable.
         # Keep order deterministic and prefer stable over preview.
         self._embedding_model_fallbacks = [
@@ -112,6 +113,30 @@ class MemoryStore:
             "gemini-embedding-001",
         ]
         self._client_ref = genai_client
+        self._vertex_client = None
+        self._use_vertex_for_embeddings = os.environ.get(
+            "RIO_MEMORY_USE_VERTEX",
+            os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", ""),
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        if gcp_project and self._use_vertex_for_embeddings:
+            try:
+                from google import genai as _genai
+                self._vertex_client = _genai.Client(
+                    vertexai=True,
+                    project=gcp_project,
+                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+                )
+                log.info("memory.vertex_client_initialized", project=gcp_project)
+            except Exception as e:
+                log.debug("memory.vertex_client_failed", error=str(e))
+        elif gcp_project and not self._use_vertex_for_embeddings:
+            log.info(
+                "memory.vertex_client_skipped",
+                project=gcp_project,
+                reason="RIO_MEMORY_USE_VERTEX/GOOGLE_GENAI_USE_VERTEXAI not enabled",
+            )
+
         self._extractor = EntityExtractor()
 
         # ── Initialize ChromaDB ───────────────────────────────────
@@ -140,6 +165,52 @@ class MemoryStore:
                  model=self._model_name,
                  collection=self.collection_name)
 
+    # ── Backward-compatible Notes API ─────────────────────────────
+
+    def save_note(
+        self,
+        key: str,
+        value: str,
+        persist_vector: bool = True,
+        media_parts: Optional[list[Any]] = None,
+    ) -> bool:
+        """Compatibility layer for orchestrator memory tools.
+
+        Stores key/value notes in-memory for fast retrieval and optionally
+        persists them to the vector store for cross-session recall.
+        """
+        k = (key or "").strip()
+        v = (value or "").strip()
+        if not k or not v:
+            return False
+
+        self._notes_kv[k] = v
+
+        if persist_vector:
+            note_text = f"{k}: {v}"
+            try:
+                self.add(
+                    content=note_text,
+                    entry_type="note",
+                    metadata={"note_key": k, "note_value": v},
+                    media_parts=media_parts,
+                )
+            except Exception as exc:
+                log.warning("memory.save_note.persist_failed", key=k, error=str(exc))
+
+        return True
+
+    def get_notes(self, key: str = "") -> dict[str, str] | str | None:
+        """Compatibility layer for orchestrator memory tools.
+
+        Returns a single value for a key when provided, otherwise returns all
+        notes captured in this process.
+        """
+        k = (key or "").strip()
+        if k:
+            return self._notes_kv.get(k)
+        return dict(self._notes_kv)
+
     def set_client(self, client: Any) -> None:
         """Dynamically update the GenAI client reference."""
         self._client_ref = client
@@ -148,7 +219,7 @@ class MemoryStore:
 
     def _get_embedding(self, contents: Any, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
         """Call Gemini API to generate embeddings for multimodal contents."""
-        if not self._client_ref:
+        if not getattr(self, "_client_ref", None) and not getattr(self, "_vertex_client", None):
             # Fallback to dummy zero vector if no client (should not happen in prod)
             log.warning("memory.no_client_for_embedding")
             return [0.0] * 3072
@@ -161,14 +232,29 @@ class MemoryStore:
         last_exc: Exception | None = None
         for idx, model_name in enumerate(candidate_models):
             try:
-                result = self._client_ref.models.embed_content(
+                # 3072 is specific to gemini-embedding-2. text-embedding-004 defaults to 768.
+                config = {"task_type": task_type}
+                if "gemini-embedding-2" in model_name:
+                    config["output_dimensionality"] = 3072
+                elif "text-embedding-004" in model_name:
+                    config["output_dimensionality"] = 768
+                
+                # Use synchronous embed_content if client is synchronous, or wrap it.
+                # adk_server uses the sync client for orchestrator tasks sometimes.
+                # Here we use the standard sync client pattern.
+                active_client = getattr(self, "_client_ref", None)
+                if "gemini-embedding-2" in model_name and getattr(self, "_vertex_client", None):
+                    active_client = self._vertex_client
+                    
+                if active_client is None:
+                    raise ValueError(f"No valid client available for model {model_name}")
+
+                result = active_client.models.embed_content(
                     model=model_name,
                     contents=contents,
-                    config={
-                        "task_type": task_type,
-                        "output_dimensionality": 3072,
-                    },
+                    config=config,
                 )
+                
                 # Persist the working model to avoid repeated failed attempts.
                 if model_name != self._model_name:
                     prev = self._model_name
@@ -178,7 +264,15 @@ class MemoryStore:
                         from_model=prev,
                         to_model=model_name,
                     )
-                return result.embeddings[0].values
+                    
+                # Pad to 3072 if we fell back to a 768-dim model, 
+                # because the ChromaDB collection was initialized with 3072.
+                # ChromaDB requires all vectors in a collection to have the same length.
+                vals = result.embeddings[0].values
+                if len(vals) < 3072:
+                    vals = vals + [0.0] * (3072 - len(vals))
+                    
+                return vals
             except Exception as exc:
                 last_exc = exc
                 err = str(exc)
@@ -187,6 +281,7 @@ class MemoryStore:
                     or "not found" in err.lower()
                     or "INVALID_ARGUMENT" in err
                     or "not supported" in err.lower()
+                    or "404" in err
                 )
                 log.error(
                     "memory.embedding_attempt_failed",
@@ -198,7 +293,7 @@ class MemoryStore:
                     break
 
         log.error("memory.embedding_failed", error=str(last_exc) if last_exc else "unknown")
-        return [0.0] * 768
+        return [0.0] * 3072
 
     # ── Store ─────────────────────────────────────────────────────
 

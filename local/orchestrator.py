@@ -67,6 +67,34 @@ try:
 except ImportError:
     _GENAI_AVAILABLE = False
 
+def load_prompt_from_markdown(filename: str) -> str:
+    """Load system prompt from a markdown file in the rio directory."""
+    from pathlib import Path
+    rio_dir = Path(__file__).resolve().parent.parent
+    md_path = rio_dir / filename
+    if md_path.exists():
+        try:
+            return md_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return ""
+
+def get_orchestrator_prompt() -> str:
+    """Load the Orchestrator prompt from markdown, or fallback to default."""
+    import re
+    md_content = load_prompt_from_markdown("orchestration.md")
+    if md_content:
+        pattern = r'ORCHESTRATOR_SYSTEM_PROMPT\s*=\s*"""(.*?)"""'
+        match = re.search(pattern, md_content, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return md_content.strip()
+        
+    return """
+You are a task planning agent. Given a user's goal, break it down into concrete, 
+actionable steps. Return a JSON array of step objects.
+"""
+
 PRO_MODEL = MODEL_PRO
 FLASH_MODEL = MODEL_FLASH
 
@@ -306,7 +334,7 @@ class Orchestrator:
                         model=model,
                         contents=f"User goal: {goal}",
                         config=types.GenerateContentConfig(
-                            system_instruction=PLAN_SYSTEM_PROMPT,
+                            system_instruction=get_orchestrator_prompt(),
                             temperature=0.3,
                             max_output_tokens=2048,
                         ),
@@ -317,7 +345,7 @@ class Orchestrator:
                     model=PRO_MODEL,
                     contents=f"User goal: {goal}",
                     config=types.GenerateContentConfig(
-                        system_instruction=PLAN_SYSTEM_PROMPT,
+                        system_instruction=get_orchestrator_prompt(),
                         temperature=0.3,
                         max_output_tokens=2048,
                     ),

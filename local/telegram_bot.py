@@ -216,6 +216,11 @@ class TelegramBot:
         while self._running:
             try:
                 updates = await self._get_updates()
+                if not updates:
+                    # Prevent tight loops if network fails instantly
+                    await asyncio.sleep(1.0)
+                    continue
+                    
                 for update in updates:
                     await self._handle_update(update)
             except asyncio.CancelledError:
@@ -233,6 +238,9 @@ class TelegramBot:
         })
         if result.get("success") and isinstance(result.get("data"), list):
             return result["data"]
+        else:
+            if result.get("error"):
+                log.debug("telegram_bot.get_updates_failed", error=result["error"])
         return []
 
     async def _handle_update(self, update: dict) -> None:

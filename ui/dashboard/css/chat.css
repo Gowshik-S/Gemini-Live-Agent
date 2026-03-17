@@ -1,7 +1,7 @@
 /* ==========================================================================
-   Rio Chat Page — Styles
-   Extends the base Obsidian Slate theme from style.css
-   ========================================================================== */
+  Rio Chat Page — Styles
+  Extends the base dark monochrome theme from style.css
+  ========================================================================== */
 
 /* --------------------------------------------------------------------------
    Layout: Sidebar + Main
@@ -56,8 +56,8 @@
 
 .btn-icon:hover {
   background: var(--bg-surface-hover);
-  color: var(--primary);
-  border-color: var(--primary-dim);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
 }
 
 .chat-sidebar__list {
@@ -91,7 +91,7 @@
 
 .conv-item--active {
   background: var(--primary-bg);
-  border: 1px solid rgba(108, 99, 255, 0.2);
+  border: 1px solid var(--border-strong);
 }
 
 .conv-item--active:hover {
@@ -111,8 +111,8 @@
 }
 
 .conv-item--active .conv-item__icon {
-  background: var(--primary-dim);
-  color: #fff;
+  background: var(--bg-surface-soft);
+  color: var(--text-primary);
 }
 
 .conv-item__body {
@@ -150,8 +150,8 @@
 }
 
 .conv-item--active .conv-item__count {
-  background: rgba(108, 99, 255, 0.15);
-  color: var(--primary);
+  background: var(--bg-surface-soft);
+  color: var(--text-secondary);
 }
 
 /* Active indicator dot */
@@ -159,7 +159,7 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--success);
+  background: #f2f2f2;
   flex-shrink: 0;
   margin-top: 5px;
   animation: pulse-live 2s infinite;
@@ -178,7 +178,7 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg-base);
+  background: var(--bg-deep);
 }
 
 .chat-messages {
@@ -275,19 +275,19 @@
 }
 
 .chat-msg--user .chat-msg__bubble {
-  background: var(--primary);
-  color: #fff;
+  background: #f2f2f2;
+  color: #101010;
   border-bottom-right-radius: 4px;
 }
 
 .chat-msg--rio .chat-msg__bubble {
-  background: var(--bg-elevated);
+  background: var(--bg-surface-soft);
   border-bottom-left-radius: 4px;
 }
 
 .chat-msg--system .chat-msg__bubble {
   background: var(--bg-surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-subtle);
   font-size: 11px;
   color: var(--text-tertiary);
   text-align: center;

@@ -127,7 +127,7 @@ class SkillsConfig:
 
 @dataclass
 class BrowserConfig:
-    default_browser: str = "chrome"  # "chrome" | "edge" | "auto"
+    default_browser: str = "chromium"  # "chrome" | "chromium" | "edge" | "auto"
     default_profile: str = "Default"  # "Default" or empty for shared Rio profile
 
 
@@ -207,6 +207,7 @@ class RioConfig:
             models=_build(ModelConfig, d.get("models")),
             logging=_build(LoggingConfig, d.get("logging")),
             skills=_build_skills(d.get("skills")),
+            browser=_build(BrowserConfig, d.get("browser")),
         )
 
     # ------------------------------------------------------------------

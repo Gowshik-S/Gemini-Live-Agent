@@ -44,6 +44,31 @@ except ImportError:
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output", "creative")
 
 
+def load_prompt_from_markdown(filename: str) -> str:
+    """Load system prompt from a markdown file in the rio directory."""
+    rio_dir = Path(__file__).resolve().parent.parent
+    md_path = rio_dir / filename
+    if md_path.exists():
+        try:
+            return md_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return ""
+
+def get_creative_agent_prompt() -> str:
+    """Load the Creative Agent prompt from markdown, or fallback to default."""
+    import re
+    md_content = load_prompt_from_markdown("creative_agent.md")
+    if md_content:
+        pattern = r'CREATIVE_AGENT_SYSTEM_PROMPT\s*=\s*"""(.*?)"""'
+        match = re.search(pattern, md_content, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return md_content.strip()
+        
+    return "You are a creative assistant. Be creative, engaging, and concise."
+
+
 class CreativeAgent:
     """Creative content generation agent using Gemini + Imagen.
 
@@ -354,7 +379,7 @@ class CreativeAgent:
 
         if is_text or (not is_image and not is_video):
             # Default to text generation
-            system = "You are a creative assistant. Be creative, engaging, and concise."
+            system = get_creative_agent_prompt()
             txt_result = await self.generate_text(goal, system_instruction=system)
             if txt_result.get("success"):
                 results.append(txt_result["text"])

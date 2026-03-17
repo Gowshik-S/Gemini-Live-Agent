@@ -29,7 +29,8 @@ const RioSocket = (() => {
   /**
    * Register an event handler.
    * Events: 'open', 'close', 'message', 'transcript', 'tool_call',
-   *         'tool_result', 'struggle', 'vision', 'control', 'health'
+    *         'tool_result', 'tool_event_update', 'struggle', 'vision',
+    *         'control', 'health', 'rate_limit'
    */
   function on(event, fn) {
     if (!_handlers[event]) _handlers[event] = [];
@@ -102,21 +103,7 @@ const RioSocket = (() => {
 
       _emit('message', data);
 
-      // Route by type
-      const type = data.type;
-      if (type === 'transcript') {
-        _emit('transcript', data);
-      } else if (type === 'dashboard') {
-        const sub = data.subtype;
-        if (sub === 'tool_call')    _emit('tool_call', data);
-        if (sub === 'tool_result')  _emit('tool_result', data);
-        if (sub === 'struggle')     _emit('struggle', data);
-        if (sub === 'vision')       _emit('vision', data);
-        if (sub === 'health')       _emit('health', data);
-        if (sub === 'rate_limit')   _emit('rate_limit', data);
-      } else if (type === 'control') {
-        _emit('control', data);
-      }
+      _routeMessage(data);
     };
 
     _ws.onerror = (e) => {
@@ -176,6 +163,116 @@ const RioSocket = (() => {
   }
 
   // ---- Internals ----
+
+  function _routeMessage(rawData) {
+    const envelope = _normalizeEnvelope(rawData);
+    const type = envelope.type;
+    const subtype = envelope.subtype;
+
+    if (type === 'transcript' || (subtype === 'transcript' && type === 'dashboard')) {
+      _emit('transcript', envelope.payload);
+      return;
+    }
+
+    if (type === 'tool_call' || subtype === 'tool_call') {
+      _emit('tool_call', _normalizeToolPayload(envelope.payload));
+      return;
+    }
+
+    if (type === 'tool_result' || subtype === 'tool_result') {
+      _emit('tool_result', _normalizeToolPayload(envelope.payload));
+      return;
+    }
+
+    if (type === 'tool_event_update' || subtype === 'tool_event_update') {
+      _emit('tool_event_update', _normalizeToolPayload(envelope.payload));
+      return;
+    }
+
+    if (type === 'dashboard') {
+      if (subtype === 'struggle') _emit('struggle', envelope.payload);
+      if (subtype === 'vision') _emit('vision', envelope.payload);
+      if (subtype === 'health') _emit('health', envelope.payload);
+      if (subtype === 'rate_limit') _emit('rate_limit', envelope.payload);
+      return;
+    }
+
+    if (type === 'control' || subtype === 'control') {
+      _emit('control', envelope.payload);
+      return;
+    }
+  }
+
+  function _normalizeEnvelope(data) {
+    const payload = data && typeof data === 'object' ? data : {};
+    const nestedPayload = _firstObject(payload.payload, payload.data, payload.event, payload.detail);
+    const merged = nestedPayload ? Object.assign({}, nestedPayload, payload) : payload;
+
+    let type = _asString(
+      merged.type,
+      merged.event_type,
+      merged.eventType,
+      merged.kind,
+      merged.channel,
+    );
+
+    let subtype = _asString(
+      merged.subtype,
+      merged.event,
+      merged.event_name,
+      merged.action,
+      merged.name,
+    );
+
+    if (!type && subtype) type = 'dashboard';
+
+    // Preserve existing transcript behavior when server sends speaker/text payload only.
+    if (!type && merged.speaker && Object.prototype.hasOwnProperty.call(merged, 'text')) {
+      type = 'transcript';
+      subtype = 'transcript';
+    }
+
+    return {
+      type,
+      subtype,
+      payload: merged,
+    };
+  }
+
+  function _normalizeToolPayload(data) {
+    const payload = data && typeof data === 'object' ? data : {};
+    const result = _firstObject(payload.result, payload.payload) || {};
+
+    const normalized = Object.assign({}, payload, {
+      tool_id: payload.tool_id || payload.id || payload.call_id || null,
+      name: payload.name || payload.tool_name || payload.tool || 'unknown',
+      args: _firstObject(payload.args, payload.tool_args) || {},
+    });
+
+    if (typeof normalized.success !== 'boolean' && typeof result.success === 'boolean') {
+      normalized.success = result.success;
+    }
+
+    return normalized;
+  }
+
+  function _asString(...values) {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim();
+      }
+    }
+    return '';
+  }
+
+  function _firstObject(...values) {
+    for (const value of values) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value;
+      }
+    }
+    return null;
+  }
 
   function _startConnectTimeout() {
     _clearConnectTimeout();

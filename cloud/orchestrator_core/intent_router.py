@@ -53,7 +53,7 @@ class IntentRouter:
                 )
             )
             
-            decision = response.text.strip().lower()
+            decision = str(getattr(response, "text", "") or "").strip().lower()
             
             # Clean up potential markdown formatting
             if "dynamic" in decision:

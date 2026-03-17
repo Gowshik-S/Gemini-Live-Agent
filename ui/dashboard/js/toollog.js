@@ -11,7 +11,8 @@ const RioToolLog = (() => {
   let _container = null;
   let _emptyEl = null;
   let _countEl = null;
-  let _pendingTools = {}; // toolId -> DOM element (for matching results)
+  let _pendingToolsById = {}; // toolId -> DOM element (for matching results)
+  let _pendingToolQueuesByName = {}; // toolName -> [toolId, ...] (FIFO for id-less results)
   let _toolCount = 0;
 
   // SVG icons for each tool
@@ -63,16 +64,23 @@ const RioToolLog = (() => {
 
     // Listen for tool events
     RioSocket.on('tool_call', (data) => {
-      addToolCall(data.name, data.args || {}, data.tool_id);
+      addToolCall(data.name, data.args || {}, data.tool_id || data.id || data.call_id);
     });
 
     RioSocket.on('tool_result', (data) => {
-      resolveToolResult(data.tool_id || data.name, data.success);
+      resolveToolResult(data.tool_id || data.id || data.call_id || null, _parseSuccess(data), data.name);
+    });
+
+    RioSocket.on('tool_event_update', (data) => {
+      resolveToolResult(data.tool_id || data.id || data.call_id || null, _parseSuccess(data), data.name);
     });
   }
 
   function addToolCall(name, args, toolId) {
     if (!_container) return;
+
+    const safeName = (name || 'unknown').toString();
+    const safeArgs = args && typeof args === 'object' ? args : {};
 
     // Hide empty state
     if (_emptyEl) _emptyEl.style.display = 'none';
@@ -81,22 +89,22 @@ const RioToolLog = (() => {
     if (_countEl) _countEl.textContent = _toolCount;
 
     // Use server-provided tool_id, or generate a unique local one
-    const id = toolId || `local_${_toolCount}`;
+    const id = String(toolId || `local_${_toolCount}`);
 
-    const toolIcon = TOOL_ICONS[name] || TOOL_ICONS._default;
-    const detail = _formatArgs(name, args);
+    const toolIcon = TOOL_ICONS[safeName] || TOOL_ICONS._default;
+    const detail = _formatArgs(safeName, safeArgs);
     const timeStr = _now();
 
     const el = document.createElement('div');
     el.className = 'tool-entry';
-    el.dataset.toolName = name;
+    el.dataset.toolName = safeName;
     el.dataset.toolId = id;
     el.innerHTML = `
       <div class="tool-entry__icon tool-entry__icon--pending">
         ${toolIcon}
       </div>
       <div class="tool-entry__body">
-        <div class="tool-entry__name">${_escapeHtml(name)}</div>
+        <div class="tool-entry__name">${_escapeHtml(safeName)}</div>
         <div class="tool-entry__detail" title="${_escapeHtml(detail)}">${_escapeHtml(detail)}</div>
       </div>
       <span class="tool-entry__time">${timeStr}</span>
@@ -104,29 +112,41 @@ const RioToolLog = (() => {
 
     _container.appendChild(el);
 
-    // Track as pending using unique ID (not name — prevents collision for concurrent same-tool calls)
-    _pendingTools[id] = el;
+    // Track by both ID and name queue so we can resolve even if results do not include IDs.
+    _pendingToolsById[id] = el;
+    if (!_pendingToolQueuesByName[safeName]) _pendingToolQueuesByName[safeName] = [];
+    _pendingToolQueuesByName[safeName].push(id);
 
     // Prune old
     while (_container.querySelectorAll('.tool-entry').length > MAX_ENTRIES) {
       const first = _container.querySelector('.tool-entry');
-      if (first) first.remove();
+      if (first) {
+        _dropPending(first.dataset.toolId, first.dataset.toolName);
+        first.remove();
+      }
     }
 
     // Scroll to bottom
     _container.scrollTop = _container.scrollHeight;
   }
 
-  function resolveToolResult(toolId, success) {
-    const el = _pendingTools[toolId];
-    if (!el) return;
-    delete _pendingTools[toolId];
+  function resolveToolResult(toolId, success, toolName) {
+    const resolvedId = _resolvePendingId(toolId, toolName);
+    if (!resolvedId) return;
+
+    const el = _pendingToolsById[resolvedId];
+    if (!el) {
+      _dropPending(resolvedId, toolName);
+      return;
+    }
+
+    _dropPending(resolvedId, el.dataset.toolName);
 
     const name = el.dataset.toolName;
     const iconEl = el.querySelector('.tool-entry__icon');
     if (iconEl) {
       iconEl.classList.remove('tool-entry__icon--pending');
-      if (success) {
+      if (success !== false) {
         iconEl.classList.add('tool-entry__icon--success');
         // Replace inner SVG with check
         const toolIcon = TOOL_ICONS[name] || TOOL_ICONS._default;
@@ -137,6 +157,64 @@ const RioToolLog = (() => {
         iconEl.innerHTML = toolIcon;
       }
     }
+  }
+
+  function _resolvePendingId(toolId, toolName) {
+    const id = toolId ? String(toolId) : '';
+    const name = (toolName || '').toString();
+
+    if (id && _pendingToolsById[id]) {
+      return id;
+    }
+
+    if (name) {
+      const queue = _pendingToolQueuesByName[name];
+      if (queue && queue.length) {
+        while (queue.length) {
+          const candidateId = queue[0];
+          if (_pendingToolsById[candidateId]) {
+            return candidateId;
+          }
+          queue.shift();
+        }
+      }
+    }
+
+    // Backwards-compat: some older frames send name in place of tool_id.
+    if (id) {
+      const queue = _pendingToolQueuesByName[id];
+      if (queue && queue.length) {
+        while (queue.length) {
+          const candidateId = queue[0];
+          if (_pendingToolsById[candidateId]) {
+            return candidateId;
+          }
+          queue.shift();
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function _dropPending(toolId, toolName) {
+    const id = toolId ? String(toolId) : '';
+    const name = (toolName || '').toString();
+    if (id) delete _pendingToolsById[id];
+    if (!name) return;
+
+    const queue = _pendingToolQueuesByName[name];
+    if (!queue) return;
+    const idx = queue.indexOf(id);
+    if (idx >= 0) queue.splice(idx, 1);
+    if (queue.length === 0) delete _pendingToolQueuesByName[name];
+  }
+
+  function _parseSuccess(data) {
+    if (!data || typeof data !== 'object') return true;
+    if (typeof data.success === 'boolean') return data.success;
+    if (data.result && typeof data.result.success === 'boolean') return data.result.success;
+    return true;
   }
 
   function _formatArgs(name, args) {

@@ -212,27 +212,90 @@ def _strip_tool_result(result: dict, max_chars: int = _MAX_TOOL_RESULT_CHARS) ->
 
 
 def _format_for_voice(text: str) -> str:
-    """Strip markdown formatting so TTS reads text naturally.
+    """Strip markdown formatting and filter technical terms so TTS reads text naturally.
 
     Removes: headers (#), bold/italic (*_), code fences (```), bullet
     dashes/stars at line start, and URL markdown [text](url) → text.
+
+    Filters technical terms: agent names, tool names, model references, and
+    technical terminology, replacing them with natural conversational language.
+
     The result is plain prose suitable for voice output.
     """
     import re
+
+    # First, strip markdown formatting
     # Unwrap markdown links: [label](url) → label
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Remove raw URLs so they are not spoken.
+    text = re.sub(r"https?://\S+", "", text)
     # Remove code fences
     text = re.sub(r"```[^\n]*\n?", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = text.replace("`", "")
     # Remove headers
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # Remove bold/italic markers
-    text = re.sub(r"(\*{1,3}|_{1,3})(.+?)\1", r"\2", text)
+    text = re.sub(r"(?m)^\s*#+\s*$", "", text)
+    # Remove bold/italic markers without treating in-word underscores as markdown.
+    text = re.sub(r"(?<!\w)(\*{1,3}|_{1,3})([\s\S]*?)\1(?!\w)", r"\2", text)
     # Remove bullet points at line starts
     text = re.sub(r"^\s*[-*+•]\s+", "", text, flags=re.MULTILINE)
-    # Collapse extra blank lines
+    # Remove standalone leftover emphasis markers and collapse extra blank lines.
+    text = re.sub(r"(?m)^\s*(\*{1,3}|_{1,3})\s*$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Remove structured REPORT schema lines (machine-facing, not user-facing).
+    text = re.sub(
+        r"(?im)^\s*(SCREEN|USER_INPUT|INTERRUPT|CONTEXT|GROUNDED|AUTH_REQUIRED|AUTH_RESOLVED)\s*:\s*.*$",
+        "",
+        text,
+    )
+
+    # Remove leaked bare status tokens if they appear in prose.
+    text = re.sub(r"(?i)\b(?:grounded|interrupt|auth_required|auth_resolved)\s*[:=]?\s*(?:true|false)\b", "", text)
+
+    # Now filter technical terms for natural voice output.
+    natural_language_map = {
+        r'\bbrowser_connect\b': 'opening the browser',
+        r'\bsmart_click\b': 'clicking',
+        r'\bbrowser_navigate\b': 'navigating to',
+        r'\bcapture_screen\b': 'taking a screenshot',
+        r'\bbrowser_click_element\b': 'clicking',
+        r'\bbrowser_type_text\b': 'typing',
+        r'\bbrowser_scroll\b': 'scrolling',
+        r'\bbrowser_wait\b': 'waiting',
+        r'\bbrowser_close\b': 'closing the browser',
+        r'\btool execution\b': 'action',
+        r'\bfunction calling\b': 'action',
+        r'\bCSS selector\b': 'element',
+        r'\bPlaywright\b': 'browser automation',
+        r'\bCDP\b': 'browser control',
+    }
+    for pattern, replacement in natural_language_map.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Remove technical labels and internal implementation identifiers.
+    text = re.sub(r'\bAgent:\s*', 'Agent ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(?:browser_agent|computer_use_agent|task_executor|code_agent)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(?:browseragent|computeruseagent|taskexecutor|codeagent)\b', '', text, flags=re.IGNORECASE)
+
+    # Remove model references like "(model: gemini-...)" and "using model ...".
+    text = re.sub(r'\(model:\s*[^)]*\)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\busing\s+model\b[^,.;\n]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bmodel:\s*[^,.;\n]*', 'Model', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bgemini-[\w.-]+\b', '', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\btool\b', '', text, flags=re.IGNORECASE)
+
+    # Clean up punctuation/whitespace left after removals.
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\s+([,.;:])', r'\1', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
     return text.strip()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +501,14 @@ def _load_modes() -> dict[str, dict]:
 # Tool sets for multi-agent routing
 _TOOL_SETS = {
     "all": None,  # All tools (default)
+    "browser": frozenset({
+        "browser_connect", "browser_navigate", "browser_click_element",
+        "browser_fill_form", "browser_extract_text", "browser_evaluate",
+        "browser_wait_for", "browser_screenshot",
+        "web_search", "web_fetch", "web_cache_get",
+        "save_note", "get_notes", "search_notes",
+        "capture_screen",
+    }),
     "screen": frozenset({
         "smart_click", "screen_click", "screen_type", "screen_scroll",
         "screen_hotkey", "screen_move", "screen_drag", "find_window",
@@ -477,6 +548,20 @@ def _select_agent(goal: str, agent_configs: dict[str, dict],
     'write an email about debugging code' which would match both
     email_drafter and code_agent under keyword routing.
     """
+    goal_lower = goal.lower()
+
+    # --- High-priority deterministic routing ---
+    # Keep explicit browser-launch intents ahead of semantic routing so
+    # "open browser ..." does not get diverted into generic search/research flows.
+    browser_launch_keywords = (
+        "open browser", "launch browser", "start browser",
+        "open chrome", "open firefox", "open edge",
+        "launch chrome", "launch firefox", "launch edge",
+    )
+    if any(kw in goal_lower for kw in browser_launch_keywords):
+        if "browser_agent" in agent_configs and agent_configs["browser_agent"].get("enabled"):
+            return "browser_agent"
+
     # --- Semantic routing via embeddings (when available) ---
     if memory_store is not None and hasattr(memory_store, 'embed'):
         try:
@@ -505,16 +590,40 @@ def _select_agent(goal: str, agent_configs: dict[str, dict],
             pass  # Fall through to keyword routing
 
     # --- Keyword fallback routing ---
-    goal_lower = goal.lower()
+    # Browser automation keywords → browser_agent (checked BEFORE screen keywords)
+    # These indicate web automation tasks that should use Playwright/CDP instead of screen automation
+    browser_automation_keywords = (
+        "search for", "search on", "google search", "web search", "bing search",
+        "navigate to", "go to url", "visit url", "open url", "browse to",
+        "fill form", "submit form", "click link", "click button on page",
+        "extract text from", "scrape", "get page content", "read webpage",
+        "browser automation", "playwright", "cdp", "devtools protocol",
+        "inspect element", "css selector", "xpath", "dom",
+        "login to website", "authenticate on", "sign in to site",
+        "scroll up", "scroll down", "scroll to", "scroll on page", "scroll on website",
+        "on the page", "on the website", "on this page", "on this website",
+        "web page", "webpage", "website", "browser page",
+        # Browser-opening keywords (Bug 1 fix)
+        "open browser", "launch browser", "start browser",
+        "open chrome", "open firefox", "open edge",
+        "launch chrome", "launch firefox", "launch edge",
+    )
+    if any(kw in goal_lower for kw in browser_automation_keywords):
+        if "browser_agent" in agent_configs and agent_configs["browser_agent"].get("enabled"):
+            return "browser_agent"
+        # Fallback to task_executor if browser_agent not available
+        log.info("orchestrator.browser_automation_detected", 
+                 note="browser_agent not configured, using task_executor with browser tools")
 
     # Screen/GUI/computer-use keywords → computer_use_agent
+    # Note: Browser-related keywords removed to prevent incorrect routing (Bug 1 fix)
     screen_keywords = (
         "click", "smart_click", "screen", "scroll", "navigate", "open app",
-        "open application", "launch", "window", "browser", "chrome",
-        "firefox", "edge", "type in", "go to", "goto", "visit",
+        "open application", "launch", "window",
+        "type in", "go to", "goto", "visit",
         "screenshot", "capture screen", "minimize", "maximize", "close window",
         "drag", "hotkey", "press", "switch window", "focus window",
-        "open chrome", "open browser", "open file", "open folder",
+        "open file", "open folder",
         "desktop", "taskbar", "start menu", "notification",
     )
     if any(kw in goal_lower for kw in screen_keywords):
@@ -704,8 +813,10 @@ _ORCHESTRATOR_SYSTEM_INSTRUCTION = (
     "Execute it fully using the available tools — do NOT stop to ask for "
     "confirmation mid-task. Complete the ENTIRE task autonomously.\n\n"
     "MEMORY — RECALL BEFORE RESPOND:\n"
-    "- FIRST: Call search_notes(query) with keywords from the current task to "
-    "recall relevant context from previous sessions. Do this BEFORE any actions.\n"
+    "- For browser-launch tasks (open/launch/start browser, open chrome/firefox/edge): "
+    "call browser_connect FIRST, then call search_notes(query) if context is needed.\n"
+    "- For non-browser tasks: call search_notes(query) early to recall relevant "
+    "context from previous sessions before major actions.\n"
     "- Use save_note(key, value, media_paths=[]) to persist important information (e.g. file paths, "
     "user preferences, progress) for future tasks. You can optionally include paths to images, video, or audio to attach multimodal context to the memory.\n"
     "- Use get_notes() to retrieve all saved notes when you need full context.\n"
@@ -766,18 +877,26 @@ class ToolOrchestrator:
 
     def __init__(
         self,
-        genai_client: Any,
-        tool_fns: list,
+        genai_client: Any | None = None,
+        tool_fns: list | None = None,
         model: str | None = None,
         memory_store: Any | None = None,
         broadcast_fn: Any | None = None,
+        inject_context: Any | None = None,
+        request_approval: Any | None = None,
+        chat_store: Any | None = None,
+        **_: Any,
     ) -> None:
         self._client = genai_client
+        self._active_inject_context = inject_context
+        # Session re-binding
+        self._active_inject_context: Callable[[str], Awaitable[None]] | None = inject_context
+
         # Ensure no duplicate function names enter the tool declaration set.
         # Duplicate names cause Gemini API 400 INVALID_ARGUMENT.
         self._tool_fns = []
         self._tool_map: dict[str, Any] = {}
-        for fn in tool_fns:
+        for fn in (tool_fns or []):
             name = fn.__name__
             if name in self._tool_map:
                 logger.warning("tools.duplicate_skipped", name=name)
@@ -2203,6 +2322,11 @@ class ToolOrchestrator:
                 self._log.warning("memory.compaction_failed", error=str(exc))
                 return False
 
+    def rebind(self, inject_context: Callable[[str], Awaitable[None]]) -> None:
+        """Update the active inject_context callback for running tasks."""
+        self._active_inject_context = inject_context
+        self._log.info("orchestrator.rebound")
+
     def get_evaluation_stats(self) -> dict:
         """Return aggregate evaluation statistics.
 
@@ -2293,10 +2417,14 @@ class ToolOrchestrator:
         # 3. Block Coalescing (UX Polisher)
         try:
             from block_coalescer import BlockCoalescer
-            coalescer = BlockCoalescer(inject_context, flush_interval=2.0)
+            # Keep flush short so voice updates don't lag behind tool execution.
+            coalescer = BlockCoalescer(inject_context, flush_interval=0.35)
             wrapped_inject = coalescer.push
         except Exception:
             wrapped_inject = inject_context
+
+        # Keep a direct low-latency inject path for urgent voice cues.
+        self._active_inject_context = inject_context
 
         task_id = (resume_snapshot or {}).get("task_id") or hashlib.md5(
             f"{goal}:{time.time()}".encode()
@@ -2529,8 +2657,6 @@ class ToolOrchestrator:
                     pass
             completion_msg = (
                 f"[SYSTEM: The autonomous task executor has completed the task.\n"
-                f"Agent: {agent_name} (model: {agent_model})\n"
-                f"Original goal: {goal}\n"
                 f"What was done: {_format_for_voice(result_text)}\n"
                 f"Acknowledge completion in 1-2 sentences. Be concise and natural.]"
             )
@@ -3116,6 +3242,41 @@ class ToolOrchestrator:
                                 "timestamp": time.strftime("%H:%M:%S"),
                             }
                         }))
+
+                    # Task 15: Human-sounding voice narration during tool execution
+                    if inject_context:
+                        # Internal memory/context tools are useful but noisy for voice UX.
+                        quiet_tools = {
+                            "search_notes", "get_notes", "save_note", "memory_stats", "export_context",
+                            "web_cache_get",
+                        }
+                        messages = {
+                            "browser_connect": "I'm opening the browser now.",
+                            "browser_navigate": "Taking you to that page now.",
+                            "browser_click_element": "Clicking that on the page.",
+                            "browser_fill_form": "Filling that form now.",
+                            "browser_extract_text": "Reading the page details now.",
+                            "open_application": "Opening that app now.",
+                            "read_file": "Checking that file now.",
+                            "write_file": "Saving those changes now.",
+                            "patch_file": "Applying that update now.",
+                            "smart_click": "Clicking that now.",
+                            "screen_type": "Typing that now.",
+                        }
+                        narration = messages.get(tool_name, "I'm on it.")
+                        if tool_name not in quiet_tools:
+                            # Use direct inject path (non-coalesced) and wait briefly so
+                            # narration starts before the tool work to avoid perceived lag.
+                            try:
+                                low_latency_inject = self._active_inject_context or inject_context
+                                await asyncio.wait_for(
+                                    low_latency_inject(
+                                        f"[SYSTEM: Tell the user exactly this, in your own voice, right now: '{narration}']"
+                                    ),
+                                    timeout=1.2,
+                                )
+                            except Exception:
+                                pass
 
                     try:
                         # Wrap tool execution with progress heartbeat + timeout.

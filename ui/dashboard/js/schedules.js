@@ -11,6 +11,12 @@ const RioSchedules = (() => {
   let _statusEl;
   let _listEl;
   let _countEl;
+  let _addBtn;
+  let _refreshBtn;
+
+  let _refreshInFlight = false;
+  let _addInFlight = false;
+  const _removeInFlight = new Set();
 
   function init() {
     _userInput = document.getElementById('schedule-user-id');
@@ -27,8 +33,11 @@ const RioSchedules = (() => {
     const savedUser = localStorage.getItem('rio.dashboard.user_id');
     if (savedUser) _userInput.value = savedUser;
 
-    document.getElementById('schedule-add')?.addEventListener('click', _add);
-    document.getElementById('schedule-refresh')?.addEventListener('click', _refresh);
+    _addBtn = document.getElementById('schedule-add');
+    _refreshBtn = document.getElementById('schedule-refresh');
+
+    _addBtn?.addEventListener('click', _add);
+    _refreshBtn?.addEventListener('click', _refresh);
     _userInput.addEventListener('change', () => {
       localStorage.setItem('rio.dashboard.user_id', _user());
       _refresh();
@@ -49,21 +58,43 @@ const RioSchedules = (() => {
   }
 
   async function _refresh() {
+    if (_refreshInFlight) return;
+    _refreshInFlight = true;
+    _setButtonBusy(_refreshBtn, true);
+
     const user = _user();
     localStorage.setItem('rio.dashboard.user_id', user);
+    _setStatus('Loading schedules...', 'text-muted');
+
     try {
       const resp = await fetch(`/api/triggers?user_id=${encodeURIComponent(user)}`);
-      const data = await resp.json();
+      const data = await _readJson(resp);
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+
       const triggers = Array.isArray(data.triggers) ? data.triggers : [];
       _render(triggers, user);
-      _setStatus(data.active ? `Loaded ${triggers.length} trigger(s)` : 'No active session for this user', data.active ? 'text-success' : 'text-warning');
+
+      if (!data.active) {
+        _setStatus('No active schedule session for this user.', 'text-warning');
+      } else if (triggers.length === 0) {
+        _setStatus('No schedules found for this user.', 'text-muted');
+      } else {
+        _setStatus(`Loaded ${triggers.length} schedule(s).`, 'text-success');
+      }
     } catch (err) {
       _render([], user);
       _setStatus(`Failed to load triggers: ${String(err)}`, 'text-error');
+    } finally {
+      _refreshInFlight = false;
+      _setButtonBusy(_refreshBtn, false);
     }
   }
 
   async function _add() {
+    if (_addInFlight) return;
+
     const user = _user();
     const goal = (_goalInput?.value || '').trim();
     const intervalSeconds = Number(_intervalInput?.value || '0');
@@ -71,6 +102,11 @@ const RioSchedules = (() => {
       _setStatus('Goal and valid interval are required', 'text-warning');
       return;
     }
+
+    _addInFlight = true;
+    _setButtonBusy(_addBtn, true);
+    _setStatus('Adding schedule...', 'text-muted');
+
     try {
       const resp = await fetch('/api/triggers/schedule', {
         method: 'POST',
@@ -81,7 +117,11 @@ const RioSchedules = (() => {
           interval_seconds: intervalSeconds,
         }),
       });
-      const data = await resp.json();
+      const data = await _readJson(resp);
+      if (!resp.ok) {
+        _setStatus(data.error || `Failed to add schedule (HTTP ${resp.status})`, 'text-error');
+        return;
+      }
       if (!data.success) {
         _setStatus(data.error || 'Failed to add schedule', 'text-error');
         return;
@@ -91,16 +131,29 @@ const RioSchedules = (() => {
       await _refresh();
     } catch (err) {
       _setStatus(`Failed to add schedule: ${String(err)}`, 'text-error');
+    } finally {
+      _addInFlight = false;
+      _setButtonBusy(_addBtn, false);
     }
   }
 
-  async function _remove(name) {
+  async function _remove(name, buttonEl) {
+    if (!name || _removeInFlight.has(name)) return;
+
+    _removeInFlight.add(name);
+    _setButtonBusy(buttonEl, true);
+    _setStatus(`Removing ${name}...`, 'text-muted');
+
     const user = _user();
     try {
       const resp = await fetch(`/api/triggers/${encodeURIComponent(name)}?user_id=${encodeURIComponent(user)}`, {
         method: 'DELETE',
       });
-      const data = await resp.json();
+      const data = await _readJson(resp);
+      if (!resp.ok) {
+        _setStatus(data.error || `Failed to remove schedule (HTTP ${resp.status})`, 'text-error');
+        return;
+      }
       if (!data.success) {
         _setStatus(data.error || 'Failed to remove schedule', 'text-error');
         return;
@@ -109,6 +162,9 @@ const RioSchedules = (() => {
       await _refresh();
     } catch (err) {
       _setStatus(`Failed to remove schedule: ${String(err)}`, 'text-error');
+    } finally {
+      _removeInFlight.delete(name);
+      _setButtonBusy(buttonEl, false);
     }
   }
 
@@ -147,12 +203,25 @@ const RioSchedules = (() => {
       const del = document.createElement('button');
       del.className = 'schedule-item__delete';
       del.textContent = 'Delete';
-      del.addEventListener('click', () => _remove(item.name));
+      del.addEventListener('click', () => _remove(item.name, del));
 
       row.appendChild(meta);
       row.appendChild(del);
       _listEl.appendChild(row);
     });
+  }
+
+  function _setButtonBusy(buttonEl, busy) {
+    if (!buttonEl) return;
+    buttonEl.disabled = !!busy;
+  }
+
+  async function _readJson(resp) {
+    try {
+      return await resp.json();
+    } catch {
+      return {};
+    }
   }
 
   if (document.readyState === 'loading') {

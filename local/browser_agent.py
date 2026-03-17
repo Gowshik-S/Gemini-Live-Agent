@@ -1,17 +1,11 @@
 """
-Rio Local — Browser Agent (Gemini Computer Use + Playwright)
+Rio Local — Browser Agent (Playwright + Gemini Computer Use)
 
-Uses the Gemini 2.5 Computer Use model for accurate visual grounding:
-  1. Capture page screenshot at 1280x720
-  2. Send to gemini-2.5-computer-use-preview-10-2025 — model returns PIXEL
-     coordinates for clicks, not fragile CSS selectors
-  3. Playwright executes coordinate-based actions (mouse.click, keyboard)
-  4. Re-capture → model verifies/decides next action
-  5. Repeat until step goal is achieved or retries exhausted
+Specialized autonomous agent for web automation with two-tier strategy:
+1. Playwright (primary) - Fast DOM-level automation
+2. Gemini Computer Use (fallback) - Visual grounding for complex interactions
 
-The Computer Use model is specifically trained for screenshot understanding
-and coordinate prediction — far more accurate than asking a text model to
-guess CSS selectors.
+Uses browser automation tools preferentially, escalates to Computer Use only when needed.
 """
 
 from __future__ import annotations
@@ -19,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Optional
 
 import structlog
@@ -40,6 +35,36 @@ try:
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
+
+
+def _load_browser_agent_prompt() -> str:
+    """Load browser agent system prompt from markdown file."""
+    prompt_file = Path(__file__).parent.parent / "browser_agent_prompt.md"
+    if prompt_file.exists():
+        try:
+            content = prompt_file.read_text(encoding="utf-8")
+            # Extract the prompt from the markdown (between triple quotes)
+            if '"""' in content:
+                parts = content.split('"""')
+                if len(parts) >= 3:
+                    return parts[1].strip()
+            return content
+        except Exception as exc:
+            log.warning("browser_agent.prompt_load_failed", error=str(exc))
+    
+    # Fallback to inline prompt
+    return """You are Rio's Browser Agent — a specialized autonomous agent for web automation.
+You control web browsers using Playwright for DOM-level precision, with fallback
+to Gemini Computer Use for visual grounding when Playwright cannot handle the task.
+
+Execute web automation tasks autonomously. Use Playwright tools first (browser_connect,
+browser_navigate, browser_click_element, browser_fill_form, browser_extract_text).
+If Playwright fails 2x on the same element, escalate to Computer Use for visual grounding.
+
+Always return structured results with success status, result description, and any extracted data."""
+
+
+BROWSER_AGENT_SYSTEM_PROMPT = _load_browser_agent_prompt()
 
 # Viewport size — the model sees screenshots at this resolution
 # and returns coordinates in this space.  Must match context creation.
@@ -107,8 +132,10 @@ class BrowserAgent:
         self._client: Optional[genai.Client] = None
         self._pw = None
         self._browser: Optional[Browser] = None
+        self._context = None
         self._page: Optional[Page] = None
         self._running = False
+        self._uses_shared_context = False
         self._log = log.bind(component="browser_agent")
 
     @property
@@ -145,6 +172,7 @@ class BrowserAgent:
                 pref_profile = cfg.browser.default_profile
                 
                 self._context = await get_browser_context(browser=pref_browser, profile=pref_profile)
+                self._uses_shared_context = True
                 
                 # Get the first page or create one
                 pages = self._context.pages
@@ -170,6 +198,7 @@ class BrowserAgent:
                     viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
                 )
                 self._page = await self._context.new_page()
+                self._uses_shared_context = False
                 self._running = True
                 return True
         except Exception:
@@ -180,12 +209,26 @@ class BrowserAgent:
     async def stop(self) -> None:
         """Shut down browser and clean up resources."""
         self._running = False
-        # Note: we don't close the shared _context here as it might be used by other tools
-        # Just clear local refs
+
+        # Legacy fallback path can own a dedicated browser/process.
+        if not self._uses_shared_context and self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                self._log.debug("browser_agent.browser_close_failed")
+
+        if not self._uses_shared_context and self._pw is not None:
+            try:
+                await self._pw.stop()
+            except Exception:
+                self._log.debug("browser_agent.playwright_stop_failed")
+
         self._browser = None
         self._pw = None
         self._page = None
+        self._context = None
         self._client = None
+        self._uses_shared_context = False
         self._log.info("browser_agent.stopped")
 
     # ------------------------------------------------------------------
@@ -261,7 +304,7 @@ class BrowserAgent:
                     model=MODEL_COMPUTER_USE,
                     contents=history,
                     config=types.GenerateContentConfig(
-                        system_instruction=COMPUTER_USE_SYSTEM,
+                        system_instruction=BROWSER_AGENT_SYSTEM_PROMPT,
                         temperature=0.1,
                         max_output_tokens=512,
                     ),
@@ -274,7 +317,7 @@ class BrowserAgent:
                         model=MODEL_FLASH,
                         contents=history,
                         config=types.GenerateContentConfig(
-                            system_instruction=COMPUTER_USE_SYSTEM,
+                            system_instruction=BROWSER_AGENT_SYSTEM_PROMPT,
                             temperature=0.2,
                             max_output_tokens=512,
                         ),

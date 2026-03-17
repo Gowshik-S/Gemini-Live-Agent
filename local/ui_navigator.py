@@ -51,7 +51,7 @@ class UINavigator:
         tool_executor,
         screen_navigator,
         model: str = "gemini-2.5-flash",
-        fps: float = 2.0,
+        fps: float = 10.0,
         confidence_threshold: float = 0.85,
         analyze_every_n_frames: int = 3,
         emit_action: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,

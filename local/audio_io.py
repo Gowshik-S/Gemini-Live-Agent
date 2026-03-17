@@ -14,6 +14,8 @@ Layer 1 (L1): Audio capture and playback.
 from __future__ import annotations
 
 import asyncio
+import time
+from math import gcd
 from typing import AsyncGenerator, Optional
 
 import platform
@@ -122,8 +124,12 @@ class AudioCapture:
         max_queue_size: int = 100,
         use_wasapi: bool = True,
     ) -> None:
+        # Target wire-format for upstream pipeline (expected by cloud/live path).
         self._sample_rate = sample_rate
         self._block_size = block_size  # 320 samples = 20ms @ 16kHz
+        # Runtime stream format may differ if device can't open at target rate.
+        self._stream_sample_rate = sample_rate
+        self._stream_block_size = block_size
         self._input_device = input_device
         self._use_wasapi = use_wasapi
         self._stream: Optional[sd.InputStream] = None
@@ -192,41 +198,84 @@ class AudioCapture:
             hostapi=hostapi_name,
         )
 
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self._sample_rate,
-                blocksize=self._block_size,
-                dtype="int16",
-                channels=1,
-                device=selected_input_device,
-                latency="low",
-                extra_settings=extra_settings,
-                callback=self._audio_callback,
+        stream_rates = [int(self._sample_rate)]
+        default_rate = None
+        if device_info is not None:
+            try:
+                default_rate = int(float(device_info.get("default_samplerate", 0) or 0))
+            except Exception:
+                default_rate = None
+        if default_rate and default_rate > 0 and default_rate not in stream_rates:
+            stream_rates.append(default_rate)
+
+        stream_settings: list[object | None] = [extra_settings]
+        if extra_settings is not None:
+            stream_settings.append(None)
+
+        last_error: Exception | None = None
+        started = False
+        for rate in stream_rates:
+            scaled_block_size = max(
+                1,
+                int(round(self._block_size * (rate / self._sample_rate))),
             )
-            self._stream.start()
-        except sd.PortAudioError as _pa_err:
-            if extra_settings is not None:
-                # WASAPI settings incompatible with this device (e.g. error -9984).
-                # Retry without host-API-specific settings.
-                log.warning(
-                    "audio.wasapi_failed_retrying",
-                    error=str(_pa_err),
-                    device=selected_input_device,
-                )
-                self._stream = sd.InputStream(
-                    samplerate=self._sample_rate,
-                    blocksize=self._block_size,
-                    dtype="int16",
-                    channels=1,
-                    device=selected_input_device,
-                    latency="low",
-                    callback=self._audio_callback,
-                )
-                self._stream.start()
-            else:
-                raise
+            for settings in stream_settings:
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=rate,
+                        blocksize=scaled_block_size,
+                        dtype="int16",
+                        channels=1,
+                        device=selected_input_device,
+                        latency="low",
+                        extra_settings=settings,
+                        callback=self._audio_callback,
+                    )
+                    self._stream.start()
+                    self._stream_sample_rate = rate
+                    self._stream_block_size = scaled_block_size
+                    started = True
+                    if rate != self._sample_rate:
+                        log.warning(
+                            "audio.input_sample_rate_fallback",
+                            requested_rate=self._sample_rate,
+                            stream_rate=rate,
+                            requested_block_size=self._block_size,
+                            stream_block_size=scaled_block_size,
+                        )
+                    break
+                except sd.PortAudioError as err:
+                    last_error = err
+                    if settings is not None:
+                        log.warning(
+                            "audio.wasapi_failed_retrying",
+                            error=str(err),
+                            device=selected_input_device,
+                            rate=rate,
+                        )
+                    else:
+                        log.debug(
+                            "audio.input_open_failed",
+                            error=str(err),
+                            device=selected_input_device,
+                            rate=rate,
+                            block_size=scaled_block_size,
+                        )
+            if started:
+                break
+
+        if not started:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Failed to start audio capture stream")
+
         self._running = True
-        log.info("audio.started", latency=self._stream.latency)
+        log.info(
+            "audio.started",
+            latency=self._stream.latency,
+            stream_rate=self._stream_sample_rate,
+            stream_block_size=self._stream_block_size,
+        )
 
     def stop(self) -> None:
         """Stop capturing audio."""
@@ -281,8 +330,8 @@ class AudioCapture:
         if not self._running or self._loop is None:
             return
 
-        # Convert numpy int16 array to raw bytes (PCM 16-bit LE on x86/x64)
-        pcm_bytes = indata.tobytes()
+        # Convert capture stream to target wire sample rate if needed.
+        pcm_bytes = self._resample_capture(indata)
 
         # Schedule the put onto the async loop (thread-safe)
         try:
@@ -290,6 +339,38 @@ class AudioCapture:
         except RuntimeError:
             # Event loop closed
             pass
+
+    def _resample_capture(self, indata: np.ndarray) -> bytes:
+        """Return PCM bytes at target sample rate for upstream transport."""
+        if self._stream_sample_rate == self._sample_rate:
+            return indata.tobytes()
+
+        try:
+            samples = np.asarray(indata, dtype=np.int16)
+            if samples.ndim > 1:
+                samples = samples[:, 0]
+
+            g = gcd(self._sample_rate, self._stream_sample_rate)
+            up = self._sample_rate // g
+            down = self._stream_sample_rate // g
+
+            try:
+                from scipy.signal import resample_poly
+                out = resample_poly(samples, up, down)
+            except Exception:
+                # Linear fallback if scipy isn't available.
+                old_len = len(samples)
+                new_len = max(1, int(old_len * (self._sample_rate / self._stream_sample_rate)))
+                old_idx = np.arange(old_len)
+                new_idx = np.linspace(0, old_len - 1, num=new_len)
+                out = np.interp(new_idx, old_idx, samples)
+
+            out_i16 = np.asarray(out, dtype=np.int16)
+            return out_i16.tobytes()
+        except Exception as exc:
+            # Last resort: keep audio flowing at raw device rate rather than dropping capture.
+            log.warning("audio.capture_resample_failed", error=str(exc))
+            return indata.tobytes()
 
     def _enqueue(self, data: bytes) -> None:
         """Put audio data into the async queue (called from the event loop thread)."""
@@ -614,17 +695,33 @@ class AudioPlayback:
 
                 if self._stream is not None and chunk:
                     try:
+                        # Calculate physical duration of the chunk to prevent fast-forwarding
+                        # 24000 Hz, 16-bit (2 bytes), mono (1 channel) = 48000 bytes/sec
+                        chunk_duration = len(chunk) / (self._output_sample_rate * 2 * self._channels)
+                        start_time = time.monotonic()
+
                         await asyncio.to_thread(self._stream.write, chunk)
-                    except OSError:
-                        # stream.write() can fail if stream was reset by interrupt()
+
+                        # Software throttle fallback: if write returned too fast, sleep the remainder
+                        elapsed = time.monotonic() - start_time
+                        if elapsed < chunk_duration:
+                            await asyncio.sleep(chunk_duration - elapsed)
+
+                    except OSError as exc:
+                        # stream.write() can fail transiently on Windows audio backends
+                        # (device switch/reset, driver hiccup, BT reconnect, etc.).
                         if self._interrupted:
                             continue
-                        raise
+                        log.warning("playback.stream_write_failed", error=str(exc))
+                        self._recreate_stream()
+                        self.clear()
+                        await asyncio.sleep(0.05)
+                        continue
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                log.exception("playback.drain_loop.error")
+            except Exception as e:
+                log.exception("playback.drain_loop.error", error=str(e))
                 # Brief pause to avoid tight error loops
                 await asyncio.sleep(0.1)
 

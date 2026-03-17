@@ -12,6 +12,7 @@ Available tools:
 
   Customer Care skill:
   - create_ticket(title, ...) -- Create a support ticket (JSON file)
+    - log_support_ticket(issue_summary, ...) -- Append ticket row to Google Sheets
 
   Tutor skill:
   - generate_quiz(topic, ...) -- Generate quiz questions for a topic
@@ -392,6 +393,7 @@ class ToolExecutor:
             "write_file": self._write_file,
             "patch_file": self._patch_file,
             "run_command": self._run_command,
+            "log_support_ticket": self._log_support_ticket,
             "create_ticket": self._create_ticket,
             "update_ticket": self._update_ticket,
             "generate_quiz": self._generate_quiz,
@@ -686,6 +688,159 @@ class ToolExecutor:
             }
         except Exception as exc:
             return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # ------------------------------------------------------------------
+    # log_support_ticket  (Customer Care skill — Google Sheets)
+    # ------------------------------------------------------------------
+
+    async def _log_support_ticket(
+        self,
+        issue_summary: str,
+        category: str,
+        severity: str,
+        user_name: str = "",
+    ) -> dict[str, Any]:
+        """Append a support ticket row to Google Sheets.
+
+        Row format:
+          [Ticket ID, Timestamp, User, Category, Severity, Issue Summary, Status]
+
+        Ticket ID is computed as last row number + 1 by reading the sheet first.
+        """
+        sheet_id = _get_env_value("SUPPORT_SHEET_ID")
+        if not sheet_id:
+            return {
+                "success": False,
+                "error": "SUPPORT_SHEET_ID is not configured",
+                "user_message": "I couldn't log the ticket because support sheet configuration is missing.",
+            }
+
+        summary = (issue_summary or "").strip()
+        if not summary:
+            return {
+                "success": False,
+                "error": "issue_summary is required",
+                "user_message": "I need a short issue summary before I can log this ticket.",
+            }
+
+        allowed_categories = {"billing", "delivery", "technical", "other"}
+        allowed_severity = {"low", "medium", "high"}
+
+        normalized_category = (category or "other").strip().lower()
+        normalized_severity = (severity or "medium").strip().lower()
+
+        if normalized_category not in allowed_categories:
+            normalized_category = "other"
+        if normalized_severity not in allowed_severity:
+            normalized_severity = "medium"
+
+        actor = (user_name or "").strip() or "Unknown"
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        sheet_range = os.environ.get("SUPPORT_SHEET_RANGE", "Sheet1!A:G").strip() or "Sheet1!A:G"
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            self._log_support_ticket_sync,
+            sheet_id,
+            sheet_range,
+            actor,
+            normalized_category,
+            normalized_severity,
+            summary,
+            timestamp,
+        )
+
+    def _log_support_ticket_sync(
+        self,
+        sheet_id: str,
+        sheet_range: str,
+        user_name: str,
+        category: str,
+        severity: str,
+        issue_summary: str,
+        timestamp: str,
+    ) -> dict[str, Any]:
+        """Blocking Sheets API call. Invoked via executor from async wrapper."""
+        try:
+            import google.auth
+            from googleapiclient.discovery import build
+            from googleapiclient.errors import HttpError
+        except ImportError as exc:
+            return {
+                "success": False,
+                "error": f"Google Sheets dependencies are missing: {exc}",
+                "user_message": "I couldn't log the ticket because Google Sheets dependencies are not installed.",
+            }
+
+        try:
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/spreadsheets"]
+            )
+            service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            values_api = service.spreadsheets().values()
+
+            existing = values_api.get(
+                spreadsheetId=sheet_id,
+                range=sheet_range,
+                majorDimension="ROWS",
+            ).execute()
+            existing_rows = existing.get("values", [])
+            ticket_id = len(existing_rows) + 1
+
+            row = [
+                ticket_id,
+                timestamp,
+                user_name,
+                category,
+                severity,
+                issue_summary,
+                "OPEN",
+            ]
+
+            append_result = values_api.append(
+                spreadsheetId=sheet_id,
+                range=sheet_range,
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]},
+            ).execute()
+
+            log.info(
+                "tool.log_support_ticket",
+                ticket_id=ticket_id,
+                category=category,
+                severity=severity,
+                sheet_id=sheet_id,
+                updated_range=append_result.get("updates", {}).get("updatedRange", ""),
+            )
+            return {
+                "success": True,
+                "ticket_id": ticket_id,
+                "timestamp": timestamp,
+                "user": user_name,
+                "category": category,
+                "severity": severity,
+                "status": "OPEN",
+                "updated_range": append_result.get("updates", {}).get("updatedRange", ""),
+                "message": f"Your ticket #{ticket_id} has been logged.",
+            }
+        except HttpError as exc:
+            err_text = str(exc)
+            log.warning("tool.log_support_ticket.http_error", error=err_text)
+            return {
+                "success": False,
+                "error": f"Google Sheets API error: {err_text}",
+                "user_message": "I couldn't log the ticket right now due to a Google Sheets API error.",
+            }
+        except Exception as exc:
+            err_text = f"{type(exc).__name__}: {exc}"
+            log.warning("tool.log_support_ticket.error", error=err_text)
+            return {
+                "success": False,
+                "error": f"Failed to log support ticket: {err_text}",
+                "user_message": "I couldn't log the ticket right now. Please try again in a moment.",
+            }
 
     # ------------------------------------------------------------------
     # create_ticket  (Customer Care skill)
@@ -2372,7 +2527,7 @@ class ToolExecutor:
             except Exception:
                 browser_cfg = {}
             if not browser:
-                browser = browser_cfg.get("default_browser", "auto")
+                browser = browser_cfg.get("default_browser", "chromium")
             if not profile:
                 profile = browser_cfg.get("default_profile", "rio")
         return await mod["connect"](cdp_url, browser=browser, profile=profile)

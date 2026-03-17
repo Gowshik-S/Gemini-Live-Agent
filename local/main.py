@@ -933,6 +933,7 @@ async def audio_capture_loop(
     wake_word=None,
     task_active: asyncio.Event | None = None,
     orchestrator=None,
+    mic_pause_until: list[float] | None = None,
 ) -> None:
     """Read audio chunks from the microphone and send as binary frames.
 
@@ -960,6 +961,9 @@ async def audio_capture_loop(
     vad_was_speaking = False  # Track VAD speech-start edge for interrupt
 
     async for chunk in capture.chunks():
+        if mic_pause_until is not None and time.monotonic() < mic_pause_until[0]:
+            continue
+
         if not client.is_connected:
             log.debug("audio_loop.waiting_for_reconnect")
             while not client.is_connected:
@@ -1802,7 +1806,17 @@ async def _shutdown_runtime(
             task.cancel()
 
     if task_list:
-        results = await asyncio.gather(*task_list, return_exceptions=True)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*task_list, return_exceptions=True),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "shutdown.task_cancel_timeout",
+                pending=[t.get_name() for t in task_list if not t.done()],
+            )
+            results = []
         for task, result in zip(task_list, results):
             if isinstance(result, asyncio.CancelledError):
                 continue
@@ -1812,15 +1826,27 @@ async def _shutdown_runtime(
             if isinstance(result, Exception):
                 log.warning("task.failed", task=task.get_name(), error=str(result))
 
+    if browser_agent is not None and browser_agent.is_running:
+        try:
+            await asyncio.wait_for(browser_agent.stop(), timeout=5.0)
+        except Exception:
+            log.debug("browser_agent.stop_failed")
+
+    # Tools may have created a shared Playwright context even when BrowserAgent
+    # wasn't actively running. Ensure it is closed before loop teardown.
+    try:
+        from browser_tools import cleanup as _browser_tools_cleanup
+    except Exception:
+        _browser_tools_cleanup = None
+    if _browser_tools_cleanup is not None:
+        try:
+            await asyncio.wait_for(_browser_tools_cleanup(), timeout=5.0)
+        except Exception:
+            log.debug("browser_tools.cleanup_failed")
+
     if orchestrator is not None:
         try:
             orchestrator.close()
-        except Exception:
-            pass
-
-    if browser_agent is not None and browser_agent.is_running:
-        try:
-            await browser_agent.stop()
         except Exception:
             pass
 
@@ -2416,6 +2442,7 @@ async def main() -> None:
 
     # -- Run all loops concurrently ----------------------------------------
     tasks: set[asyncio.Task] = set()
+    mic_pause_until = [0.0]
 
     session_ready = asyncio.Event()
     tasks.add(asyncio.create_task(
@@ -2444,7 +2471,8 @@ async def main() -> None:
         tasks.add(asyncio.create_task(
             audio_capture_loop(client, capture, ptt, vad_instance, playback,
                                wake_word=wake_word, task_active=task_active,
-                               orchestrator=orchestrator),
+                               orchestrator=orchestrator,
+                               mic_pause_until=mic_pause_until),
             name="audio",
         ))
 
@@ -2533,6 +2561,11 @@ async def main() -> None:
                 log.info("startup.session_ready")
                 # Brief pause to let the Live session fully stabilise
                 await asyncio.sleep(2.0)
+                # Prevent speaker loopback from instantly interrupting startup speech.
+                startup_mic_suppress = float(
+                    os.environ.get("RIO_STARTUP_MIC_SUPPRESS_SECONDS", "12") or 12,
+                )
+                mic_pause_until[0] = time.monotonic() + max(0.0, startup_mic_suppress)
                 await client.send_json({
                     "type": "text",
                     "content": "Hey Rio, say hello and introduce yourself briefly!",
