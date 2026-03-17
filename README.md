@@ -78,61 +78,48 @@ Rio is an autonomous AI assistant and pair programmer that combines voice intera
 
 Rio uses a distributed architecture with a local client and cloud relay:
 
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                         LOCAL CLIENT                                 │
-│  (rio/local/)                                                        │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
-│  │   Audio I/O  │  │Screen Capture│  │ Tool Executor│             │
-│  │  VAD + Wake  │  │  OCR + Vision│  │ File/Shell   │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘             │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
-│  │Screen Navigator│ │Browser Agent │  │Windows Agent │             │
-│  │ Click/Type   │  │  Playwright  │  │  pywinauto   │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘             │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
-│  │ Memory Store │  │  Chat Store  │  │Struggle Detect│             │
-│  │ Vector/SQLite│  │   SQLite     │  │  ML Pipeline │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘             │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              │ WebSocket
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         CLOUD RELAY                                  │
-│  (rio/cloud/)                                                        │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
-│  │  FastAPI     │  │Session Manager│ │ Tool Bridge  │             │
-│  │  WebSocket   │  │ Live/Text    │  │ RPC Proxy    │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘             │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
-│  │Tool Orchestrator│ │Model Router │  │Rate Limiter  │             │
-│  │ Multi-Agent  │  │Flash/Pro/CU  │  │ Quota Mgmt   │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘             │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐                                │
-│  │  Dashboard   │  │ Skill Loader │                                │
-│  │  UI Server   │  │ Profiles     │                                │
-│  └──────────────┘  └──────────────┘                                │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              │ Gemini API
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         GEMINI MODELS                                │
-│                                                                      │
-│  • gemini-3-flash-preview (primary orchestrator)                    │
-│  • gemini-3-pro-preview (complex reasoning)                         │
-│  • gemini-2.5-flash-native-audio-latest (live audio)                │
-│  • gemini-2.5-computer-use-preview (vision grounding)               │
-│  • imagen-4 (image generation)                                      │
-│  • veo-2 (video generation)                                         │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+  %% GitHub-renderable architecture overview
+
+  subgraph "Local Machine - rio/local"
+    L1["Main Runtime<br/>asyncio bootstrap, reconnect, degradation"]
+    L2["Audio Pipeline<br/>Silero VAD, PCM16 16kHz in, 24kHz out"]
+    L3["Vision and UI Navigator<br/>Pillow, RapidOCR, JPEG frames"]
+    L4["Tool Executor<br/>file, shell, Playwright, pyautogui, web fetch"]
+    L5["Memory Layer<br/>ChromaDB, SQLite, Embedding-2, FTS"]
+    L6["Channels<br/>Telegram, WhatsApp, long poll, notifications"]
+  end
+
+  subgraph "Cloud Relay - Cloud Run - rio/cloud"
+    C1["FastAPI Server<br/>WebSocket, REST API, OpenAI-compatible"]
+    C2["Live Session<br/>Gemini bidirectional stream, session resumption"]
+    C3["Tool Bridge<br/>ToolBridge pattern, RPC proxy"]
+    C4["Tool Orchestrator<br/>ADK, multi-step planner, approval queue"]
+    C5["Workspace Tools<br/>Gmail, Drive, Calendar, Sheets, Docs"]
+    C6["Model Router<br/>30 RPM token bucket, 4 degradation levels"]
+  end
+
+  subgraph "External APIs and UI"
+    E1["Dashboard UI<br/>browser, ws/ui stream, telemetry"]
+    E2["Gemini Live API<br/>native audio, gemini-2.5-flash"]
+    E3["Gemini and Vertex<br/>2.5 Pro, Embedding-2, Imagen 3"]
+    E4["Telegram Bot API<br/>long poll, sendMessage, approvals"]
+    E5["Google Workspace<br/>Gmail, Drive, Calendar, Sheets, Docs"]
+    E6["WhatsApp and Web<br/>Meta Graph API, DuckDuckGo"]
+  end
+
+  L1 -->|ws| C1
+  L2 -->|0x01 PCM16| C2
+  L3 -->|0x02 JPEG| C3
+  L4 -->|tool RPC| C4
+
+  C1 -->|ws/ui| E1
+  C2 -->|bidirectional stream| E2
+  C4 -->|reasoning| E3
+  C5 -->|HTTPS| E5
+  L6 -.->|notifications| E4
+  C6 -.->|web and channel routing| E6
 ```
 
 ### Data Flow
