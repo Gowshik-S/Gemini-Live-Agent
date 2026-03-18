@@ -48,15 +48,17 @@ flowchart TD
 
     subgraph CLOUD["Google Cloud Run  —  rio-agent-45"]
         C1["FastAPI Gateway\nadk_server.py"]
-        C2["Gemini 2.5 Flash\nNative Audio\nlive voice session"]
+        C2["Gemini 2.5 Flash Native Audio\nlive voice session · barge-in"]
         C3["ToolOrchestrator\nplans & routes tasks\n30 RPM rate limiter"]
         C4["ToolBridge\nproxies tool calls\nto your machine"]
     end
 
-    subgraph MODELS["Gemini Models"]
+    subgraph MODELS["Gemini Models  —  via Vertex AI"]
+        VAI["Vertex AI\nGoogle Cloud AI Platform"]
         M1["Gemini 3-Flash\ntask reasoning"]
         M2["Gemini Computer Use Preview\nreads screen → coordinates"]
         M3["Imagen 3 · Veo 2\ncreative generation"]
+        VAI --> M1 & M2 & M3
     end
 
     U1 --> L1 --> L2
@@ -68,7 +70,7 @@ flowchart TD
     C1 --> C2
     C1 --> C3
     C3 --> C4
-    C3 --> M1 & M2 & M3
+    C3 --> VAI
 
     C4 -- "tool_call" --> L3
     L3 -- "tool_result" --> C4
@@ -122,7 +124,7 @@ Rio has no chat input field. Interaction is entirely voice-in / voice-out, with 
 
 ### Vision-Guided UI Control — Gemini Computer Use Preview
 
-Rio uses **Gemini Computer Use Preview** (`gemini-3-flash-preview` with computer use capability) as the vision intelligence layer for all UI interactions.
+Rio uses **Gemini Computer Use Preview** (served via **Vertex AI**) as the vision intelligence layer for all UI interactions.
 
 The pipeline works in two stages:
 
@@ -130,7 +132,7 @@ The pipeline works in two stages:
 Screenshot (JPEG)
       │
       ▼
-Gemini Computer Use Preview
+Gemini Computer Use Preview  (Vertex AI)
   → reads screen context
   → identifies target element
   → returns normalized (x, y) coordinates
@@ -149,16 +151,19 @@ This is what powers `smart_click(target, action)` in `local/tools.py` — you de
 
 > **Gemini Computer Use Preview** is purpose-built for agents that interact with UIs — browsers, desktop apps, web applications — by understanding screen context rather than DOM structure. Rio uses it as the grounding layer so UI navigation degrades gracefully even when Playwright selectors can't reach an element.
 
+### Google Cloud & Gemini Integration
 
-- **Google GenAI SDK** used directly: `genai.Client`, `client.aio.live.connect`, `types.LiveConnectConfig`, `types.SpeechConfig`, `types.AutomaticActivityDetection`, `types.FunctionDeclaration.from_callable`
-- **Vertex AI path** auto-activates when `GOOGLE_GENAI_USE_VERTEXAI=true` — same code, zero changes
+- **Google GenAI SDK + Vertex AI** used directly: `genai.Client`, `client.aio.live.connect`, `types.LiveConnectConfig`, `types.SpeechConfig`, `types.AutomaticActivityDetection`, `types.FunctionDeclaration.from_callable`
+- **Vertex AI** is the platform backing Gemini Computer Use Preview, Gemini 3-Flash tool orchestration, Imagen 3, and Veo 2. Activated via `GOOGLE_GENAI_USE_VERTEXAI=true` with `GOOGLE_CLOUD_PROJECT` — same SDK client, zero code changes
 - **Google Workspace APIs** (Gmail, Drive, Calendar, Sheets, Docs) integrated via `cloud/workspace_tools.py`
 - **Cloud Run** manifest: `minScale=1`, `maxScale=5`, `sessionAffinity=true`, `timeoutSeconds=3600` — long-lived WebSocket sessions don't get killed mid-task
 
 ### ToolBridge Pattern
+
 One `ToolBridge` instance is created per WebSocket session. `_make_tools(bridge)` returns **58 async closures** scoped to that session — covering file ops, shell, screen automation, browser (Playwright), window management, clipboard, web search, Google Workspace, Imagen/Veo generation, memory, and skill-specific tools (customer care, tutoring). Results are Pydantic-validated before being fed back to the orchestrator.
 
 ### Reliability & Error Handling
+
 | Layer | Mechanism |
 |---|---|
 | Rate limiting | 30 RPM token bucket, 4 degradation levels (NORMAL → CAUTION → EMERGENCY → CRITICAL) |
@@ -168,6 +173,7 @@ One `ToolBridge` instance is created per WebSocket session. `_make_tools(bridge)
 | Anti-hallucination | OCR + screenshot provide UI state evidence; tool outputs treated as execution truth, injected as grounding |
 
 ### Config Resolution Priority
+
 ```
 ENV variable  →  .env / config.yaml  →  code defaults
 ```
@@ -200,7 +206,7 @@ All model choices, timeouts, feature flags, and rate limits are overridable at r
 | Free | Available immediately — try voice interaction, dashboard, and tool execution |
 | Pro | Full autonomous task mode, screen control, and all 58 tools unlocked |
 
-> **For judges:** The demo video walkthrough covers the full Pro-tier capability. If you'd like live Pro access during evaluation, Reach out [rio.gowshik.in](https://rio.gowshik.in).
+> **For judges:** The demo video walkthrough covers the full Pro-tier capability. If you'd like live Pro access during evaluation, reach out at [rio.gowshik.in](https://rio.gowshik.in).
 
 ---
 
@@ -216,10 +222,10 @@ All model choices, timeouts, feature flags, and rate limits are overridable at r
 **Verify live deployment:**
 ```bash
 curl -s https://rio-landing-979788564023.us-central1.run.app/health | jq
-# Expected: Rio Landing Page
+# Expected: { "status": "ok", "service": "rio-cloud", "backend": "...", "model": "..." }
 ```
 
-**GCP services used:** Cloud Run · Gemini Live API · Gemini content generation · Vertex AI (optional) · Secret Manager (`gemini-api-key`) · Google Workspace APIs
+**GCP services used:** Cloud Run · Gemini Live API · **Vertex AI** (Gemini Computer Use Preview · Gemini 3-Flash · Imagen 3 · Veo 2) · Secret Manager (`gemini-api-key`) · Google Workspace APIs
 
 ---
 
@@ -274,7 +280,8 @@ That's the only required environment variable to get started. Everything else re
 **Optional overrides** (add to `cloud/.env` as needed):
 
 ```bash
-GOOGLE_CLOUD_PROJECT=your-gcp-project-id   # for Vertex AI path
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id   # required for Vertex AI path
+GOOGLE_GENAI_USE_VERTEXAI=true             # activate Vertex AI backend
 SESSION_MODE=live                           # "live" (audio) or "text"
 RIO_VOICE=Puck                             # agent voice identity
 RIO_WS_TOKEN=secret                        # WebSocket auth token
@@ -327,7 +334,7 @@ Once both are running, press **F2** and speak a command.
 python -m rio.cli doctor --test-api
 ```
 
-This checks: config loading, API connectivity, rate limiter, model routing, tool imports, dashboard files, and wire protocol constants. Optional dependencies (ChromaDB, sentence-transformers, Playwright) are reported as skipped, not failed, if not installed.
+This checks: config loading, API connectivity, rate limiter, model routing, tool imports, dashboard files, and wire protocol constants. Optional dependencies (ChromaDB, Playwright) are reported as skipped, not failed, if not installed.
 
 ---
 
@@ -370,9 +377,9 @@ Then run the local runtime pointing at the deployed relay — no other changes n
 |---|---|---|
 | Task Executor | Gemini 3-Flash | Multi-step general task orchestration |
 | Code Agent | Gemini 3-Flash | File editing, shell, git |
-| Computer Use Agent | **Gemini Computer Use Preview** | Screen reading, coordinate grounding, GUI automation |
+| Computer Use Agent | **Gemini Computer Use Preview** (Vertex AI) | Screen reading, coordinate grounding, GUI automation |
 | Research Agent | Gemini 2.5-Pro | Deep reasoning, analysis |
-| Creative Agent | Imagen 3 + Veo 2 | Image and video generation |
+| Creative Agent | Imagen 3 + Veo 2 (Vertex AI) | Image and video generation |
 
 ### Tool Categories (58 total)
 
@@ -435,9 +442,9 @@ The dashboard is pure static HTML/CSS/JS served directly by FastAPI — no separ
 | Layer | Technology |
 |---|---|
 | Cloud relay | FastAPI · uvicorn · websockets · structlog |
-| AI / Gemini | `google-genai` SDK · Live API · Gemini 2.5 Flash Native Audio · Flash/Pro text |
+| AI / Gemini | `google-genai` SDK · **Vertex AI** · Live API · Gemini 2.5 Flash Native Audio · Gemini 3-Flash · Gemini Computer Use Preview |
 | Audio | sounddevice · Silero VAD · CPU PyTorch |
-| Vision | mss · Pillow · RapidOCR (ONNX) |
+| Vision | mss · Pillow · RapidOCR (ONNX) · Gemini Computer Model|
 | Automation | pyautogui · pygetwindow · Playwright |
 | Memory | SQLite · ChromaDB · **Gemini Text Embeddings 2** (`text-embedding-004`) |
 | Deployment | Cloud Run · Docker (Python 3.11-slim) |
