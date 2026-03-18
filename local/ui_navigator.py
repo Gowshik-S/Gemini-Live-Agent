@@ -56,7 +56,7 @@ class UINavigator:
         analyze_every_n_frames: int = 3,
         emit_action: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
         genai_client=None,
-        click_tool: str = "smart_click",
+        click_tool: str = "screen_click",
     ) -> None:
         self._tool_executor = tool_executor
         self._screen_navigator = screen_navigator
@@ -65,7 +65,9 @@ class UINavigator:
         self._confidence_threshold = float(confidence_threshold)
         self._analyze_every_n_frames = max(1, int(analyze_every_n_frames))
         self._emit_action = emit_action
-        self._click_tool = click_tool
+        # Force coordinate-grounded click flow for desktop reliability.
+        # smart_click is intentionally avoided in UI Navigator.
+        self._click_tool = "screen_click" if click_tool == "smart_click" else click_tool
 
         self._client = genai_client
         self._task: asyncio.Task | None = None
@@ -433,21 +435,10 @@ class UINavigator:
     async def _execute_action(self, action: NavigatorAction) -> dict[str, Any]:
         context = action.context
 
-        # High-confidence clicks are confirmed with Computer Use before execution.
+        # High-confidence clicks are confirmed with text-only coordinate grounding.
         confirmed_xy: tuple[int, int] | None = None
         if action.action in {"click", "left_click", "double_click", "right_click"}:
-            if self._click_tool == "smart_click" and action.element:
-                # Delegate entirely to the smart_click tool
-                return await self._tool_executor.execute(
-                    "smart_click",
-                    {
-                        "target": action.element,
-                        "action": action.action,
-                        "clicks": 2 if action.action == "double_click" else 1,
-                    }
-                )
-            elif self._click_tool == "screen_click":
-                confirmed_xy = await self._confirm_click_coordinates(action)
+            confirmed_xy = await self._confirm_click_coordinates(action)
 
         if context == "browser":
             return await self._execute_browser_action(action, confirmed_xy)

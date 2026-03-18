@@ -1,0 +1,546 @@
+Rio Agent Repository Analysis
+Generated: 2026-03-18
+Scope analyzed: Rio-Agent/rio source tree (including runtime data directories present in repo folder)
+
+================================================================================
+1) DIRECTORY TREE (ANNOTATED BY ROLE)
+================================================================================
+
+Legend:
+- [SRC] core source code
+- [CFG] config and manifests
+- [DOC] documentation/prompt files
+- [TEST] test and eval assets
+- [UI] dashboard frontend
+- [DATA] runtime/persistent data artifacts
+- [OPS] setup/deployment scripts
+- [SKILL] mode/skill/profile definitions
+
+rio/
+  .gitignore [CFG]
+  __init__.py [SRC]
+  cli.py [SRC] CLI entrypoint (`rio config`, `rio doctor`, `rio run`)
+  config.yaml [CFG] global runtime config (models/hotkeys/orchestrator/gcp)
+  requirements.txt [CFG]
+  requirements-dev.txt [CFG]
+  INSTALL.md [DOC]
+  README.md [DOC]
+  orchestration.md [DOC]
+  UI_Navigator.md [DOC]
+  agent_prompt.md [DOC] system prompt content
+  browser_agent_prompt.md [DOC]
+  creative_agent.md [DOC]
+  rio_architecture.png [DOC]
+
+  cloud/ [SRC]
+    .env [CFG]
+    adk_server.py [SRC] FastAPI + Live API relay + WS control plane
+    main.py [SRC] legacy/alternate cloud server path
+    gemini_session.py [SRC] system instruction + Gemini session wrapper
+    rio_agent.py [SRC] ToolBridge + tool closure factory + ADK agent factory
+    tool_orchestrator.py [SRC] multi-step function-calling task executor
+    rate_limiter.py [SRC] token-bucket 30 RPM + degradation ladder
+    model_router.py [SRC] model selection and Pro budget routing
+    session_manager.py [SRC] session lifecycle/timeout management
+    workspace_tools.py [SRC] Google Workspace API wrappers
+    trigger_engine.py [SRC] interval/scheduled trigger automation
+    block_coalescer.py [SRC]
+    directive_parser.py [SRC]
+    evaluation.py [SRC]
+    error_classifier.py [SRC]
+    mcp_client.py [SRC]
+    mcp_server.py [SRC]
+    skill_loader.py [SRC]
+    voice_plugin.py [SRC]
+    __init__.py [SRC]
+    README.md [DOC]
+    requirements.txt [CFG]
+    Dockerfile [OPS]
+    service.yaml [OPS]
+    plan_google.txt [DOC]
+    adk_server.py.bak [DATA] backup artifact
+
+    cloud/orchestrator_core/ [SRC]
+      base.py
+      intent_router.py
+      pipelines.py
+      registry.py
+
+    cloud/voice_plugins/ [SRC]
+      custom_voice.py
+      __init__.py
+
+  local/ [SRC]
+    __init__.py
+    main.py [SRC] local runtime orchestrator (audio/vision/ws loops)
+    config.py [SRC] typed config loader + model resolver
+    constants.py [SRC] wire protocol/model/version constants
+    ws_client.py [SRC] resilient websocket client + heartbeat + queues
+    audio_io.py [SRC] mic capture/playback (PCM)
+    vad.py [SRC] Silero VAD wrapper
+    wake_word.py [SRC] wake-word detection
+    push_to_talk.py [SRC] hotkey gate
+    screen_capture.py [SRC] screenshot/JPEG pipeline (+ OCR helper integration)
+    ocr.py [SRC] RapidOCR engine wrapper
+    screen_navigator.py [SRC] pyautogui/window interactions
+    ui_navigator.py [SRC] frame-streamed UI navigation assist
+    browser_tools.py [SRC] Playwright browser control
+    browser_agent.py [SRC] browser-specific Gemini actions
+    windows_agent.py [SRC] windows automation helper
+    web_tools.py [SRC] web search/fetch/cache
+    tools.py [SRC] local tool executor dispatch + safety + support sheets + computer-use
+    orchestrator.py [SRC] local autonomous orchestration
+    memory.py [SRC] vector/store memory integration
+    unified_memory.py [SRC]
+    chat_store.py [SRC] sqlite chat history
+    task_state.py [SRC] sqlite task/session memory
+    user_pattern_model.py [SRC]
+    model_fallback.py [SRC]
+    struggle_detector.py [SRC]
+    profiles.py [SRC]
+    platform_utils.py [SRC]
+    rio_logging.py [SRC]
+    maintenance.py [SRC]
+    notifier.py [SRC]
+    telegram_bot.py [SRC]
+    whatsapp_channel.py [SRC]
+    channel_manager.py [SRC]
+    creative_agent.py [SRC] image/video generation (Imagen + Veo)
+    README.md [DOC]
+    requirements.txt [CFG]
+
+    local/data/memory/* [DATA] local runtime memory DB/vector artifacts
+
+  ui/ [UI]
+    README.md [DOC]
+    dashboard/
+      index.html [UI]
+      chat.html [UI]
+      setup.html [UI]
+      README.md [DOC]
+      css/style.css [UI]
+      css/chat.css [UI]
+      css/setup.css [UI]
+      js/websocket.js [UI]
+      js/transcript.js [UI]
+      js/toollog.js [UI]
+      js/health.js [UI]
+      js/gauge.js [UI]
+      js/schedules.js [UI]
+      js/setup.js [UI]
+      js/chat.js [UI]
+
+  ml/ [SRC]
+    __init__.py
+    feature_engine.py
+    ensemble_model.py
+    user_model_manager.py
+    train.py
+    README.md [DOC]
+    datasets/README.md [DOC]
+    models/user_default.pkl [DATA]
+
+  tests/ [TEST]
+    test_all.py
+    eval_harness.py
+    golden_trajectories.json
+    README.md [DOC]
+
+  setup/ [OPS]
+    setup.sh
+    setup.bat
+    run-cloud.sh
+    run-cloud.bat
+    run-local.sh
+    run-local.bat
+    deploy.sh
+    README.md
+
+  modes/ [SKILL]
+    automation.yaml
+    developer.yaml
+    researcher.yaml
+
+  skills/ [SKILL]
+    customer_care.yaml
+    tutor.yaml
+
+  rio_profiles/ [SKILL]
+    customer_care_profile.json
+    tutor_profile.json
+
+  data/ [DATA]
+    README.md
+    .gitkeep
+    context.txt
+    rio_chats.db(.shm/.wal)
+    rio_patterns.db(.shm/.wal)
+    rio_tasks.db(.shm/.wal)
+    conversations/*.json
+    sessions/*.json
+    transcripts/*.jsonl
+    users/*.json
+    memory/* (chroma/fts/vector blobs)
+
+================================================================================
+2) SIGNIFICANT FILES: PURPOSE, KEY FUNCTIONS/CLASSES, DEPENDENCIES
+================================================================================
+
+[cloud/adk_server.py]
+- Purpose: primary cloud runtime (FastAPI) for Rio live sessions.
+- Key constructs:
+  - FastAPI `app` with lifespan startup/shutdown.
+  - `/ws/rio/live` websocket endpoint handling live model stream + tool bridge + orchestration.
+  - `_build_live_config(...)` builds `types.LiveConnectConfig`.
+  - `inject_context(...)` to inject orchestrator outputs back to live voice model.
+  - Translation control (`translator_toggle`, `translator_update`, `_handle_live_translation`).
+  - OpenAI-compatible endpoints (`/v1/models`, `/v1/chat/completions`).
+- Dependencies: fastapi, uvicorn, google-genai SDK, websockets, structlog, dotenv.
+
+[cloud/rio_agent.py]
+- Purpose: per-session ToolBridge and tool closure factory.
+- Key constructs:
+  - `ToolBridge` class (`dispatch`, `resolve`, `resolve_by_name`, timeout overrides).
+  - Pydantic validation map for tool result schemas.
+  - `_make_tools(bridge)` returns closured async tool call wrappers.
+  - `create_rio_agent(...)` optional ADK agent factory.
+- Notable fact: `_make_tools` return list length = 58 closures (AST count from source).
+
+[cloud/tool_orchestrator.py]
+- Purpose: non-live function-calling execution engine for multi-step autonomous tasks.
+- Key constructs:
+  - `ToolOrchestrator` class.
+  - `_is_task_request(...)` intent gate.
+  - loop caps/context controls (`_MAX_ITERATIONS=50`, `_CONTEXT_COMPACT_CHARS=400000`).
+  - `automatic_function_calling=...disable=True` in model calls (explicit manual tool loop control).
+- Dependencies: google-genai SDK types, asyncio, yaml config, memory/task stores.
+
+[cloud/rate_limiter.py]
+- Purpose: 30 RPM token-bucket + degradation policy.
+- Key constructs:
+  - `Priority` enum (SESSION, USER_ASK, PROACTIVE, BACKGROUND).
+  - `DegradationLevel` enum (NORMAL/CAUTION/EMERGENCY/CRITICAL).
+  - `RateLimiter.try_acquire()` and `get_usage()`.
+
+[cloud/workspace_tools.py]
+- Purpose: direct Google Workspace API tools.
+- Key functions:
+  - `gmail_search`, `gmail_send`.
+  - `drive_list`, `drive_download`.
+  - `calendar_list_events`, `calendar_create`.
+  - `sheets_read`, `docs_create` (in file continuation).
+- Dependencies: google-api-python-client, google-auth, service-account credentials.
+
+[cloud/gemini_session.py]
+- Purpose: system instruction composition and Gemini session modes (text/live).
+- Key constructs:
+  - `_load_agent_config`, `_build_role_intro`, `build_system_instruction`.
+  - tool declaration metadata used for model function calling context.
+
+[cloud/model_router.py]
+- Purpose: model route and Pro RPM budget governor.
+- Key behavior: tracks `_pro_rpm_budget`, `_pro_rpm_used`, 60-second windows.
+
+[cloud/Dockerfile]
+- Purpose: container packaging for Cloud Run.
+- Key behavior: Python 3.11-slim, non-root user, healthcheck `/health`, `uvicorn adk_server:app`.
+
+[cloud/service.yaml]
+- Purpose: Cloud Run service definition.
+- Key settings:
+  - minScale=1, maxScale=5, sessionAffinity=true.
+  - timeoutSeconds=3600, concurrency=80.
+  - health startup/liveness probes on `/health`.
+
+[local/main.py]
+- Purpose: local runtime orchestrator.
+- Key loops:
+  - `audio_capture_loop` (PCM chunks + VAD/PTT + send binary `0x01`).
+  - `screen_capture_loop` (JPEG frames + send binary `0x02`).
+  - receive loop handling cloud tool calls/results/transcripts and binary audio playback.
+  - hotkey loops (`F3` mute toggle, `F7` translation, `F8` task status).
+- Dependencies: websockets client wrapper, audio_io, vad, screen_capture, tools, navigator modules.
+
+[local/ws_client.py]
+- Purpose: persistent websocket client with reconnect and heartbeat.
+- Key behavior:
+  - send queue with frame prioritization.
+  - ping heartbeat.
+  - JSON decode for text frames and pass-through binary frames.
+
+[local/constants.py]
+- Purpose: shared constants.
+- Critical protocol constants:
+  - `AUDIO_PREFIX=b"\x01"`
+  - `IMAGE_PREFIX=b"\x02"`
+
+[local/audio_io.py]
+- Purpose: mic input and speaker output.
+- Key formats:
+  - input: PCM 16-bit LE mono 16kHz.
+  - output pipeline supports model audio playback path.
+
+[local/vad.py]
+- Purpose: Silero VAD wrapper.
+- Key API: `SileroVAD.process(...)`, `process_async(...)`.
+
+[local/screen_capture.py]
+- Purpose: screenshot capture, JPEG encoding, optional OCR pair capture.
+- Key behavior:
+  - default quality 85.
+  - returns JPEG bytes for transmission.
+
+[local/ocr.py]
+- Purpose: RapidOCR extraction from JPEG screenshot bytes.
+- Key behavior: hash-based caching to avoid repeated OCR on same frame.
+
+[local/tools.py]
+- Purpose: local tool execution dispatcher.
+- Key functionality:
+  - secure file ops (`read_file`, `write_file`, `patch_file`) with backups.
+  - `run_command` with blocklist + timeout.
+  - screen/window/process/clipboard tools.
+  - support ticket logging to Google Sheets (`_log_support_ticket*`).
+  - computer-use grounding with model calls and coordinate normalization.
+  - configurable workspace CLI binary (`RIO_WORKSPACE_CLI_BIN`).
+
+[local/browser_tools.py]
+- Purpose: Playwright browser integration and navigation timings.
+- Key env tunables:
+  - `RIO_BROWSER_NAV_GOTO_TIMEOUT_MS`, `RIO_BROWSER_NAV_POST_WAIT_MS`, etc.
+
+[local/ui_navigator.py]
+- Purpose: frame-fed UI navigation helper.
+- Key behavior: sends JPEG frames as model input and returns structured action guidance.
+
+[local/creative_agent.py]
+- Purpose: creative media generation helper.
+- Key APIs:
+  - `generate_image` via Imagen model.
+  - `generate_video` via Veo model (`veo-2.0-generate-001`).
+
+[local/config.py]
+- Purpose: typed config with defaults and env/model resolution.
+- Key APIs:
+  - `RioConfig.load()`
+  - `get_model(name)` (env -> config -> default fallback)
+
+[local/memory.py], [local/unified_memory.py], [local/task_state.py], [local/chat_store.py]
+- Purpose: persistent memory, session notes, task state, transcript/chat storage.
+- Dependencies: sqlite, optional chromadb/sentence-transformers embeddings.
+
+[ui/dashboard/*]
+- Purpose: operational dashboard.
+- Key features: transcript stream, tool log correlation, health status, schedules, setup controls.
+- Backend channel: websocket (`/ws/dashboard`) + HTTP config endpoints.
+
+[ml/*]
+- Purpose: user pattern modeling and ensemble training/evaluation.
+
+================================================================================
+3) ENVIRONMENT VARIABLES AND CONFIG FLAGS USED IN CODEBASE
+================================================================================
+
+Source-extracted env var names used by Rio code:
+- GEMINI_API_KEY
+- GOOGLE_CLOUD_PROJECT
+- GOOGLE_CLOUD_LOCATION
+- GOOGLE_GENAI_USE_VERTEXAI
+- GOOGLE_APPLICATION_CREDENTIALS
+- GOOGLE_WORKSPACE_USER
+- LIVE_MODEL
+- ORCHESTRATOR_MODEL
+- TEXT_MODEL
+- SESSION_MODE
+- PORT
+- PRO_RPM_BUDGET
+- COMPUTER_USE_MODEL
+- RIO_WS_TOKEN
+- RIO_VOICE
+- RIO_AGENT_NAME
+- RIO_AGENT_ROLE
+- RIO_CONFIG
+- RIO_ENV_FILE
+- RIO_EVAL_ENABLED
+- RIO_ORCHESTRATOR_USE_AGENTS_MD
+- RIO_CONFIRM_TIMEOUT_SECONDS
+- RIO_SEND_STARTUP_GREETING
+- RIO_STARTUP_MIC_SUPPRESS_SECONDS
+- RIO_EMBEDDING_MODEL
+- RIO_TOOLBRIDGE_TIMEOUT_SECONDS
+- RIO_WORKSPACE_CLI_BIN
+- RIO_TELEGRAM_BOT_TOKEN
+- RIO_TELEGRAM_CHAT_ID
+- RIO_WHATSAPP_ACCESS_TOKEN
+- RIO_WHATSAPP_PHONE_NUMBER_ID
+- RIO_WHATSAPP_TO_NUMBER
+- RIO_BROWSER_REQUIRE_CHROMIUM
+- RIO_BROWSER_SHOW_AUTOMATION_BANNER
+- RIO_BROWSER_NAV_GOTO_TIMEOUT_MS
+- RIO_BROWSER_NAV_POST_WAIT_MS
+- RIO_TRANSLATOR_MODEL
+- RIO_TRANSLATOR_DEFAULT_ENABLED
+- RIO_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE
+- RIO_TRANSLATOR_DEFAULT_TARGET_LANGUAGE
+- RIO_TRANSLATOR_DEFAULT_STAFF_LANGUAGE
+- RIO_TRANSLATOR_DEFAULT_COUNTERPARTY_LANGUAGE
+- RIO_TRANSLATOR_DEFAULT_BIDIRECTIONAL
+- RIO_TRANSLATOR_DEFAULT_SPEAK
+- RIO_TRANSLATOR_DEFAULT_SUPPRESS_TASKS
+- RIO_TRANSLATOR_REPEAT_GUARD_MS
+- RIO_TRANSLATOR_MIN_CHARS
+- RIO_TRANSLATOR_TIMEOUT_SECONDS
+- RIO_LIVE_MODEL_TOOLS
+- RIO_LIVE_ENABLE_SERVER_VAD
+- RIO_LIVE_ENABLE_INPUT_AUDIO_TRANSCRIPTION
+- RIO_LIVE_ENABLE_OUTPUT_AUDIO_TRANSCRIPTION
+- RIO_LIVE_ENABLE_SESSION_RESUMPTION
+- RIO_LIVE_ENABLE_HISTORY_RESTORE
+- RIO_LIVE_ENABLE_PERSISTENT_CLIENT_SESSION
+- RIO_LIVE_ENABLE_RESUME_INTERRUPTED_TASKS
+- RIO_VOICE_PLUGIN_MODULE
+- RIO_VOICE_PLUGIN_FACTORY
+- SUPPORT_SHEET_RANGE
+- SUPPORT_SHEET_TITLE
+- SUPPORT_AUTO_CREATE_SHEET
+- WAYLAND_DISPLAY
+- DISPLAY
+- APPDATA
+- XDG_CONFIG_HOME
+- XDG_STATE_HOME
+- XDG_SESSION_TYPE
+- TEMP
+
+Config flags in `config.yaml` (core):
+- `rio.session_mode`, `rio.cloud_url`, `rio.backend`
+- `rio.audio.*`, `rio.vad.*`, `rio.vision.*`, `rio.hotkeys.*`
+- `rio.models.*` (primary/live/secondary/computer_use/imagen/fallback budgets)
+- `rio.orchestrator.*` (timeouts, tool_policy, loop_detection, composite_routing)
+- `rio.ui_navigator.*`, `rio.struggle.*`, `rio.memory.*`
+- `rio.gcp.*`, `rio.workspace_cli.binary`, `rio.filesystem.*`
+- `rio.voice.*`, `rio.notifications.*`, `rio.skills.*`, `rio.agents.*`
+
+================================================================================
+4) EXTERNAL APIS, SDKS, AND SERVICES INTEGRATED
+================================================================================
+
+Core AI/runtime:
+- Google GenAI Python SDK (`google.genai`) for Live API, generate_content, images/videos.
+- Gemini models (live native audio, flash/pro tool models, embeddings).
+- Optional Vertex AI mode (`genai.Client(vertexai=True, project=..., location=...)`).
+- Optional Google ADK Agent class import in `cloud/rio_agent.py` for legacy ADK factory.
+
+Cloud service:
+- FastAPI + Uvicorn.
+- Cloud Run deployment (`cloud/service.yaml`).
+
+Desktop/browser automation:
+- Playwright (browser automation).
+- pyautogui / window/process helpers.
+
+Vision and OCR:
+- Pillow (image encoding/transform).
+- RapidOCR ONNX runtime (OCR extraction).
+
+Memory and storage:
+- sqlite (chat/task/session stores).
+- optional chromadb/sentence-transformers (vector memory).
+
+Workspace and messaging:
+- Google Workspace APIs (Gmail/Drive/Calendar/Sheets/Docs) via google-api-python-client.
+- Telegram Bot API integration.
+- WhatsApp channel integration.
+
+Web search/fetch:
+- DuckDuckGo search wrappers and web fetching tools.
+
+CLI integrations:
+- Workspace CLI adapter path configured by `RIO_WORKSPACE_CLI_BIN` and `rio.workspace_cli.binary`.
+- Gemini CLI is present in workspace root (`gemini-cli/`) but Rio source uses google-genai SDK directly.
+
+================================================================================
+5) INTER-COMPONENT COMMUNICATION PATTERNS
+================================================================================
+
+A) WebSocket (primary control/data plane)
+- Local -> Cloud: `/ws/rio/live`
+- Dashboard -> Cloud: `/ws/dashboard`
+- Message types include JSON control frames + binary payload frames.
+
+B) Binary wire protocol (local constants)
+- `0x01` prefix (`AUDIO_PREFIX`) = PCM16 audio payload.
+- `0x02` prefix (`IMAGE_PREFIX`) = JPEG image payload.
+
+C) HTTP APIs
+- `/health` for readiness/liveness.
+- `/api/chat-history`, `/api/users/{user_id}/config`, `/api/triggers*`.
+- OpenAI-compatible `/v1/models`, `/v1/chat/completions`.
+
+D) Tool RPC pattern (ToolBridge)
+- Cloud emits `tool_call` JSON with `id/name/args`.
+- Local executes and returns `tool_result` with matching `id`.
+- ToolBridge resolves pending futures by call ID.
+
+E) Internal async patterns
+- asyncio tasks, event loops, queues, heartbeat loops.
+- background workers for capture/send/read and orchestrator task execution.
+
+================================================================================
+6) DATA FLOW: USER VOICE INPUT -> VAD -> CLOUD -> AGENT -> TOOLS -> RESPONSE
+================================================================================
+
+1. User speaks on local machine.
+2. Local `audio_io` captures PCM 16-bit LE chunks at 16kHz.
+3. `SileroVAD` optionally filters non-speech chunks.
+4. Local sends `0x01 + pcm_bytes` over websocket to cloud.
+5. Cloud `adk_server.py` forwards to Gemini Live session (`aio.live.connect`).
+6. Input transcription events are parsed.
+7. Task detection gates into orchestrator when request is executable.
+8. `ToolOrchestrator` runs function-calling loop using orchestrator model.
+9. For each tool call, cloud `ToolBridge` sends `tool_call` to local.
+10. Local `tools.py` executes action (file/shell/browser/screen/workspace/etc.) and returns `tool_result`.
+11. Orchestrator incorporates tool result and continues until completion.
+12. Completion is injected back into live session via `inject_context(...)` with `turn_complete=True`.
+13. Live model emits audio output; cloud forwards audio frames to local.
+14. Local playback outputs assistant voice to user.
+
+Vision branch (parallel when enabled):
+- Local captures screenshot via Pillow/mss -> JPEG.
+- Sends `0x02 + jpeg_bytes` to cloud for model context and navigator/orchestrator grounding.
+- OCR (RapidOCR) may provide text grounding for decision reliability.
+
+================================================================================
+7) DEPLOYMENT TOPOLOGY (LOCAL VS CLOUD RUN)
+================================================================================
+
+Local runtime (`rio/local`):
+- Runs on user machine.
+- Captures microphone/screen, executes local tools, automates desktop/browser.
+- Maintains websocket connection to cloud.
+
+Cloud runtime (`rio/cloud`):
+- FastAPI service deployed to Cloud Run.
+- Manages live model sessions, orchestrator, tool proxying, dashboard/control APIs.
+- Health endpoint and long websocket timeout (3600s) configured.
+
+Cloud Run evidence from source:
+- Service name: `rio-cloud` in `cloud/service.yaml`.
+- Region label: `us-central1`.
+- GCP project in config: `rio-agent-45` (`config.yaml -> rio.gcp.project_id`).
+- Container image pattern: `gcr.io/PROJECT_ID/rio-cloud:latest`.
+
+================================================================================
+8) NOTES ON GEMINI CLI AND WORKSPACE CLI INTEGRATION
+================================================================================
+
+- Workspace CLI integration is explicit in Rio config and local tools (`RIO_WORKSPACE_CLI_BIN`, `rio.workspace_cli.binary`).
+- Rio cloud also includes direct Google Workspace API integrations in `cloud/workspace_tools.py`.
+- Gemini CLI exists as a sibling repository in workspace root, but Rio source implementation itself is SDK-driven (`google.genai`) and OpenAI-compatible HTTP endpoint driven; there is no direct subprocess wrapper around `gemini` binary in analyzed Rio source files.
+
+================================================================================
+9) RISK/COMPLETENESS NOTES
+================================================================================
+
+- This analysis includes source + runtime artifacts present in `rio/data` and `local/data` directories.
+- Runtime directories contain many generated files (sessions/transcripts/chroma blobs); they are grouped by pattern above instead of line-by-line semantic description because they are data outputs, not authored source modules.
+- All architecture and protocol claims above were derived from files under `Rio-Agent/rio`.

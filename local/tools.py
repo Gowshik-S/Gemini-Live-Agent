@@ -1885,6 +1885,20 @@ class ToolExecutor:
         _, h = self._get_screen_size()
         return int(y / 1000 * h)
 
+    def _normalize_x(self, x: int) -> int:
+        """Convert real screen pixel X → 0-1000 normalized X."""
+        w, _ = self._get_screen_size()
+        if w <= 0:
+            return 0
+        return max(0, min(1000, int((x / w) * 1000)))
+
+    def _normalize_y(self, y: int) -> int:
+        """Convert real screen pixel Y → 0-1000 normalized Y."""
+        _, h = self._get_screen_size()
+        if h <= 0:
+            return 0
+        return max(0, min(1000, int((y / h) * 1000)))
+
     async def _capture_png_for_cu(self) -> bytes | None:
         """Capture a full-resolution screenshot as PNG for computer-use model feedback."""
         if self._screen_capture is None:
@@ -2236,6 +2250,19 @@ class ToolExecutor:
         if self._screen_capture is None:
             return {"success": False, "error": "Screen capture not attached"}
 
+        # Fast defaults for real-time UI control; can be tuned via env when needed.
+        try:
+            model_timeout_seconds = float(_get_env_value("RIO_CU_SNAPSHOT_TIMEOUT_SECONDS") or "1.2")
+        except (TypeError, ValueError):
+            model_timeout_seconds = 1.2
+        model_timeout_seconds = max(0.5, min(10.0, model_timeout_seconds))
+
+        try:
+            model_attempts = int(_get_env_value("RIO_CU_SNAPSHOT_MODEL_ATTEMPTS") or "1")
+        except (TypeError, ValueError):
+            model_attempts = 1
+        model_attempts = max(1, min(3, model_attempts))
+
         captured = await _capture_full_res_jpeg_base64()
         if not captured:
             return {"success": False, "error": "Screenshot failed"}
@@ -2281,10 +2308,10 @@ class ToolExecutor:
                 os.environ.get("COMPUTER_USE_MODEL", "gemini-2.5-computer-use-preview-10-2025"),
                 "gemini-2.5-flash",
                 "gemini-2.0-flash-exp",
-            ]
+            ][:model_attempts]
             for candidate_model in model_chain:
                 try:
-                    async with asyncio.timeout(3.5):
+                    async with asyncio.timeout(model_timeout_seconds):
                         response = await self._cu_generate_content(
                             client,
                             model=candidate_model,
@@ -2303,7 +2330,7 @@ class ToolExecutor:
                         stage="model_timeout",
                         target=target,
                         model=candidate_model,
-                        timeout_seconds=3.5,
+                        timeout_seconds=model_timeout_seconds,
                     )
                 except Exception as exc:
                     model_error = str(exc)
@@ -2333,25 +2360,30 @@ class ToolExecutor:
             model_error = str(exc)
             log.warning("cu.single_snapshot", stage="model_failed", target=target, error=model_error)
 
-        # Fallback 1: image matching via pyautogui.locateCenterOnScreen(target_image)
-        log.info("cu.single_snapshot", stage="locate_fallback", target=target)
-        try:
-            import pyautogui
+        # Fallback 1: image matching only for file/image targets.
+        target_path = Path(str(target)).expanduser()
+        is_image_target = target_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+        if is_image_target and target_path.exists():
+            log.info("cu.single_snapshot", stage="locate_fallback", target=target)
+            try:
+                import pyautogui
 
-            located = await asyncio.to_thread(pyautogui.locateCenterOnScreen, target)
-            if located is not None:
-                x = int(located.x)
-                y = int(located.y)
-                self._last_confirmed_click_xy = (x, y)
-                return {
-                    "success": True,
-                    "x": x,
-                    "y": y,
-                    "method": "pyautogui_locate",
-                }
-        except Exception as exc:
-            if not model_error:
-                model_error = str(exc)
+                located = await asyncio.to_thread(pyautogui.locateCenterOnScreen, str(target_path))
+                if located is not None:
+                    x = int(located.x)
+                    y = int(located.y)
+                    self._last_confirmed_click_xy = (x, y)
+                    return {
+                        "success": True,
+                        "x": x,
+                        "y": y,
+                        "method": "pyautogui_locate",
+                    }
+            except Exception as exc:
+                if not model_error:
+                    model_error = str(exc)
+        else:
+            log.info("cu.single_snapshot", stage="locate_skipped", target=target)
 
         # Fallback 2: direct click at last known coordinates.
         log.info("cu.single_snapshot", stage="direct_fallback", target=target)
@@ -2535,7 +2567,7 @@ class ToolExecutor:
         return {
             "success": True,
             "status": "grounding_started", 
-            "estimated_wait": "4s",
+            "estimated_wait": "2s",
             "message": "Vision grounding started in background. The click will happen shortly. Please wait a moment before verifying."
         }
 

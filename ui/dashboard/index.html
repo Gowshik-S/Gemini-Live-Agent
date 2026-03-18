@@ -103,13 +103,34 @@
         <h2 class="panel__title">Live Transcript</h2>
         <span class="panel__badge" id="transcript-count">0</span>
       </div>
-      <div class="panel__body transcript-scroll" id="transcript-body">
+      <div class="panel__body">
+        <div class="translator-controls" id="translator-controls">
+          <label class="translator-toggle">
+            <input type="checkbox" id="translator-enabled">
+            <span>Live Translation</span>
+          </label>
+          <label class="translator-field" for="translator-counterparty-language">
+            <span>Counterparty</span>
+            <select id="translator-counterparty-language"></select>
+          </label>
+          <label class="translator-field" for="translator-staff-language">
+            <span>Staff</span>
+            <select id="translator-staff-language"></select>
+          </label>
+          <label class="translator-toggle translator-toggle--compact">
+            <input type="checkbox" id="translator-bidirectional">
+            <span>Bidirectional</span>
+          </label>
+          <span class="translator-status text-muted" id="translator-status">Translator off</span>
+        </div>
+        <div class="transcript-scroll" id="transcript-body">
         <div class="transcript-empty" id="transcript-empty">
           <svg class="icon icon--lg" viewBox="0 0 24 24" fill="none">
             <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z" stroke="currentColor" stroke-width="1.5"/>
             <path d="M8 12h.01M12 12h.01M16 12h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
           <p>Waiting for conversation...</p>
+        </div>
         </div>
       </div>
     </section>

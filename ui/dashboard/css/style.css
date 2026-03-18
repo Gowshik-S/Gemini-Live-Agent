@@ -362,12 +362,75 @@ body {
   min-height: 0;
 }
 
+.panel--transcript .panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.translator-controls {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 11px;
+  background: linear-gradient(160deg, rgba(24, 24, 24, 0.96), rgba(16, 16, 16, 0.97));
+  padding: 9px;
+}
+
+.translator-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.translator-toggle input {
+  width: 14px;
+  height: 14px;
+}
+
+.translator-toggle--compact {
+  align-self: center;
+}
+
+.translator-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.66rem;
+  color: var(--text-tertiary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.translator-field select {
+  min-height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(13, 13, 13, 0.95);
+  color: var(--text-primary);
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.translator-status {
+  grid-column: 1 / -1;
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+}
+
 .transcript-scroll {
   display: flex;
   flex-direction: column;
   gap: 7px;
   overflow-y: auto;
   padding-right: 2px;
+  flex: 1;
 }
 
 .transcript-empty,
@@ -441,6 +504,12 @@ body {
   color: var(--info);
   border-color: rgba(255, 255, 255, 0.2);
   background: rgba(255, 255, 255, 0.05);
+}
+
+.msg--translation .msg__avatar {
+  color: var(--primary-bright);
+  border-color: rgba(255, 255, 255, 0.34);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .msg__content {
@@ -918,6 +987,15 @@ input {
 
   .panel--transcript {
     min-height: 360px;
+  }
+
+  .translator-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .translator-toggle,
+  .translator-toggle--compact {
+    align-self: center;
   }
 
   .metrics-column {

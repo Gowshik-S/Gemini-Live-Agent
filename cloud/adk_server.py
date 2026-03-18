@@ -25,6 +25,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -98,6 +99,99 @@ USE_VERTEX = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
 
 # Model resolution: env → yaml → hardcoded default
 _DEFAULT_MODEL = "gemini-2.5-flash-native-audio-latest"
+_DEFAULT_TRANSLATOR_MODEL = os.environ.get("RIO_TRANSLATOR_MODEL", "gemini-2.5-flash")
+_DEFAULT_TRANSLATOR_ENABLED = _env_flag("RIO_TRANSLATOR_DEFAULT_ENABLED", False)
+_DEFAULT_TRANSLATOR_SOURCE_LANGUAGE = os.environ.get("RIO_TRANSLATOR_DEFAULT_SOURCE_LANGUAGE", "auto")
+_DEFAULT_TRANSLATOR_TARGET_LANGUAGE = os.environ.get("RIO_TRANSLATOR_DEFAULT_TARGET_LANGUAGE", "en")
+_DEFAULT_TRANSLATOR_STAFF_LANGUAGE = os.environ.get("RIO_TRANSLATOR_DEFAULT_STAFF_LANGUAGE", "en")
+_DEFAULT_TRANSLATOR_COUNTERPARTY_LANGUAGE = os.environ.get("RIO_TRANSLATOR_DEFAULT_COUNTERPARTY_LANGUAGE", "auto")
+_DEFAULT_TRANSLATOR_BIDIRECTIONAL = _env_flag("RIO_TRANSLATOR_DEFAULT_BIDIRECTIONAL", False)
+_DEFAULT_TRANSLATOR_SPEAK = _env_flag("RIO_TRANSLATOR_DEFAULT_SPEAK", True)
+_DEFAULT_TRANSLATOR_SUPPRESS_TASKS = _env_flag("RIO_TRANSLATOR_DEFAULT_SUPPRESS_TASKS", True)
+_DEFAULT_TRANSLATOR_REPEAT_GUARD_MS = int(os.environ.get("RIO_TRANSLATOR_REPEAT_GUARD_MS", "1200") or 1200)
+_DEFAULT_TRANSLATOR_MIN_CHARS = int(os.environ.get("RIO_TRANSLATOR_MIN_CHARS", "2") or 2)
+_DEFAULT_TRANSLATOR_TIMEOUT_SECONDS = float(os.environ.get("RIO_TRANSLATOR_TIMEOUT_SECONDS", "6.0") or 6.0)
+
+
+def _extract_json_object(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        return match.group(0)
+    return cleaned
+
+
+def _normalize_lang_code(value: str | None, default: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"auto", "automatic", "detect"}:
+        return "auto"
+    if re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2,4})?", raw):
+        return raw
+    return default
+
+
+async def _translate_text(
+    client: genai.Client,
+    text: str,
+    source_language: str,
+    target_language: str,
+    model: str,
+    timeout_seconds: float,
+) -> dict[str, str]:
+    prompt = (
+        "You are a strict translation engine. Translate the input text accurately. "
+        "Preserve meaning and tone. Do not add commentary.\n"
+        f"Source language: {source_language}\n"
+        f"Target language: {target_language}\n"
+        f"Input text: {text}\n\n"
+        "Return ONLY JSON with keys: detected_source_language, target_language, translated_text"
+    )
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=256,
+                ),
+            )
+    except Exception:
+        return {
+            "detected_source_language": source_language,
+            "target_language": target_language,
+            "translated_text": text,
+        }
+
+    raw_text = (getattr(response, "text", None) or "").strip()
+    if not raw_text:
+        return {
+            "detected_source_language": source_language,
+            "target_language": target_language,
+            "translated_text": text,
+        }
+
+    try:
+        payload = json.loads(_extract_json_object(raw_text))
+        translated = str(payload.get("translated_text", "")).strip() or text
+        detected = _normalize_lang_code(str(payload.get("detected_source_language", source_language)), source_language)
+        target = _normalize_lang_code(str(payload.get("target_language", target_language)), target_language)
+        return {
+            "detected_source_language": detected,
+            "target_language": target,
+            "translated_text": translated,
+        }
+    except Exception:
+        return {
+            "detected_source_language": source_language,
+            "target_language": target_language,
+            "translated_text": raw_text,
+        }
 
 
 async def _classify_intent_via_llm(client: genai.Client, text: str) -> bool:
@@ -357,6 +451,20 @@ def _default_user_config(user_id: str) -> dict[str, Any]:
         },
         "preferences": {
             "preferred_channel": "telegram",
+        },
+        "live_translator": {
+            "enabled": _DEFAULT_TRANSLATOR_ENABLED,
+            "source_language": _DEFAULT_TRANSLATOR_SOURCE_LANGUAGE,
+            "target_language": _DEFAULT_TRANSLATOR_TARGET_LANGUAGE,
+            "staff_language": _DEFAULT_TRANSLATOR_STAFF_LANGUAGE,
+            "counterparty_language": _DEFAULT_TRANSLATOR_COUNTERPARTY_LANGUAGE,
+            "bidirectional": _DEFAULT_TRANSLATOR_BIDIRECTIONAL,
+            "speak_translation": _DEFAULT_TRANSLATOR_SPEAK,
+            "suppress_task_detection": _DEFAULT_TRANSLATOR_SUPPRESS_TASKS,
+            "model": _DEFAULT_TRANSLATOR_MODEL,
+            "repeat_guard_ms": _DEFAULT_TRANSLATOR_REPEAT_GUARD_MS,
+            "min_chars": _DEFAULT_TRANSLATOR_MIN_CHARS,
+            "timeout_seconds": _DEFAULT_TRANSLATOR_TIMEOUT_SECONDS,
         },
     }
 
@@ -1208,6 +1316,123 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     if not isinstance(workspace_policy, dict):
         workspace_policy = {}
 
+    translator_cfg = user_cfg.get("live_translator", {}) if isinstance(user_cfg, dict) else {}
+    if not isinstance(translator_cfg, dict):
+        translator_cfg = {}
+
+    translator_enabled = bool(translator_cfg.get("enabled", _DEFAULT_TRANSLATOR_ENABLED))
+    translator_source_language = _normalize_lang_code(
+        str(translator_cfg.get("source_language", _DEFAULT_TRANSLATOR_SOURCE_LANGUAGE)),
+        _DEFAULT_TRANSLATOR_SOURCE_LANGUAGE,
+    )
+    translator_target_language = _normalize_lang_code(
+        str(translator_cfg.get("target_language", _DEFAULT_TRANSLATOR_TARGET_LANGUAGE)),
+        _DEFAULT_TRANSLATOR_TARGET_LANGUAGE,
+    )
+    translator_staff_language = _normalize_lang_code(
+        str(translator_cfg.get("staff_language", translator_target_language or _DEFAULT_TRANSLATOR_STAFF_LANGUAGE)),
+        _DEFAULT_TRANSLATOR_STAFF_LANGUAGE,
+    )
+    translator_counterparty_language = _normalize_lang_code(
+        str(translator_cfg.get("counterparty_language", _DEFAULT_TRANSLATOR_COUNTERPARTY_LANGUAGE)),
+        _DEFAULT_TRANSLATOR_COUNTERPARTY_LANGUAGE,
+    )
+    translator_bidirectional = bool(translator_cfg.get("bidirectional", _DEFAULT_TRANSLATOR_BIDIRECTIONAL))
+    translator_speak = bool(translator_cfg.get("speak_translation", _DEFAULT_TRANSLATOR_SPEAK))
+    translator_suppress_task_detection = bool(
+        translator_cfg.get("suppress_task_detection", _DEFAULT_TRANSLATOR_SUPPRESS_TASKS),
+    )
+    translator_model = str(translator_cfg.get("model", _DEFAULT_TRANSLATOR_MODEL) or _DEFAULT_TRANSLATOR_MODEL)
+    translator_repeat_guard_ms = int(
+        translator_cfg.get("repeat_guard_ms", _DEFAULT_TRANSLATOR_REPEAT_GUARD_MS) or _DEFAULT_TRANSLATOR_REPEAT_GUARD_MS,
+    )
+    translator_min_chars = int(
+        translator_cfg.get("min_chars", _DEFAULT_TRANSLATOR_MIN_CHARS) or _DEFAULT_TRANSLATOR_MIN_CHARS,
+    )
+    translator_timeout_seconds = float(
+        translator_cfg.get("timeout_seconds", _DEFAULT_TRANSLATOR_TIMEOUT_SECONDS) or _DEFAULT_TRANSLATOR_TIMEOUT_SECONDS,
+    )
+    translator_last_signature = ""
+    translator_last_at = 0.0
+    translator_last_detected_counterparty_language = ""
+
+    def _persist_translator_cfg() -> None:
+        _save_user_config(user_id, {
+            "live_translator": {
+                "enabled": translator_enabled,
+                "source_language": translator_source_language,
+                "target_language": translator_target_language,
+                "staff_language": translator_staff_language,
+                "counterparty_language": translator_counterparty_language,
+                "bidirectional": translator_bidirectional,
+                "speak_translation": translator_speak,
+                "suppress_task_detection": translator_suppress_task_detection,
+                "model": translator_model,
+                "repeat_guard_ms": translator_repeat_guard_ms,
+                "min_chars": translator_min_chars,
+                "timeout_seconds": translator_timeout_seconds,
+            },
+        })
+
+    def _reload_translator_cfg() -> None:
+        nonlocal translator_enabled
+        nonlocal translator_source_language
+        nonlocal translator_target_language
+        nonlocal translator_staff_language
+        nonlocal translator_counterparty_language
+        nonlocal translator_bidirectional
+        nonlocal translator_speak
+        nonlocal translator_suppress_task_detection
+        nonlocal translator_model
+        nonlocal translator_repeat_guard_ms
+        nonlocal translator_min_chars
+        nonlocal translator_timeout_seconds
+
+        cfg = _load_user_config(user_id)
+        lt = cfg.get("live_translator", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(lt, dict):
+            lt = {}
+
+        translator_enabled = bool(lt.get("enabled", translator_enabled))
+        translator_source_language = _normalize_lang_code(
+            str(lt.get("source_language", translator_source_language)),
+            translator_source_language,
+        )
+        translator_target_language = _normalize_lang_code(
+            str(lt.get("target_language", translator_target_language)),
+            translator_target_language,
+        )
+        translator_staff_language = _normalize_lang_code(
+            str(lt.get("staff_language", translator_staff_language or translator_target_language)),
+            translator_staff_language or _DEFAULT_TRANSLATOR_STAFF_LANGUAGE,
+        )
+        translator_counterparty_language = _normalize_lang_code(
+            str(lt.get("counterparty_language", translator_counterparty_language)),
+            translator_counterparty_language or _DEFAULT_TRANSLATOR_COUNTERPARTY_LANGUAGE,
+        )
+        translator_bidirectional = bool(lt.get("bidirectional", translator_bidirectional))
+        translator_speak = bool(lt.get("speak_translation", translator_speak))
+        translator_suppress_task_detection = bool(
+            lt.get("suppress_task_detection", translator_suppress_task_detection),
+        )
+        translator_model = str(lt.get("model", translator_model) or translator_model)
+        translator_repeat_guard_ms = int(lt.get("repeat_guard_ms", translator_repeat_guard_ms) or translator_repeat_guard_ms)
+        translator_min_chars = int(lt.get("min_chars", translator_min_chars) or translator_min_chars)
+        translator_timeout_seconds = float(lt.get("timeout_seconds", translator_timeout_seconds) or translator_timeout_seconds)
+
+    log.info(
+        "live.translator.config",
+        enabled=translator_enabled,
+        source_language=translator_source_language,
+        target_language=translator_target_language,
+        staff_language=translator_staff_language,
+        counterparty_language=translator_counterparty_language,
+        bidirectional=translator_bidirectional,
+        speak_translation=translator_speak,
+        suppress_task_detection=translator_suppress_task_detection,
+        model=translator_model,
+    )
+
     shared_enabled = bool(workspace_policy.get("shared_workspace_enabled", True))
     allowed_shared_users = {
         _sanitize_user_id(v)
@@ -1438,9 +1663,120 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     orchestrator.cancel_all()
                     return
 
+                async def _handle_live_translation(source_text: str, source_kind: str) -> bool:
+                    nonlocal translator_last_signature
+                    nonlocal translator_last_at
+                    nonlocal translator_last_detected_counterparty_language
+
+                    _reload_translator_cfg()
+
+                    if not translator_enabled:
+                        return False
+                    text = (source_text or "").strip()
+                    if len(text) < translator_min_chars:
+                        return False
+
+                    source_language = translator_source_language
+                    target_language = translator_target_language
+                    direction = "single"
+                    if translator_bidirectional:
+                        if source_kind == "transcription":
+                            source_language = translator_counterparty_language
+                            target_language = translator_staff_language
+                            direction = "counterparty_to_staff"
+                        else:
+                            source_language = translator_staff_language
+                            target_language = (
+                                translator_last_detected_counterparty_language
+                                or translator_counterparty_language
+                                or "auto"
+                            )
+                            direction = "staff_to_counterparty"
+
+                    signature = f"{source_kind}:{text.lower()}:{source_language}->{target_language}:bidi={translator_bidirectional}"
+                    now = time.time()
+                    if (
+                        signature == translator_last_signature
+                        and (now - translator_last_at) * 1000 < translator_repeat_guard_ms
+                    ):
+                        return True
+
+                    translator_last_signature = signature
+                    translator_last_at = now
+
+                    tr = await _translate_text(
+                        genai_client,
+                        text,
+                        source_language,
+                        target_language,
+                        translator_model,
+                        translator_timeout_seconds,
+                    )
+                    translated_text = str(tr.get("translated_text", "")).strip() or text
+                    detected_source = str(tr.get("detected_source_language", source_language))
+                    target_language = str(tr.get("target_language", target_language))
+
+                    if translator_bidirectional and source_kind == "transcription":
+                        detected_norm = _normalize_lang_code(detected_source, "")
+                        if detected_norm and detected_norm not in {"auto", translator_staff_language}:
+                            translator_last_detected_counterparty_language = detected_norm
+
+                    payload = {
+                        "type": "translation",
+                        "subtype": "final",
+                        "source": source_kind,
+                        "direction": direction,
+                        "bidirectional": translator_bidirectional,
+                        "source_text": text,
+                        "translated_text": translated_text,
+                        "source_language": detected_source,
+                        "target_language": target_language,
+                        "client_id": client_id,
+                    }
+                    try:
+                        await websocket.send_text(json.dumps(payload))
+                    except Exception:
+                        pass
+                    await _broadcast_dashboard(payload)
+
+                    if translator_speak and translated_text and session:
+                        try:
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part.from_text(text=(
+                                        "[SYSTEM: Live translator mode is enabled. "
+                                        f"Speak only the translated sentence in {target_language}. "
+                                        f"Do not add extra commentary. Sentence: {translated_text}]"
+                                    ))],
+                                ),
+                                turn_complete=True,
+                            )
+                        except Exception as exc:
+                            log.warning("live.translator.speak_failed", error=str(exc))
+
+                    log.info(
+                        "live.translator.emitted",
+                        source=source_kind,
+                        source_language=detected_source,
+                        target_language=target_language,
+                        chars=len(text),
+                    )
+                    return True
+
                 # ---- Upstream: client WebSocket → Gemini session ----
                 async def upstream_task() -> None:
                     nonlocal active
+                    nonlocal translator_enabled
+                    nonlocal translator_source_language
+                    nonlocal translator_target_language
+                    nonlocal translator_staff_language
+                    nonlocal translator_counterparty_language
+                    nonlocal translator_bidirectional
+                    nonlocal translator_speak
+                    nonlocal translator_suppress_task_detection
+                    nonlocal translator_last_signature
+                    nonlocal translator_last_at
                     try:
                         while active:
                             ws_msg = await websocket.receive()
@@ -1590,6 +1926,10 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                                 source="text",
                                                 utterance=content[:60],
                                             )
+                                    elif translator_enabled:
+                                        translated = await _handle_live_translation(content, "text")
+                                        if translated and translator_suppress_task_detection:
+                                            continue
                                     elif _is_task_request(content):
                                         log.info(
                                             "orchestrator.task_detected",
@@ -1627,6 +1967,74 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                         ),
                                         turn_complete=False,
                                     )
+
+                            elif frame_type == "control":
+                                action = str(frame.get("action", "")).strip().lower()
+                                if action == "translator_toggle":
+                                    translator_enabled = not translator_enabled
+                                    translator_last_signature = ""
+                                    translator_last_at = 0.0
+                                    _persist_translator_cfg()
+                                    await websocket.send_text(json.dumps({
+                                        "type": "control",
+                                        "action": "translator_mode",
+                                        "enabled": translator_enabled,
+                                        "source_language": translator_source_language,
+                                        "target_language": translator_target_language,
+                                        "staff_language": translator_staff_language,
+                                        "counterparty_language": translator_counterparty_language,
+                                        "bidirectional": translator_bidirectional,
+                                    }))
+                                elif action == "translator_status":
+                                    _reload_translator_cfg()
+                                    await websocket.send_text(json.dumps({
+                                        "type": "control",
+                                        "action": "translator_mode",
+                                        "enabled": translator_enabled,
+                                        "source_language": translator_source_language,
+                                        "target_language": translator_target_language,
+                                        "staff_language": translator_staff_language,
+                                        "counterparty_language": translator_counterparty_language,
+                                        "bidirectional": translator_bidirectional,
+                                    }))
+                                elif action == "translator_update":
+                                    payload = frame.get("payload", {})
+                                    if isinstance(payload, dict):
+                                        translator_enabled = bool(payload.get("enabled", translator_enabled))
+                                        translator_source_language = _normalize_lang_code(
+                                            str(payload.get("source_language", translator_source_language)),
+                                            translator_source_language,
+                                        )
+                                        translator_target_language = _normalize_lang_code(
+                                            str(payload.get("target_language", translator_target_language)),
+                                            translator_target_language,
+                                        )
+                                        translator_staff_language = _normalize_lang_code(
+                                            str(payload.get("staff_language", translator_staff_language)),
+                                            translator_staff_language,
+                                        )
+                                        translator_counterparty_language = _normalize_lang_code(
+                                            str(payload.get("counterparty_language", translator_counterparty_language)),
+                                            translator_counterparty_language,
+                                        )
+                                        translator_bidirectional = bool(payload.get("bidirectional", translator_bidirectional))
+                                        translator_speak = bool(payload.get("speak_translation", translator_speak))
+                                        translator_suppress_task_detection = bool(
+                                            payload.get("suppress_task_detection", translator_suppress_task_detection),
+                                        )
+                                        translator_last_signature = ""
+                                        translator_last_at = 0.0
+                                        _persist_translator_cfg()
+                                        await websocket.send_text(json.dumps({
+                                            "type": "control",
+                                            "action": "translator_mode",
+                                            "enabled": translator_enabled,
+                                            "source_language": translator_source_language,
+                                            "target_language": translator_target_language,
+                                            "staff_language": translator_staff_language,
+                                            "counterparty_language": translator_counterparty_language,
+                                            "bidirectional": translator_bidirectional,
+                                        }))
 
                             elif frame_type == "approval_response":
                                 # B2: User approved/denied a tool call
@@ -2172,6 +2580,10 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                                             source="transcription_active_task",
                                             utterance=full_user_text[:80],
                                         )
+                                elif full_user_text and translator_enabled:
+                                    translated = await _handle_live_translation(full_user_text, "transcription")
+                                    if translated and translator_suppress_task_detection:
+                                        continue
                                 elif full_user_text:
                                     is_task = _is_task_request(full_user_text)
                                     if not is_task and len(full_user_text.split()) > 5:

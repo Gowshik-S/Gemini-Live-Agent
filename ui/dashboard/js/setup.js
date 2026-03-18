@@ -10,6 +10,25 @@
 // API base — auto-detect from current location
 // ═══════════════════════════════════════════════════════════════════════════
 const API_BASE = window.location.origin;
+const DEFAULT_SETUP_USER_ID = 'default';
+const LANGUAGE_OPTIONS = [
+  { code: 'auto', label: 'Auto detect' },
+  { code: 'en', label: 'English' },
+  { code: 'ta', label: 'Tamil' },
+  { code: 'es', label: 'Spanish' },
+  { code: 'fr', label: 'French' },
+  { code: 'de', label: 'German' },
+  { code: 'it', label: 'Italian' },
+  { code: 'pt', label: 'Portuguese' },
+  { code: 'hi', label: 'Hindi' },
+  { code: 'ar', label: 'Arabic' },
+  { code: 'ja', label: 'Japanese' },
+  { code: 'ko', label: 'Korean' },
+  { code: 'zh', label: 'Chinese' },
+  { code: 'ru', label: 'Russian' },
+];
+
+let translatorUserConfigCache = null;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tabs
@@ -465,12 +484,166 @@ document.getElementById('form-agents').addEventListener('submit', async (e) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Translator Settings
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getTranslatorUserId() {
+  const el = document.getElementById('tr-user-id');
+  if (!el) return DEFAULT_SETUP_USER_ID;
+  const raw = (el.value || '').trim().toLowerCase();
+  return raw || DEFAULT_SETUP_USER_ID;
+}
+
+function setTranslatorUserId(userId) {
+  const el = document.getElementById('tr-user-id');
+  if (!el) return;
+  el.value = userId || DEFAULT_SETUP_USER_ID;
+}
+
+function populateLanguageSelect(selectId, defaultCode = 'en', includeAuto = false) {
+  const el = document.getElementById(selectId);
+  if (!el) return;
+  el.innerHTML = '';
+
+  const options = includeAuto ? LANGUAGE_OPTIONS : LANGUAGE_OPTIONS.filter((item) => item.code !== 'auto');
+  options.forEach((item) => {
+    const opt = document.createElement('option');
+    opt.value = item.code;
+    opt.textContent = `${item.label} (${item.code})`;
+    if (item.code === defaultCode) opt.selected = true;
+    el.appendChild(opt);
+  });
+}
+
+function normalizeTranslatorConfig(raw) {
+  const cfg = (raw && typeof raw === 'object') ? raw : {};
+  return {
+    enabled: Boolean(cfg.enabled),
+    source_language: String(cfg.source_language || cfg.counterparty_language || 'en').toLowerCase(),
+    target_language: String(cfg.target_language || cfg.staff_language || 'en').toLowerCase(),
+    staff_language: String(cfg.staff_language || cfg.target_language || 'en').toLowerCase(),
+    counterparty_language: String(cfg.counterparty_language || cfg.source_language || 'en').toLowerCase(),
+    bidirectional: cfg.bidirectional !== false,
+    speak_translation: cfg.speak_translation !== false,
+    suppress_task_detection: cfg.suppress_task_detection !== false,
+    model: cfg.model || 'gemini-2.5-flash',
+    repeat_guard_ms: Number(cfg.repeat_guard_ms || 1200),
+    min_chars: Number(cfg.min_chars || 2),
+    timeout_seconds: Number(cfg.timeout_seconds || 6.0),
+  };
+}
+
+function populateTranslatorForm(config) {
+  const tr = normalizeTranslatorConfig(config);
+  document.getElementById('tr-enabled').checked = Boolean(tr.enabled);
+  document.getElementById('tr-staff-language').value = tr.staff_language || 'en';
+  document.getElementById('tr-counterparty-language').value = tr.counterparty_language || 'en';
+  document.getElementById('tr-bidirectional').checked = Boolean(tr.bidirectional);
+  document.getElementById('tr-speak').checked = Boolean(tr.speak_translation);
+  document.getElementById('tr-suppress-tasks').checked = Boolean(tr.suppress_task_detection);
+}
+
+function collectTranslatorForm() {
+  const staffLanguage = (document.getElementById('tr-staff-language').value || 'en').toLowerCase();
+  const counterpartyLanguage = (document.getElementById('tr-counterparty-language').value || 'en').toLowerCase();
+  return {
+    enabled: document.getElementById('tr-enabled').checked,
+    source_language: counterpartyLanguage,
+    target_language: staffLanguage,
+    staff_language: staffLanguage,
+    counterparty_language: counterpartyLanguage,
+    bidirectional: document.getElementById('tr-bidirectional').checked,
+    speak_translation: document.getElementById('tr-speak').checked,
+    suppress_task_detection: document.getElementById('tr-suppress-tasks').checked,
+  };
+}
+
+async function loadTranslatorSettings(userId) {
+  try {
+    const safeUser = encodeURIComponent(userId || DEFAULT_SETUP_USER_ID);
+    const res = await fetch(`${API_BASE}/api/users/${safeUser}/config`);
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    translatorUserConfigCache = (data && data.config && typeof data.config === 'object') ? data.config : {};
+    populateTranslatorForm(translatorUserConfigCache.live_translator || {});
+    return translatorUserConfigCache;
+  } catch (err) {
+    showToast('toast-translator', `Error: ${err.message}`, true);
+    return null;
+  }
+}
+
+async function fetchTranslatorUserConfig(userId) {
+  const safeUser = encodeURIComponent(userId || DEFAULT_SETUP_USER_ID);
+  const res = await fetch(`${API_BASE}/api/users/${safeUser}/config`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return (data && data.config && typeof data.config === 'object') ? data.config : {};
+}
+
+async function saveTranslatorSettings(userId) {
+  const safeUser = encodeURIComponent(userId || DEFAULT_SETUP_USER_ID);
+  const latest = translatorUserConfigCache || (await fetchTranslatorUserConfig(userId));
+  const mergedTranslator = {
+    ...normalizeTranslatorConfig(latest.live_translator || {}),
+    ...collectTranslatorForm(),
+  };
+  const mergedConfig = {
+    ...latest,
+    live_translator: mergedTranslator,
+  };
+
+  const res = await fetch(`${API_BASE}/api/users/${safeUser}/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mergedConfig),
+  });
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+
+  const data = await res.json();
+  translatorUserConfigCache = (data && data.config && typeof data.config === 'object') ? data.config : mergedConfig;
+  populateTranslatorForm(translatorUserConfigCache.live_translator || {});
+  return translatorUserConfigCache;
+}
+
+document.getElementById('form-translator').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await saveTranslatorSettings(getTranslatorUserId());
+    showToast('toast-translator', 'Translator settings saved!');
+  } catch (err) {
+    showToast('toast-translator', `Error: ${err.message}`, true);
+  }
+});
+
+document.getElementById('btn-reload-translator').addEventListener('click', async () => {
+  await loadTranslatorSettings(getTranslatorUserId());
+  showToast('toast-translator', 'Translator settings reloaded');
+});
+
+document.getElementById('tr-user-id').addEventListener('change', async () => {
+  const userId = getTranslatorUserId();
+  setTranslatorUserId(userId);
+  await loadTranslatorSettings(userId);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Init — load existing profiles on page load
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
   // Keep config sections hidden until the corresponding skill is enabled.
   document.getElementById('cc-enabled').addEventListener('change', syncCustomerCareVisibility);
   document.getElementById('tutor-enabled').addEventListener('change', syncTutorVisibility);
+
+  populateLanguageSelect('tr-staff-language', 'en', false);
+  populateLanguageSelect('tr-counterparty-language', 'en', true);
+
+  const params = new URLSearchParams(window.location.search);
+  const initialUser = (params.get('user_id') || params.get('user') || DEFAULT_SETUP_USER_ID).trim().toLowerCase() || DEFAULT_SETUP_USER_ID;
+  setTranslatorUserId(initialUser);
 
   const [cc, tutor, , , agents] = await Promise.all([
     loadProfile('customer_care'),
@@ -479,6 +652,7 @@ document.getElementById('form-agents').addEventListener('submit', async (e) => {
     loadModelsStatus(),
     loadAgents(),
   ]);
+  await loadTranslatorSettings(initialUser);
   if (cc) populateCustomerCare(cc);
   if (tutor) populateTutor(tutor);
   if (agents) populateAgents(agents);

@@ -48,6 +48,8 @@ rio:
   global_deny_tools: []
   hotkeys:
     live_mode: f6
+    live_translation: f7
+    task_status: f8
     push_to_talk: f2
     screen_mode: f5
     screenshot: f3
@@ -147,6 +149,7 @@ rio:
     threshold: 0.85
   ui_navigator:
     analyze_every_n_frames: 3
+    click_tool: screen_click
     confidence_threshold: 0.85
     enabled: false
     fps: 10.0

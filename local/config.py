@@ -35,10 +35,12 @@ class AudioConfig:
 @dataclass
 class HotkeyConfig:
     push_to_talk: str = "f2"
-    screenshot: str = "f3"
+    screenshot: str = "f3"  # F3 is wired as mute/unmute voice toggle
     toggle_proactive: str = "f4"
     screen_mode: str = "f5"
     live_mode: str = "f6"
+    live_translation: str = "f7"
+    task_status: str = "f8"
 
 
 @dataclass
@@ -63,7 +65,7 @@ class UINavigatorConfig:
     model: str = "gemini-2.5-flash-native-audio-preview-12-2025"
     confidence_threshold: float = 0.85
     analyze_every_n_frames: int = 3
-    click_tool: str = "smart_click"  # smart_click | screen_click
+    click_tool: str = "screen_click"  # screen_click (coordinate-grounded)
 
 
 @dataclass

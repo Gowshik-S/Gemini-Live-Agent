@@ -29,7 +29,7 @@ const RioSocket = (() => {
   /**
    * Register an event handler.
    * Events: 'open', 'close', 'message', 'transcript', 'tool_call',
-    *         'tool_result', 'tool_event_update', 'struggle', 'vision',
+    *         'tool_result', 'tool_event_update', 'translation', 'struggle', 'vision',
     *         'control', 'health', 'rate_limit'
    */
   function on(event, fn) {
@@ -171,6 +171,11 @@ const RioSocket = (() => {
 
     if (type === 'transcript' || (subtype === 'transcript' && type === 'dashboard')) {
       _emit('transcript', envelope.payload);
+      return;
+    }
+
+    if (type === 'translation' || subtype === 'translation') {
+      _emit('translation', envelope.payload);
       return;
     }
 

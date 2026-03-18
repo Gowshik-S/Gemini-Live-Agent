@@ -7,8 +7,10 @@ Layer 3 (L3): voice + vision + tools client.
   - Captures microphone audio (PCM 16-bit 16kHz mono) and streams to cloud
   - Plays back Gemini audio responses (PCM 24kHz) through the speaker
   - Push-to-Talk (F2) gates audio capture when available
-  - Silero VAD filters silence when available
-  - Screen capture: periodic (every 3s) + on-demand (F3 key)
+    - Silero VAD filters silence when available
+    - Screen capture: periodic + on-demand via voice/tool requests
+    - F3 toggle: mute/unmute microphone input
+    - F8: announce current ongoing task status
   - Tool execution: read_file, write_file, patch_file, run_command
   - Graceful degradation: ptt+vad / ptt-only / vad-only / always-on
   - Reads user text input from stdin as fallback
@@ -268,7 +270,7 @@ BANNER = r"""
  Voice + screen vision + tools + struggle detection + ML ensemble + Pro routing
  WASAPI low-latency audio, 20ms capture chunks, 40ms jitter buffer
  Wake word: say "Rio" or "Hey Rio" to activate
- F2=Push-to-Talk  F3=Screenshot  F4=Force-trigger(demo)  F5=Screen-mode  F6=Live-Mode
+ F2=Push-to-Talk  F3=Mute Toggle  F4=Force-trigger(demo)  F5=Screen-mode  F6=Live-Mode  F7=Live-Translation  F8=Task Status
  Text input via stdin.  Ctrl-C to quit.
 """
 
@@ -544,7 +546,8 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                        screen_navigator=None,
                        autonomous_mode: asyncio.Event | None = None,
                        task_active: asyncio.Event | None = None,
-                       wake_word=None) -> None:
+                       wake_word=None,
+                       translation_state: dict[str, object] | None = None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     audio_frames_received = 0
     task_in_progress = False  # Track autonomous task execution
@@ -590,6 +593,17 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                             print("\n  [Rio deactivated — say 'Rio' to wake]")
                             print("  You: ", end="", flush=True)
                     # Otherwise: Echo of our own message — ignore
+
+            elif msg_type == "translation":
+                translated_text = msg.get("translated_text", "")
+                if translated_text:
+                    source_language = msg.get("source_language", "auto")
+                    target_language = msg.get("target_language", "en")
+                    direction = msg.get("direction", "translation")
+                    print(
+                        f"\n  Translator [{direction} {source_language}->{target_language}]: {translated_text}",
+                    )
+                    print("  You: ", end="", flush=True)
 
             elif msg_type == "text":
                 # Direct text response (fallback / future use)
@@ -661,6 +675,20 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     elif playback is not None and hasattr(playback, 'stop'):
                         playback.stop()
                     print("\n  [interrupted — listening...]")
+                    print("  You: ", end="", flush=True)
+                elif action == "translator_mode":
+                    enabled = bool(msg.get("enabled", False))
+                    source_language = str(msg.get("source_language", "auto") or "auto")
+                    target_language = str(msg.get("target_language", "en") or "en")
+                    bidirectional = bool(msg.get("bidirectional", False))
+                    if translation_state is not None:
+                        translation_state["enabled"] = enabled
+                        translation_state["source_language"] = source_language
+                        translation_state["target_language"] = target_language
+                        translation_state["bidirectional"] = bidirectional
+                    mode = "bidirectional" if bidirectional else "single-direction"
+                    status = "ON" if enabled else "OFF"
+                    print(f"  [live translation: {status} | {source_language} -> {target_language} | {mode}]")
                     print("  You: ", end="", flush=True)
 
             elif msg_type == "dashboard":
@@ -1230,45 +1258,68 @@ async def ui_navigator_loop(
 
 
 # ---------------------------------------------------------------------------
-# Screenshot hotkey loop — captures on F3 press
+# F3 toggle loop — mute/unmute mic input
 # ---------------------------------------------------------------------------
 
-async def screenshot_hotkey_loop(
-    client: WSClient,
-    screen: "ScreenCapture",
+async def mute_pause_toggle_loop(
     trigger: "PushToTalk",
+    mic_pause_until: list[float],
+    mic_muted_state: list[bool],
 ) -> None:
-    """Wait for the screenshot hotkey (F3) and send a forced capture.
+    """Toggle microphone mute state with a single hotkey (F3)."""
 
-    Unlike periodic capture, this always sends (no delta skip) so the
-    user gets immediate feedback that the screenshot was taken.
-    """
     while True:
         await trigger.wait_for_press()
-        log.info("screenshot.triggered")
-        print("\n  [screenshot captured]")
 
-        if not client.is_connected:
-            print("  [not connected — screenshot dropped]")
-            await trigger.wait_for_release()
-            continue
+        if not mic_muted_state[0]:
+            mic_muted_state[0] = True
+            mic_pause_until[0] = float("inf")
 
-        try:
-            jpeg = await screen.capture_async(force=True)
-            if jpeg is not None:
-                await client.send_binary(IMAGE_PREFIX + jpeg)
-                log.info(
-                    "screenshot.sent",
-                    size_kb=round(len(jpeg) / 1024, 1),
-                )
-                print(f"  [sent {round(len(jpeg)/1024, 1)} KB — ask Rio about your screen]")
-            else:
-                print("  [screenshot failed — capture returned nothing]")
-        except ConnectionError:
-            print("  [screenshot send failed — not connected]")
-        except Exception:
-            log.exception("screenshot.error")
-            print("  [screenshot error]")
+            log.info("f3.toggle", muted=True)
+            print("\n  [F3: mic muted]")
+        else:
+            mic_muted_state[0] = False
+            mic_pause_until[0] = 0.0
+
+            log.info("f3.toggle", muted=False)
+            print("\n  [F3: mic unmuted]")
+
+        print("  You: ", end="", flush=True)
+        await trigger.wait_for_release()
+
+
+async def task_status_hotkey_loop(
+    trigger: "PushToTalk",
+    client: WSClient,
+    orchestrator=None,
+) -> None:
+    """F8: Report ongoing task status in plain language (no task IDs)."""
+    while True:
+        await trigger.wait_for_press()
+
+        if orchestrator is None:
+            status_text = "Task status is unavailable right now because the local orchestrator is not initialized."
+        elif orchestrator.is_busy:
+            report = orchestrator.get_progress_report()
+            status_text = f"Current ongoing task status:\n{report}"
+        else:
+            status_text = "There is no ongoing task right now."
+
+        print(f"\n  [F8 task status]\n{status_text}")
+
+        if client.is_connected:
+            try:
+                await client.send_json({
+                    "type": "context",
+                    "subtype": "task_status",
+                    "content": (
+                        "[SYSTEM: User requested the current task status via F8. "
+                        "Respond clearly in plain language and do not mention task IDs.]\n"
+                        f"{status_text}"
+                    ),
+                })
+            except ConnectionError:
+                pass
 
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
@@ -1284,7 +1335,7 @@ async def screen_mode_toggle_loop(
 ) -> None:
     """Wait for the screen-mode hotkey (F5) and toggle autonomous mode.
 
-    - on_demand (default): Frames only sent via F3, voice, or capture_screen tool.
+        - on_demand (default): Frames sent via voice/capture_screen tool.
       Saves Gemini API credits.
     - autonomous: Periodic frames sent every ~3s (original behaviour).
     """
@@ -1379,6 +1430,30 @@ async def live_mode_toggle_loop(
                     })
                 except ConnectionError:
                     pass
+
+        print("  You: ", end="", flush=True)
+        await trigger.wait_for_release()
+
+
+# ---------------------------------------------------------------------------
+# Live translation toggle loop — F7 toggles translator mode
+# ---------------------------------------------------------------------------
+
+async def live_translation_toggle_loop(
+    trigger: "PushToTalk",
+    client: WSClient,
+) -> None:
+    """F7: Toggle live translator mode in cloud session config."""
+    while True:
+        await trigger.wait_for_press()
+        try:
+            await client.send_json({
+                "type": "control",
+                "action": "translator_toggle",
+            })
+            print("\n  [live translation toggle requested]")
+        except ConnectionError:
+            print("\n  [live translation toggle failed — not connected]")
 
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
@@ -1733,9 +1808,11 @@ async def _shutdown_runtime(
     send_goodbye: bool,
     ptt=None,
     screenshot_trigger=None,
+    task_status_trigger=None,
     screen_mode_trigger=None,
     proactive_trigger=None,
     live_mode_trigger=None,
+    live_translation_trigger=None,
     capture=None,
     playback=None,
     chat_store=None,
@@ -1785,9 +1862,11 @@ async def _shutdown_runtime(
     for trigger in (
         ptt,
         screenshot_trigger,
+        task_status_trigger,
         screen_mode_trigger,
         proactive_trigger,
         live_mode_trigger,
+        live_translation_trigger,
     ):
         if trigger is not None:
             try:
@@ -2034,18 +2113,31 @@ async def main() -> None:
     else:
         print("  Vision: disabled (screen_capture module not found)")
 
-    # -- Initialize screenshot hotkey (F3) -------------------------------------
+    # -- Initialize F3 mute toggle hotkey --------------------------------------
     screenshot_trigger = None
-    if screen is not None and PushToTalk is not None:
+    if PushToTalk is not None:
         screenshot_trigger = PushToTalk.create(key_name=config.hotkeys.screenshot)
         if screenshot_trigger is not None:
-            log.info("screenshot.hotkey_ready", key=config.hotkeys.screenshot)
-            print(f"  Screenshot: {config.hotkeys.screenshot.upper()} key")
+            log.info("f3.hotkey_ready", key=config.hotkeys.screenshot)
+            print(f"  Mute Toggle: {config.hotkeys.screenshot.upper()} key")
         else:
-            log.warning("screenshot.hotkey_unavailable")
-            print("  Screenshot: hotkey unavailable (periodic only)")
-    elif screen is not None:
-        print("  Screenshot: periodic only (pynput not available)")
+            log.warning("f3.hotkey_unavailable")
+            print("  Mute Toggle: hotkey unavailable")
+    else:
+        print("  Mute Toggle: disabled (pynput not installed)")
+
+    # -- Initialize F8 task status hotkey -------------------------------------
+    task_status_trigger = None
+    if PushToTalk is not None:
+        task_status_trigger = PushToTalk.create(key_name=config.hotkeys.task_status)
+        if task_status_trigger is not None:
+            log.info("task_status.hotkey_ready", key=config.hotkeys.task_status)
+            print(f"  Task Status: {config.hotkeys.task_status.upper()} key")
+        else:
+            log.warning("task_status.hotkey_unavailable")
+            print("  Task Status: hotkey unavailable")
+    else:
+        print("  Task Status: disabled (pynput not installed)")
 
     # -- Initialize screen mode (on-demand vs autonomous) ----------------------
     autonomous_mode = asyncio.Event()
@@ -2447,14 +2539,26 @@ async def main() -> None:
             print("  [warning] Could not start audio playback — text-only responses")
             playback = None
 
-    # -- Start screenshot hotkey listener ----------------------------------
+    # -- Start F3 mute toggle listener -------------------------------------
     if screenshot_trigger is not None:
         screenshot_trigger.start(asyncio.get_running_loop())
-        print(f"  [press {config.hotkeys.screenshot.upper()} to capture your screen]")
+        print(f"  [press {config.hotkeys.screenshot.upper()} to mute/unmute voice input]")
+
+    # -- Start F8 task status listener -------------------------------------
+    if task_status_trigger is not None:
+        task_status_trigger.start(asyncio.get_running_loop())
+        print(f"  [press {config.hotkeys.task_status.upper()} to hear ongoing task status]")
 
     # -- Run all loops concurrently ----------------------------------------
     tasks: set[asyncio.Task] = set()
     mic_pause_until = [0.0]
+    mic_muted_state = [False]
+    translation_state: dict[str, object] = {
+        "enabled": False,
+        "source_language": "auto",
+        "target_language": "en",
+        "bidirectional": False,
+    }
 
     session_ready = asyncio.Event()
     tasks.add(asyncio.create_task(
@@ -2465,7 +2569,8 @@ async def main() -> None:
                      screen_navigator=screen_navigator,
                      autonomous_mode=autonomous_mode,
                      task_active=task_active,
-                     wake_word=wake_word),
+                     wake_word=wake_word,
+                     translation_state=translation_state),
         name="recv",
     ))
     tasks.add(asyncio.create_task(
@@ -2514,10 +2619,20 @@ async def main() -> None:
             name="ui_navigator",
         ))
 
-    if screenshot_trigger is not None and screen is not None:
+    if screenshot_trigger is not None:
         tasks.add(asyncio.create_task(
-            screenshot_hotkey_loop(client, screen, screenshot_trigger),
-            name="screenshot",
+            mute_pause_toggle_loop(
+                screenshot_trigger,
+                mic_pause_until,
+                mic_muted_state,
+            ),
+            name="mute_pause_toggle",
+        ))
+
+    if task_status_trigger is not None:
+        tasks.add(asyncio.create_task(
+            task_status_hotkey_loop(task_status_trigger, client, orchestrator=orchestrator),
+            name="task_status",
         ))
 
     # L4: Struggle detection loop
@@ -2559,6 +2674,18 @@ async def main() -> None:
                     wake_word=wake_word, client=client,
                 ),
                 name="live_mode",
+            ))
+
+    # Live translation toggle loop (F7)
+    live_translation_trigger = None
+    if PushToTalk is not None:
+        live_translation_trigger = PushToTalk.create(key_name=config.hotkeys.live_translation)
+        if live_translation_trigger is not None:
+            live_translation_trigger.start(asyncio.get_running_loop())
+            print(f"  [press {config.hotkeys.live_translation.upper()} to toggle live translation]")
+            tasks.add(asyncio.create_task(
+                live_translation_toggle_loop(live_translation_trigger, client),
+                name="live_translation",
             ))
 
     send_goodbye = False
@@ -2608,9 +2735,11 @@ async def main() -> None:
             send_goodbye=send_goodbye,
             ptt=ptt,
             screenshot_trigger=screenshot_trigger,
+            task_status_trigger=task_status_trigger,
             screen_mode_trigger=screen_mode_trigger,
             proactive_trigger=proactive_trigger,
             live_mode_trigger=live_mode_trigger,
+            live_translation_trigger=live_translation_trigger,
             capture=capture,
             playback=playback,
             chat_store=chat_store,

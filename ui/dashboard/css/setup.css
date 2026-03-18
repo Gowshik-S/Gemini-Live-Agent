@@ -468,6 +468,10 @@ textarea {
   animation: toast-in 0.3s ease;
 }
 
+.toast--hidden {
+  display: none;
+}
+
 .toast__icon {
   font-size: 16px;
 }

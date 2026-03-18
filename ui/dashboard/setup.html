@@ -72,6 +72,13 @@
         </svg>
         Tutor
       </button>
+      <button class="tab-btn" data-tab="translator">
+        <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+          <path d="M2 4h5M4.5 2v2M8 8l2-4 2 4M8.8 6.4h2.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M10 12h4M12 10v4M9.8 13h4.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+        </svg>
+        Translator
+      </button>
       <button class="tab-btn" data-tab="agents">
         <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
           <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.5"/>
@@ -553,6 +560,97 @@
               <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
             </svg>
             Save Profile
+          </button>
+        </div>
+
+      </form>
+    </section>
+
+    <!-- ============================================================== -->
+    <!-- TRANSLATOR TAB                                                 -->
+    <!-- ============================================================== -->
+    <section class="tab-content" id="tab-translator">
+      <form id="form-translator" autocomplete="off">
+
+        <div class="toast toast--hidden" id="toast-translator">
+          <span class="toast__icon">✓</span>
+          <span class="toast__msg">Translator settings saved</span>
+        </div>
+
+        <fieldset class="form-section">
+          <legend class="form-section__title">Translator Profile</legend>
+          <p class="form-hint">Configure voice translation for live shop usage. This controls both dashboard toggles and voice-mode translation behavior.</p>
+
+          <div class="form-group">
+            <label for="tr-user-id">User ID</label>
+            <input type="text" id="tr-user-id" value="default" placeholder="default">
+            <p class="form-hint">Use <strong>default</strong> unless you run multiple user profiles.</p>
+          </div>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="tr-enabled" title="Enable live translator by default">
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Enable live translator by default</span>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend class="form-section__title">Languages</legend>
+          <p class="form-hint">Primary language is what seller/staff should hear or speak. Customer language defaults to English and can be changed anytime.</p>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="tr-staff-language">Primary Language (Seller/Staff)</label>
+              <select id="tr-staff-language"></select>
+            </div>
+            <div class="form-group">
+              <label for="tr-counterparty-language">Customer Language</label>
+              <select id="tr-counterparty-language"></select>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset class="form-section">
+          <legend class="form-section__title">Voice Mode Behavior</legend>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="tr-bidirectional" checked title="Enable bidirectional translation">
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Bidirectional translation in voice mode</span>
+          </div>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="tr-speak" checked title="Speak translated output aloud">
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Speak translated output aloud</span>
+          </div>
+
+          <div class="form-row form-row--toggle">
+            <label class="toggle">
+              <input type="checkbox" id="tr-suppress-tasks" checked title="Suppress task detection while translating">
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form-label">Suppress task detection while translating</span>
+          </div>
+
+          <p class="form-hint">Hotkey: press <strong>F7</strong> in local runtime to toggle live translator instantly.</p>
+        </fieldset>
+
+        <div class="form-actions">
+          <button type="button" class="btn btn--ghost" id="btn-reload-translator">Reload Current Config</button>
+          <button type="submit" class="btn btn--primary" id="btn-save-translator">
+            <svg class="icon icon--sm" viewBox="0 0 16 16" fill="none">
+              <path d="M12 3H4a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V6l-3-3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M10 3v3H6V3" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="5" y="8" width="6" height="3" rx=".5" stroke="currentColor" stroke-width="1"/>
+            </svg>
+            Save Translator Settings
           </button>
         </div>
 
