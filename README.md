@@ -1,791 +1,349 @@
 # Rio Agent
 
-**Version:** 0.9.0
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Google Cloud Run](https://img.shields.io/badge/Cloud%20Run-Deployed-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run)
+[![Gemini Live API](https://img.shields.io/badge/Gemini-Live%20API-FF6D00?logo=google&logoColor=white)](https://ai.google.dev)
+[![ADK](https://img.shields.io/badge/Google%20ADK-Agent%20Pattern-7B1FA2)](https://google.github.io/adk-docs/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket%20Relay-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 
-Rio is an autonomous AI assistant and pair programmer that combines voice interaction, computer vision, and intelligent tool orchestration. Built on Google's Gemini models, Rio can see your screen, execute commands, automate desktop tasks, and proactively assist when you're stuck—all through natural conversation.
+> **One command. Full autonomy.**  
+> Rio listens, sees your screen, plans, acts, and reports — without requiring a single click from you.
 
-**One-line pitch:** "The AI assistant that sees, acts, and helps before you ask."
+---
 
-## Core Capabilities
+## The Problem
 
-### 🎙️ Natural Interaction
-- **Voice & Text Modes**: Live audio conversation with native audio models or text-based chat
-- **Push-to-Talk**: F2 hotkey for instant voice input
-- **Wake Word Detection**: Optional hands-free activation with Vosk models
-- **Voice Activity Detection (VAD)**: Silero VAD for intelligent speech detection
+Every AI assistant today is still a text box with better autocomplete. You remain the orchestrator: restating context after every turn, approving micro-steps, and manually bridging the gap between what you said and what needs to happen on screen. For real multi-step tasks — "draft the emails, attach the report, schedule the follow-up" — that model completely breaks.
 
-### 👁️ Computer Vision
-- **Screen Capture**: On-demand (F3) or continuous autonomous monitoring
-- **Vision-Guided Actions**: Uses Gemini Computer Use model for precise UI element targeting
-- **OCR Support**: RapidOCR for text extraction from screenshots
-- **Multi-Monitor**: Full support for multi-display setups
+## The Solution
 
-### 🤖 Autonomous Execution
-- **Multi-Agent Architecture**: Specialized agents for code, screen interaction, research, and creative tasks
-- **Tool Orchestration**: 60+ tools for file operations, shell commands, screen control, and more
-- **Smart Click**: Natural language UI targeting ("click the Save button")
-- **Task Planning**: Automatic decomposition of complex goals into executable steps
-- **Verification Loop**: Auto-captures screenshots after actions to verify success
+Rio replaces the turn-by-turn loop with a **continuous multimodal control lane**. The local runtime streams your voice and live screen state to a cloud agent that plans, calls tools, confirms on-screen outcomes via OCR, and speaks the result back — all in one uninterrupted flow. You give one command. Rio closes the task.
 
-### 🛠️ Development Tools
-- **File Operations**: Read, write, patch with automatic `.rio.bak` backups
-- **Shell Execution**: Safe command execution with dangerous pattern blocking
-- **Browser Automation**: Playwright-based web automation via Chrome DevTools Protocol
-- **Window Management**: Focus, minimize, maximize, close, resize windows
-- **Process Control**: List, monitor, and manage system processes
+---
 
-### 🌐 Web & Cloud Integration
-- **Web Search**: DuckDuckGo integration for research
-- **Web Scraping**: Fetch and parse web content
-- **Google Workspace**: Gmail, Drive, Calendar, Sheets, Docs integration
-- **MCP Support**: Model Context Protocol for extensible tool integration
+## Challenge Categories
 
-### 🧠 Memory & Learning
-- **Persistent Memory**: Save and recall context across sessions
-- **Vector Search**: Semantic memory with ChromaDB (optional)
-- **Pattern Recognition**: ML-based user behavior modeling
-- **Struggle Detection**: Proactive assistance when you're stuck
-- **Task History**: Complete audit trail of all actions
+| Track | Status |
+|---|---|
+| ✅ Live Agent | Full — voice I/O, barge-in, persona, live bidirectional streaming |
+| ✅ UI Navigator | Full — OCR-grounded screen understanding, Playwright browser control, post-action verification |
+| 🔄 Storyteller / Creative Agent | Partial — Imagen 3 + Veo 2 generation works; narrative packaging in progress |
 
-### 🎨 Creative Capabilities
-- **Image Generation**: Imagen 3 integration
-- **Video Generation**: Veo 2 integration
-- **Creative Agent**: Specialized agent for design and media tasks
-
-### 📊 Monitoring & Control
-- **Web Dashboard**: Real-time transcript, tool logs, and health monitoring
-- **Telemetry**: Comprehensive logging with structlog
-- **Rate Limiting**: Configurable per-tool and per-minute limits
-- **Safety Controls**: Multi-layer validation and approval workflows
-
-## Feature Status
-
-| Area | Status | Notes |
-| --- | --- | --- |
-| Live audio + text fallback | Implemented | `session_mode: live` falls back to text mode if Live API connection fails |
-| Screen capture | Implemented | F3 on-demand capture plus periodic autonomous capture |
-| Autonomous computer-use loop | Implemented | Screen actions auto-capture a follow-up screenshot for the next step |
-| Local code/file tools | Implemented | Safe path resolution, backups, command blocklist |
-| Struggle detection | Implemented | Four screen-based signals plus cooldowns and demo mode |
-| Dashboard UI | Implemented | Transcript, struggle gauge, tool log, health, setup page |
-| Customer care + tutor skills | Implemented | Fixed-schema profiles and local persistence |
-| Chat history + pattern tracking | Implemented | SQLite-backed stores |
-| ML ensemble pipeline | Implemented/optional | Active when `scikit-learn` is available |
-| Vector memory | Optional | Requires `chromadb` and `sentence-transformers` |
-| Gemini Pro routing | Partial | Heuristic exists, but `ModelRouter.call_pro()` is still a stub |
+---
 
 ## Architecture
 
-Rio uses a distributed architecture with a local client and cloud relay:
+### System Overview
 
 ```mermaid
-flowchart LR
-  %% GitHub-renderable architecture overview
+flowchart TD
+    U1["🎙 You speak\na command"]
+    U2["🖥 Your screen\nis captured"]
 
-  subgraph "Local Machine - rio/local"
-    L1["Main Runtime<br/>asyncio bootstrap, reconnect, degradation"]
-    L2["Audio Pipeline<br/>Silero VAD, PCM16 16kHz in, 24kHz out"]
-    L3["Vision and UI Navigator<br/>Pillow, RapidOCR, JPEG frames"]
-    L4["Tool Executor<br/>file, shell, Playwright, pyautogui, web fetch"]
-    L5["Memory Layer<br/>ChromaDB, SQLite, Embedding-2, FTS"]
-    L6["Channels<br/>Telegram, WhatsApp, long poll, notifications"]
-  end
+    subgraph LOCAL["Your Machine  —  rio/local/"]
+        L1["Silero VAD\nfilters silence"]
+        L2["asyncio Orchestrator\nmain.py"]
+        L3["Tool Executor\n58 tools"]
+    end
 
-  subgraph "Cloud Relay - Cloud Run - rio/cloud"
-    C1["FastAPI Server<br/>WebSocket, REST API, OpenAI-compatible"]
-    C2["Live Session<br/>Gemini bidirectional stream, session resumption"]
-    C3["Tool Bridge<br/>ToolBridge pattern, RPC proxy"]
-    C4["Tool Orchestrator<br/>ADK, multi-step planner, approval queue"]
-    C5["Workspace Tools<br/>Gmail, Drive, Calendar, Sheets, Docs"]
-    C6["Model Router<br/>30 RPM token bucket, 4 degradation levels"]
-  end
+    subgraph CLOUD["Google Cloud Run  —  rio-agent-45"]
+        C1["FastAPI Gateway\nadk_server.py"]
+        C2["Gemini 2.5 Flash\nNative Audio\nlive voice session"]
+        C3["ToolOrchestrator\nplans & routes tasks\n30 RPM rate limiter"]
+        C4["ToolBridge\nproxies tool calls\nto your machine"]
+    end
 
-  subgraph "External APIs and UI"
-    E1["Dashboard UI<br/>browser, ws/ui stream, telemetry"]
-    E2["Gemini Live API<br/>native audio, gemini-2.5-flash"]
-    E3["Gemini and Vertex<br/>2.5 Pro, Embedding-2, Imagen 3"]
-    E4["Telegram Bot API<br/>long poll, sendMessage, approvals"]
-    E5["Google Workspace<br/>Gmail, Drive, Calendar, Sheets, Docs"]
-    E6["WhatsApp and Web<br/>Meta Graph API, DuckDuckGo"]
-  end
+    subgraph MODELS["Gemini Models"]
+        M1["Gemini 3-Flash\ntask reasoning"]
+        M2["Gemini Computer Use Preview\nreads screen → coordinates"]
+        M3["Imagen 3 · Veo 2\ncreative generation"]
+    end
 
-  L1 -->|ws| C1
-  L2 -->|0x01 PCM16| C2
-  L3 -->|0x02 JPEG| C3
-  L4 -->|tool RPC| C4
+    U1 --> L1 --> L2
+    U2 --> L2
 
-  C1 -->|ws/ui| E1
-  C2 -->|bidirectional stream| E2
-  C4 -->|reasoning| E3
-  C5 -->|HTTPS| E5
-  L6 -.->|notifications| E4
-  C6 -.->|web and channel routing| E6
+    L2 -- "0x01 PCM16 audio\nover WebSocket" --> C1
+    L2 -- "0x02 JPEG frames\nover WebSocket" --> C1
+
+    C1 --> C2
+    C1 --> C3
+    C3 --> C4
+    C3 --> M1 & M2 & M3
+
+    C4 -- "tool_call" --> L3
+    L3 -- "tool_result" --> C4
+
+    C3 -- "inject final result" --> C2
+    C2 -- "🔊 audio response\nover WebSocket" --> L2
+
+    L2 --> U1
 ```
 
-### Data Flow
+### Tool Execution Flow
 
-1. **User Input** → Local client captures voice/text/screen
-2. **WebSocket** → Encrypted connection to cloud relay
-3. **Gemini Session** → Cloud manages model interactions
-4. **Tool Calls** → Proxied back to local client for execution
-5. **Results** → Returned to model for next iteration
-6. **Response** → Delivered to user via voice/text
-7. **Dashboard** → Real-time monitoring via WebSocket broadcast
+```mermaid
+flowchart TD
+    A["You say:\n'Open Gmail and\ndraft a reply'"]
+    B["Gemini 3-Flash\nbreaks task into steps"]
+    C{"What kind\nof task?"}
+    D["Browser tool\nPlaywright opens Gmail"]
+    E["Vision tool\nGemini Computer Use Preview\nreads screen → coordinates\npyautogui clicks"]
+    F["Workspace tool\nGmail API drafts reply"]
+    G["Result returned\nto ToolOrchestrator"]
+    H["Rio speaks:\n'Done — draft saved\nin Gmail'"]
 
-## Project Structure
-
-```text
-rio/
-├── __init__.py              # Package version (0.9.0)
-├── cli.py                   # Command-line interface (rio config, doctor, run)
-├── config.yaml              # Main configuration file
-├── INSTALL.md               # Detailed installation guide
-│
-├── cloud/                   # Cloud relay service
-│   ├── main.py             # FastAPI application entry point
-│   ├── gemini_session.py   # Gemini Live/text session wrapper
-│   ├── session_manager.py  # Multi-session lifecycle management
-│   ├── rio_agent.py        # ADK agent definition & ToolBridge
-│   ├── tool_orchestrator.py # Multi-agent tool execution engine (3330 lines)
-│   ├── model_router.py     # Model selection logic (Flash/Pro/Computer Use)
-│   ├── rate_limiter.py     # Request throttling & quota management
-│   ├── mcp_client.py       # Model Context Protocol client
-│   ├── mcp_server.py       # MCP server implementation
-│   ├── skill_loader.py     # Dynamic skill loading
-│   ├── voice_plugin.py     # Voice synthesis plugin system
-│   ├── workspace_tools.py  # Workspace-aware tool wrappers
-│   ├── Dockerfile          # Container image definition
-│   ├── service.yaml        # Cloud Run deployment config
-│   └── requirements.txt    # Cloud dependencies
-│
-├── local/                   # Local desktop client
-│   ├── main.py             # Client entry point & event loop
-│   ├── orchestrator.py     # Autonomous task execution engine (879 lines)
-│   ├── tools.py            # Local tool implementations
-│   ├── audio_io.py         # Audio input/output handling
-│   ├── vad.py              # Voice activity detection (Silero)
-│   ├── wake_word.py        # Wake word detection (Vosk)
-│   ├── screen_capture.py   # Screenshot capture (mss)
-│   ├── screen_navigator.py # Screen automation (pyautogui)
-│   ├── windows_agent.py    # Windows-specific automation (pywinauto)
-│   ├── browser_agent.py    # Browser automation (Playwright)
-│   ├── browser_tools.py    # Browser tool implementations
-│   ├── memory.py           # Persistent memory system
-│   ├── unified_memory.py   # Unified memory interface
-│   ├── chat_store.py       # Chat history persistence (SQLite)
-│   ├── task_state.py       # Task state management
-│   ├── struggle_detector.py # Proactive assistance detection
-│   ├── user_pattern_model.py # User behavior modeling
-│   ├── model_fallback.py   # Model failover logic
-│   ├── config.py           # Configuration loader
-│   ├── constants.py        # Shared constants
-│   ├── platform_utils.py   # Cross-platform utilities
-│   ├── profiles.py         # User profile management
-│   ├── notifier.py         # Desktop notifications
-│   ├── ocr.py              # OCR integration (RapidOCR)
-│   ├── web_tools.py        # Web search & fetch
-│   ├── ws_client.py        # WebSocket client
-│   ├── telegram_bot.py     # Telegram integration
-│   ├── whatsapp_channel.py # WhatsApp integration
-│   ├── channel_manager.py  # Multi-channel messaging
-│   ├── creative_agent.py   # Image/video generation
-│   ├── push_to_talk.py     # PTT hotkey handler
-│   ├── rio_logging.py      # Structured logging setup
-│   ├── maintenance.py      # Cleanup & maintenance tasks
-│   └── requirements.txt    # Local dependencies
-│
-├── ml/                      # Machine learning components
-│   ├── feature_engine.py   # Feature extraction pipeline
-│   ├── ensemble_model.py   # Model composition
-│   ├── user_model_manager.py # Model lifecycle management
-│   ├── train.py            # Training entry point
-│   ├── models/             # Serialized model artifacts
-│   └── datasets/           # Training data
-│
-├── data/                    # Runtime data (gitignored)
-│   ├── conversations/      # Chat transcripts
-│   ├── memory/             # Vector memory store
-│   ├── sessions/           # Session state
-│   ├── transcripts/        # Audio transcripts
-│   ├── users/              # User profiles
-│   ├── workspaces/         # Workspace metadata
-│   ├── rio_chats.db        # Chat history database
-│   ├── rio_patterns.db     # User pattern database
-│   └── rio_tasks.db        # Task state database
-│
-├── ui/                      # Web dashboard
-│   └── dashboard/          # Static HTML/CSS/JS
-│
-├── setup/                   # Installation scripts
-│   ├── setup.sh            # Linux/macOS setup
-│   ├── setup.bat           # Windows setup
-│   ├── run-cloud.sh        # Start cloud relay (Unix)
-│   ├── run-cloud.bat       # Start cloud relay (Windows)
-│   ├── run-local.sh        # Start local client (Unix)
-│   ├── run-local.bat       # Start local client (Windows)
-│   └── deploy.sh           # Cloud Run deployment
-│
-├── tests/                   # Test suite
-│   ├── test_all.py         # Integration tests
-│   ├── eval_harness.py     # Evaluation framework
-│   └── golden_trajectories.json # Test scenarios
-│
-├── modes/                   # Agent mode definitions
-│   ├── automation.yaml     # Automation mode config
-│   ├── developer.yaml      # Developer mode config
-│   └── researcher.yaml     # Research mode config
-│
-├── skills/                  # Skill definitions
-│   ├── customer_care.yaml  # Customer support skill
-│   └── tutor.yaml          # Tutoring skill
-│
-├── logs/                    # Application logs (gitignored)
-│   └── rio-YYYY-MM-DD.log  # Daily log files
-│
-└── output/                  # Generated content
-    └── creative/           # Generated images/videos
+    A --> B --> C
+    C -- "browser action" --> D --> G
+    C -- "UI interaction" --> E --> G
+    C -- "workspace API" --> F --> G
+    G --> H
 ```
 
-## Quick Start
+> **Key design decision:** `RIO_LIVE_MODEL_TOOLS=false` by default. All tool execution routes through the text orchestrator, not the native audio model — this prevents unreliable function-calling in live audio sessions while keeping voice I/O seamless.
+
+---
+
+## Multimodal Experience
+
+### Beyond the Text Box
+Rio has no chat input field. Interaction is entirely voice-in / voice-out, with screen vision as passive ground truth.
+
+| Criterion | How Rio Satisfies It | Evidence in Code |
+|---|---|---|
+| **Voice + Vision loop** | Mic + screenshot stream run as parallel asyncio loops; neither blocks the other | `local/main.py` — `audio_capture_loop` + `screen_capture_loop` |
+| **Barge-in / interruption** | F2 PTT clears active playback immediately; VAD speech-start also interrupts | `local/push_to_talk.py`, `local/audio_io.py` playback cancel path |
+| **Distinct persona / voice** | Agent name, role, and voice ID are config-driven (`RIO_VOICE`, `RIO_AGENT_NAME`) | `cloud/gemini_session.py` `_build_role_intro()`, `cloud/voice_plugin.py` |
+| **Visual precision** | OCR extracts on-screen text before + after every action; `smart_click` sends the screenshot to **Gemini Computer Use Preview** which returns pixel coordinates — pyautogui then executes the physical click | `local/tools.py` `smart_click()`, `local/ocr.py` |
+| **Live, not turn-based** | Bidirectional WebSocket + background orchestrator task with `inject_context()` keeps the voice session alive while tools execute | `cloud/adk_server.py` `inject_context()`, `cloud/tool_orchestrator.py` |
+
+---
+
+## Technical Implementation
+
+### Vision-Guided UI Control — Gemini Computer Use Preview
+
+Rio uses **Gemini Computer Use Preview** (`gemini-3-flash-preview` with computer use capability) as the vision intelligence layer for all UI interactions.
+
+The pipeline works in two stages:
+
+```
+Screenshot (JPEG)
+      │
+      ▼
+Gemini Computer Use Preview
+  → reads screen context
+  → identifies target element
+  → returns normalized (x, y) coordinates
+      │
+      ▼
+pyautogui
+  → physically moves mouse to coordinates
+  → executes click / drag / scroll
+      │
+      ▼
+Post-action screenshot + OCR
+  → verifies the action had the expected effect
+```
+
+This is what powers `smart_click(target, action)` in `local/tools.py` — you describe the element in plain language ("the Send button", "the search bar"), the Computer Use model locates it on the actual live screen, and pyautogui executes. No hardcoded coordinates, no brittle selectors. Rio sees what a human sees.
+
+> **Gemini Computer Use Preview** is purpose-built for agents that interact with UIs — browsers, desktop apps, web applications — by understanding screen context rather than DOM structure. Rio uses it as the grounding layer so UI navigation degrades gracefully even when Playwright selectors can't reach an element.
+
+
+- **Google GenAI SDK** used directly: `genai.Client`, `client.aio.live.connect`, `types.LiveConnectConfig`, `types.SpeechConfig`, `types.AutomaticActivityDetection`, `types.FunctionDeclaration.from_callable`
+- **Vertex AI path** auto-activates when `GOOGLE_GENAI_USE_VERTEXAI=true` — same code, zero changes
+- **Google Workspace APIs** (Gmail, Drive, Calendar, Sheets, Docs) integrated via `cloud/workspace_tools.py`
+- **Cloud Run** manifest: `minScale=1`, `maxScale=5`, `sessionAffinity=true`, `timeoutSeconds=3600` — long-lived WebSocket sessions don't get killed mid-task
+
+### ToolBridge Pattern
+One `ToolBridge` instance is created per WebSocket session. `_make_tools(bridge)` returns **58 async closures** scoped to that session — covering file ops, shell, screen automation, browser (Playwright), window management, clipboard, web search, Google Workspace, Imagen/Veo generation, memory, and skill-specific tools (customer care, tutoring). Results are Pydantic-validated before being fed back to the orchestrator.
+
+### Reliability & Error Handling
+| Layer | Mechanism |
+|---|---|
+| Rate limiting | 30 RPM token bucket, 4 degradation levels (NORMAL → CAUTION → EMERGENCY → CRITICAL) |
+| Tool safety | Dangerous shell patterns blocklisted; `write_file` creates `.rio.bak` before every edit |
+| Model fallback | `SESSION_MODE` + model env overrides; legacy relay path (`RIO_USE_ADK=0`) as last resort |
+| Tool timeouts | Per-tool and global timeout (`RIO_TOOLBRIDGE_TIMEOUT_SECONDS`); orchestrator caps at 50 iterations |
+| Anti-hallucination | OCR + screenshot provide UI state evidence; tool outputs treated as execution truth, injected as grounding |
+
+### Config Resolution Priority
+```
+ENV variable  →  .env / config.yaml  →  code defaults
+```
+All model choices, timeouts, feature flags, and rate limits are overridable at runtime without code changes.
+
+---
+
+## Demo Scenario
+
+> **Command:** *"Rio, open Chrome, find yesterday's unread emails, and draft a reply summary."*
+
+| Time | What Happens | Observable Signal |
+|---|---|---|
+| T=0s | Voice command captured via F2 / VAD | Live transcription event in dashboard |
+| T=3s | Rio acknowledges verbally; orchestrator begins tool routing | `tool_call` stream visible in dashboard tool log |
+| T=8s | Browser opens; Gmail navigated via Playwright | Screenshot streamed; OCR extracts email subjects |
+| T=15s | Draft composed; workspace tool writes to Gmail draft | `tool_result` confirms draft ID |
+| T=20s | Rio speaks completion summary | Audio playback; dashboard shows full tool trace |
+
+**No clicks. No text typed. One spoken sentence.**
+
+---
+
+## Try Rio Live
+
+**[rio.gowshik.in](https://rio.gowshik.in)** — Rio is publicly deployed and accessible right now.
+
+| Tier | Access |
+|---|---|
+| Free | Available immediately — try voice interaction, dashboard, and tool execution |
+| Pro | Full autonomous task mode, screen control, and all 58 tools unlocked |
+
+> **For judges:** The demo video walkthrough covers the full Pro-tier capability. If you'd like live Pro access during evaluation, Reach out [rio.gowshik.in](https://rio.gowshik.in).
+
+---
+
+## Cloud Deployment
+
+| Field | Value |
+|---|---|
+| GCP Project | `rio-agent-45` |
+| Cloud Run Service | `rio-cloud` |
+| Region | `us-central1` |
+| Container | Python 3.11-slim · non-root · healthcheck |
+
+**Verify live deployment:**
+```bash
+curl -s https://rio-landing-979788564023.us-central1.run.app/health | jq
+# Expected: Rio Landing Page
+```
+
+**GCP services used:** Cloud Run · Gemini Live API · Gemini content generation · Vertex AI (optional) · Secret Manager (`gemini-api-key`) · Google Workspace APIs
+
+---
+
+## Running Rio Locally
 
 ### Prerequisites
 
-- **Python**: 3.11+ (3.10+ may work but 3.11+ is recommended)
-- **Operating System**: Windows 10/11, Linux (Ubuntu 20.04+), macOS 11+
-- **RAM**: 4GB minimum, 8GB recommended
-- **Disk Space**: ~2GB for dependencies and models
-- **API Key**: Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+| Requirement | Version | Notes |
+|---|---|---|
+| Python | 3.11+ | `python --version` to verify |
+| Git | any | for cloning |
+| Gemini API Key | — | [Get one here](https://aistudio.google.com/app/apikey) |
+| Chrome / Chromium | any | required for browser automation tools |
+| Microphone | — | any system mic works |
 
-### Installation
-
-#### Option 1: Automated Setup (Recommended)
-
-**Windows:**
-```cmd
-cd Rio-Agent\rio\setup
-setup.bat
-```
-
-**Linux / macOS:**
-```bash
-cd Rio-Agent/rio/setup
-chmod +x *.sh
-./setup.sh
-```
-
-The setup script will:
-1. Create a Python virtual environment
-2. Install all required dependencies
-3. Configure the Gemini API key
-4. Set up the configuration file
-
-#### Option 2: Manual Installation
+### Step 1 — Clone
 
 ```bash
-cd Rio-Agent/rio
+git clone https://github.com/Gowshik-S/Gemini-Live-Agent
+cd Gemini-Live-Agent
+```
 
-# Create and activate virtual environment
+### Step 2 — Install Dependencies
+
+```bash
+cd rio
+
+# Create virtual environment
 python -m venv .venv
 
-# Windows:
-.venv\Scripts\activate
-# Linux/macOS:
-source .venv/bin/activate
+# Activate
+source .venv/bin/activate       # Linux / macOS
+.venv\Scripts\activate          # Windows
 
-# Install dependencies
+# Install
 pip install -r requirements.txt
-
-# For development (optional)
-pip install -r requirements-dev.txt
-
-# Configure API key
-echo "GEMINI_API_KEY=your_api_key_here" > cloud/.env
 ```
 
-### Running Rio
+> Optional: install dev dependencies for running tests
+> ```bash
+> pip install -r requirements-dev.txt
+> ```
 
-#### Start the Cloud Relay
-
-**Windows:**
-```cmd
-cd Rio-Agent\rio\setup
-run-cloud.bat
-```
-
-**Linux / macOS:**
-```bash
-cd Rio-Agent/rio/setup
-./run-cloud.sh
-```
-
-The cloud relay will start on `http://localhost:8080`
-
-#### Start the Local Client
-
-**Windows:**
-```cmd
-cd Rio-Agent\rio\setup
-run-local.bat
-```
-
-**Linux / macOS:**
-```bash
-cd Rio-Agent/rio/setup
-./run-local.sh
-```
-
-### Verify Installation
-
-After starting both services:
-
-- **Health Check**: http://localhost:8080/health
-- **Dashboard**: http://localhost:8080/dashboard
-- **Setup Page**: http://localhost:8080/dashboard/setup.html
-
-### Using the CLI
-
-Rio includes a powerful CLI for configuration and diagnostics:
+### Step 3 — Configure API Key
 
 ```bash
-# Interactive setup wizard
-python -m rio.cli configure
+echo "GEMINI_API_KEY=your_key_here" > cloud/.env
+```
 
-# Run system diagnostics
-python -m rio.cli doctor
+That's the only required environment variable to get started. Everything else resolves from `rio/config.yaml` defaults.
 
-# Test API connectivity
+**Optional overrides** (add to `cloud/.env` as needed):
+
+```bash
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id   # for Vertex AI path
+SESSION_MODE=live                           # "live" (audio) or "text"
+RIO_VOICE=Puck                             # agent voice identity
+RIO_WS_TOKEN=secret                        # WebSocket auth token
+```
+
+### Step 4 — Start the Cloud Relay
+
+The cloud relay is the FastAPI server that hosts the Gemini Live session, orchestrator, and tool bridge. In production this runs on Cloud Run — locally it runs on port 8080.
+
+```bash
+# Linux / macOS
+cd rio/setup && ./run-cloud.sh
+
+# Windows
+cd rio\setup && run-cloud.bat
+
+# Or directly
+cd rio && uvicorn cloud.adk_server:app --host 0.0.0.0 --port 8080
+```
+
+Confirm it's up:
+```bash
+curl http://localhost:8080/health
+# {"status":"ok","service":"rio-cloud","backend":"...","model":"..."}
+```
+
+Dashboard: `http://localhost:8080/dashboard`
+
+### Step 5 — Start the Local Runtime
+
+The local runtime handles mic capture, screen capture, VAD, and local tool execution. It connects to the relay over WebSocket.
+
+```bash
+# Linux / macOS
+cd rio/setup && ./run-local.sh
+
+# Windows
+cd rio\setup && run-local.bat
+
+# Or directly
+cd rio/local && python main.py
+```
+
+Once both are running, press **F2** and speak a command.
+
+### Step 6 — Verify End-to-End
+
+```bash
+# Run the full diagnostic suite
 python -m rio.cli doctor --test-api
-
-# View configuration
-python -m rio.cli config show
-
-# Get a config value
-python -m rio.cli config get models.primary
-
-# Set a config value
-python -m rio.cli config set models.primary gemini-3-flash-preview
-
-# Start Rio
-python -m rio.cli run
 ```
 
-## Runtime Controls
+This checks: config loading, API connectivity, rate limiter, model routing, tool imports, dashboard files, and wire protocol constants. Optional dependencies (ChromaDB, sentence-transformers, Playwright) are reported as skipped, not failed, if not installed.
 
-### Hotkeys
+---
 
-Global hotkeys work when `pynput` is installed and your OS allows keyboard hooks.
-
-| Key | Function | Description |
-|-----|----------|-------------|
-| **F2** | Push to Talk | Hold to speak, release to send |
-| **F3** | Screenshot | Force an immediate screenshot |
-| **F4** | Demo Trigger | Force proactive assistance (demo mode) |
-| **F5** | Screen Mode | Toggle between on_demand and autonomous |
-| **F6** | Live Mode | Toggle continuous monitoring and wake word |
-
-### Screen Modes
-
-- **on_demand**: Screenshots only when requested (F3, tool call, or user request)
-- **autonomous**: Periodic screenshots based on `vision.fps` setting
-- **Live Mode**: Continuous screen monitoring + wake word listening for hands-free operation
-
-### Voice Commands
-
-When in Live Mode or after pressing F2:
-
-- **"Hey Rio"** - Wake word to activate listening
-- **"Open [application]"** - Launch applications
-- **"Click [description]"** - Smart click on UI elements
-- **"Search for [query]"** - Web search
-- **"Read file [path]"** - Read file contents
-- **"Run [command]"** - Execute shell commands
-- **"Take a screenshot"** - Capture screen
-- **"Resume"** / **"Continue"** - Resume paused tasks
-
-### CLI Commands
+### One-Line Install (Alternative)
 
 ```bash
-# Configuration
-rio config show                          # View all settings
-rio config get models.primary            # Get specific value
-rio config set models.primary gemini-3-flash-preview  # Set value
-
-# Diagnostics
-rio doctor                               # Run system checks
-rio doctor --test-api                    # Test API connectivity
-
-# Setup
-rio configure                            # Interactive setup wizard
-
-# Execution
-rio run                                  # Start Rio agent
+curl -sL https://raw.githubusercontent.com/Gowshik-S/Gemini-Live-Agent/main/install.sh | bash
 ```
 
-## Configuration
+---
 
-Rio's behavior is controlled by `rio/config.yaml`. Here are the key settings:
+### Cloud Run Deployment
 
-### Core Settings
+The repo ships a deploy script that builds and pushes the container, then updates the Cloud Run service.
 
-```yaml
-rio:
-  agent_name: Rio                    # Agent display name
-  session_mode: live                 # "live" (audio) or "text"
-  backend: direct                    # Connection mode
-  cloud_url: ws://localhost:8080/ws/rio/live  # WebSocket endpoint
-```
-
-### Model Configuration
-
-```yaml
-  models:
-    primary: gemini-3-flash-preview           # Main orchestrator model
-    secondary: gemini-3-pro-preview           # Fallback model
-    live: gemini-2.5-flash-native-audio-latest # Live audio model
-    computer_use: gemini-3-flash-preview      # Vision grounding model
-    imagen: imagen-4                          # Image generation
-    timeout_seconds: 30.0
-    cooldown_seconds: 60.0
-    pro_rpm_budget: 5                         # Pro model rate limit
-```
-
-### Multi-Agent Configuration
-
-```yaml
-  agents:
-    task_executor:
-      enabled: true
-      max_iterations: 25
-      model: gemini-3-flash-preview
-      tools: all
-      description: "General task execution, multi-step workflows"
-    
-    code_agent:
-      enabled: true
-      max_iterations: 15
-      model: gemini-3-flash-preview
-      tools: dev
-      description: "Coding, debugging, file editing, git operations"
-    
-    computer_use_agent:
-      enabled: true
-      max_iterations: 25
-      model: gemini-3-flash-preview
-      tools: screen
-      description: "Screen interaction, GUI automation, browser navigation"
-    
-    research_agent:
-      enabled: true
-      max_iterations: 10
-      model: gemini-2.5-pro
-      tools: memory
-      description: "Deep research, complex analysis, reasoning"
-    
-    creative_agent:
-      enabled: true
-      max_iterations: 5
-      tools: creative
-      description: "Image generation, video creation, design"
-```
-
-### Vision & Screen Capture
-
-```yaml
-  vision:
-    default_mode: on_demand  # "on_demand" or "autonomous"
-    fps: 0.33                # Screenshots per second in autonomous mode
-    quality: 85              # JPEG quality (0-100)
-    resize_factor: 0.75      # Scale factor for screenshots
-```
-
-### Audio Settings
-
-```yaml
-  audio:
-    sample_rate: 16000
-    block_size: 320
-    latency: low
-    use_wasapi: true         # Windows-specific audio API
-    input_device: null       # Auto-detect
-    output_device: null      # Auto-detect
-```
-
-### Hotkeys
-
-```yaml
-  hotkeys:
-    push_to_talk: f2         # Voice input
-    screenshot: f3           # Force screenshot
-    toggle_proactive: f4     # Demo mode trigger
-    screen_mode: f5          # Toggle screen capture mode
-    live_mode: f6            # Toggle Live Mode
-```
-
-### Memory & Persistence
-
-```yaml
-  memory:
-    db_path: ./data/memory
-    max_recall: 5            # Number of memories to recall
-```
-
-### Struggle Detection
-
-```yaml
-  struggle:
-    enabled: true
-    threshold: 0.85          # Confidence threshold
-    cooldown_seconds: 300    # Time between proactive offers
-    decline_cooldown: 600    # Cooldown after user declines
-    demo_mode: false         # Lower thresholds for demos
-```
-
-### Tool Policy & Rate Limiting
-
-```yaml
-  orchestrator:
-    tool_timeout_seconds: 120
-    heartbeat_interval_seconds: 5
-    
-    tool_policy:
-      default_per_minute: 20
-      max_calls_per_task: 120
-      max_cost_points_per_task: 200
-      
-      cost_points:
-        generate_video: 6
-        gmail_send: 3
-        run_command: 4
-        start_process: 5
-      
-      per_tool_per_minute:
-        gmail_send: 6
-        run_command: 8
-        smart_click: 30
-```
-
-### Filesystem Access Control
-
-```yaml
-  filesystem:
-    enabled: true
-    read_paths:
-      - .                    # Current directory
-    write_paths:
-      - .                    # Current directory
-```
-
-### Skills
-
-```yaml
-  skills:
-    customer_care:
-      enabled: true
-      default_priority: medium
-      auto_escalate_after: 300
-      ticket_dir: ./rio_tickets
-    
-    tutor:
-      enabled: true
-      default_difficulty: intermediate
-      socratic_mode: true
-      quiz_num_questions: 5
-      progress_dir: ./rio_progress
-```
-
-### Logging
-
-```yaml
-  logging:
-    log_dir: ./logs
-    max_files: 7             # Days of logs to keep
-    verbose: false
-```
-
-### Environment Variables
-
-Set these in `rio/cloud/.env` or your environment:
-
-```bash
-# Required
-GEMINI_API_KEY=your_api_key_here
-
-# Optional overrides
-SESSION_MODE=live                    # Override session mode
-TEXT_MODEL=gemini-3-flash-preview    # Override text model
-LIVE_MODEL=gemini-2.5-flash-native-audio-latest
-RIO_WS_TOKEN=secret_token            # WebSocket authentication
-PRO_RPM_BUDGET=5                     # Pro model rate limit
-ORCHESTRATOR_MODEL=gemini-3-flash-preview
-RIO_TOOLBRIDGE_TIMEOUT_SECONDS=60
-RIO_ORCHESTRATOR_USE_AGENTS_MD=true  # Load agents.md instructions
-```
-
-## Available Tools
-
-Rio provides 60+ tools organized by category:
-
-### File Operations
-- `read_file(path)` - Read file contents
-- `write_file(path, content)` - Write to file (creates .rio.bak backup)
-- `patch_file(path, old_text, new_text)` - Find and replace in file
-
-### Shell & Process Management
-- `run_command(command)` - Execute shell command (30s timeout, dangerous patterns blocked)
-- `start_process(command, label)` - Start long-running background process
-- `check_process(pid)` - Check process status
-- `stop_process(pid)` - Stop background process
-- `list_processes(name_filter)` - List running processes
-- `kill_process(name_or_pid)` - Terminate process
-
-### Screen Capture & Vision
-- `capture_screen()` - Take screenshot
-- `get_screen_info()` - Get monitor information
-
-### Screen Automation (Coordinate-Based)
-- `screen_click(x, y, button, clicks)` - Click at coordinates
-- `screen_type(text, interval)` - Type text
-- `screen_scroll(x, y, clicks)` - Scroll at position
-- `screen_hotkey(keys)` - Press keyboard shortcut
-- `screen_move(x, y)` - Move mouse cursor
-- `screen_drag(start_x, start_y, end_x, end_y)` - Click and drag
-
-### Vision-Guided Automation
-- `smart_click(target, action, clicks)` - Click UI element by description (uses Computer Use model)
-
-### Window Management
-- `open_application(name_or_path)` - Launch application
-- `list_all_windows()` - List all visible windows
-- `get_active_window()` - Get foreground window info
-- `find_window(title)` - Search for window by title
-- `focus_window(title)` - Bring window to foreground
-- `minimize_window(title)` - Minimize window
-- `maximize_window(title)` - Maximize window
-- `close_window(title)` - Close window
-- `resize_window(title, width, height)` - Resize window
-- `move_window(title, x, y)` - Move window
-
-### Clipboard
-- `get_clipboard()` - Read clipboard text
-- `set_clipboard(text)` - Set clipboard text
-
-### Browser Automation (Playwright)
-- `browser_connect(cdp_url, browser, profile)` - Connect to browser via CDP
-- `browser_navigate(url)` - Navigate to URL
-- `browser_click_element(selector)` - Click element by CSS selector
-- `browser_fill_form(selector, value)` - Fill form field
-- `browser_extract_text(selector)` - Extract text from element
-- `browser_evaluate(javascript)` - Execute JavaScript
-- `browser_wait_for(selector, timeout)` - Wait for element
-
-### Web Tools
-- `web_search(query, max_results)` - Search web with DuckDuckGo
-- `web_fetch(url, max_chars)` - Fetch and parse web page
-- `web_cache_get(url)` - Get cached web page
-
-### Memory & Notes
-- `save_note(key, value, media_paths)` - Save persistent note
-- `get_notes()` - Retrieve all notes
-- `search_notes(query, limit)` - Search notes by keyword
-- `export_context()` - Export session memory to file
-- `memory_stats()` - Get memory system statistics
-
-### Google Workspace
-- `gmail_search(query, max_results)` - Search Gmail
-- `gmail_send(to, subject, body, cc, bcc)` - Send email
-- `drive_list(folder_id, max_results)` - List Drive files
-- `calendar_list_events(calendar, time_min, time_max)` - List calendar events
-- `sheets_read(spreadsheet_id, range_a1)` - Read from Sheets
-- `docs_create(title, content)` - Create Google Doc
-
-### Creative Tools
-- `generate_image(prompt, aspect_ratio, style)` - Generate image with Imagen 3
-- `generate_video(prompt, duration_seconds, aspect_ratio)` - Generate video with Veo 2
-
-### Customer Care (Skill)
-- `create_ticket(title, category, priority, description)` - Create support ticket
-- `update_ticket(ticket_id, status, priority, notes)` - Update ticket
-
-### Tutoring (Skill)
-- `generate_quiz(topic, difficulty, num_questions)` - Generate quiz
-- `track_progress(action, subject, topic, score)` - Track learning progress
-- `explain_concept(concept, level, context)` - Get concept explanation
-
-### Tool Risk Classification
-
-Tools are classified by risk level for safety controls:
-
-- **SAFE**: Read-only operations (read_file, capture_screen, list_windows)
-- **MODERATE**: Writes and UI interactions (write_file, screen_click, generate_image)
-- **DANGEROUS**: Shell execution and process control (run_command, kill_process)
-- **CRITICAL**: Reserved for future destructive operations
-
-## Safety Model
-
-Rio is designed to degrade gracefully and avoid destructive behavior by default.
-
-- Dangerous shell patterns such as `rm -rf`, `mkfs`, `shutdown`, `curl | bash`, and similar commands are blocked.
-- `write_file` and `patch_file` create `.rio.bak` backups before modifying files.
-- File paths are resolved relative to the tool working directory and blocked from escaping it.
-- Dangerous tool calls are confirmed locally before execution.
-- Screen actions are rate-limited and logged, and `pyautogui.FAILSAFE` stays enabled.
-
-## Working Directory Scope
-
-Rio's local file tools are scoped to the process working directory. The provided `run-local` scripts start the client from `rio/local`, so by default Rio can only read or modify files in that directory tree.
-
-If you want Rio to operate on a different project, launch `rio/local/main.py` from that project's root so the tool executor resolves paths there.
-
-## Skills and Persistence
-
-### Customer Care
-
-- Deterministic profile schema in `rio/local/profiles.py`
-- Setup UI saves `customer_care_profile.json`
-- Ticket tools persist JSON tickets under `rio_tickets/`
-
-### Tutor
-
-- Deterministic student profile schema in `rio/local/profiles.py`
-- Setup UI saves `tutor_profile.json`
-- Tutor tools persist progress under `rio_progress/`
-
-### Local state generated by Rio
-
-- `rio/rio_chats.db` - chat history
-- `rio/rio_patterns.db` - user behavior and struggle patterns
-- `rio/rio_memory/` - optional vector memory store
-- `rio/rio_profiles/` - saved customer care and tutor profiles
-- `rio/local/*.rio.bak` or project-local `.rio.bak` files - backups from edits
-
-## Testing
-
-Rio includes a smoke/integration-style test script at [`rio/tests/test_all.py`](rio/tests/test_all.py).
-
-Run it with:
-
-```bash
-cd Rio-Agent
-python rio/tests/test_all.py
-```
-
-The suite validates imports, config loading, rate limiting, model routing, tool execution, dashboard files, and wire protocol constants. Optional features may be skipped if their dependencies are not installed.
-
-## Cloud Run Deployment
-
-The repo includes a deploy script and container spec:
-
-- [`rio/deploy.sh`](rio/deploy.sh)
-- [`rio/cloud/service.yaml`](rio/cloud/service.yaml)
-- [`rio/cloud/Dockerfile`](rio/cloud/Dockerfile)
-
-Deployment assumptions:
-
-1. `gcloud` is installed and authenticated.
-2. Cloud Run, Cloud Build, and Secret Manager are enabled.
-3. A secret named `gemini-api-key` exists in Secret Manager.
-
-Then run:
+**Prerequisites:** `gcloud` CLI authenticated · Cloud Run + Cloud Build + Secret Manager APIs enabled · a secret named `gemini-api-key` in Secret Manager.
 
 ```bash
 cd Rio-Agent/rio
@@ -793,31 +351,100 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-The script prints the HTTP URL and the WebSocket URL to put back into `rio/config.yaml`.
+The script outputs the HTTP and WebSocket URLs. Paste the WebSocket URL into `rio/config.yaml`:
+
+```yaml
+rio:
+  cloud_url: wss://<your-cloud-run-url>/ws/rio/live
+```
+
+Then run the local runtime pointing at the deployed relay — no other changes needed.
+
+---
+
+## Agent & Tool Breakdown
+
+### Agents
+
+| Agent | Model | Role |
+|---|---|---|
+| Task Executor | Gemini 3-Flash | Multi-step general task orchestration |
+| Code Agent | Gemini 3-Flash | File editing, shell, git |
+| Computer Use Agent | **Gemini Computer Use Preview** | Screen reading, coordinate grounding, GUI automation |
+| Research Agent | Gemini 2.5-Pro | Deep reasoning, analysis |
+| Creative Agent | Imagen 3 + Veo 2 | Image and video generation |
+
+### Tool Categories (58 total)
+
+`File ops` · `Shell & process` · `Screen capture` · `Screen automation` · `Vision-guided click` · `Window management` · `Browser (Playwright)` · `Web search/fetch` · `Memory & notes` · `Google Workspace` · `Creative (Imagen/Veo)` · `Customer care skill` · `Tutoring skill`
+
+---
+
+## Dashboard
+
+Rio ships a real-time operational dashboard served by the cloud relay at `http://localhost:8080/dashboard/` (or your Cloud Run URL in production).
+
+| Page | URL | Purpose |
+|---|---|---|
+| Main dashboard | `/dashboard/` | Live transcript, tool log, health gauges, agent status |
+| Chat | `/dashboard/chat.html` | Text-mode interaction with Rio |
+| Setup | `/dashboard/setup.html` | Configure skills, profiles, API keys, agent behavior |
+
+### What the Dashboard Shows
+
+**Live Transcript stream** — every utterance and Rio's responses appear in real time via `/ws/dashboard` WebSocket. You can see exactly what Rio heard and what it decided.
+
+**Tool log** — every `tool_call` and `tool_result` is correlated and displayed with timing. Judges can watch Rio's execution trace — open Gmail, extract text, draft reply — step by step as it happens.
+
+**Health gauges** — RPM usage, degradation level, active session state, and model routing decisions are surfaced live. If the rate limiter kicks in, the gauge shows it.
+
+**Schedules** — view and manage any scheduled or trigger-based tasks Rio has queued.
+
+**Setup page** — first-run configuration UI. Set your Gemini API key, choose agent skills (Customer Care / Tutor), configure voice, and save profile JSON — all without touching config files.
+
+The dashboard is pure static HTML/CSS/JS served directly by FastAPI — no separate frontend server needed. It connects to the relay over WebSocket and polls HTTP config endpoints for state.
+
+---
+
+## Runtime Controls
+
+| Key | Action |
+|---|---|
+| F2 | Push-to-talk — hold to speak, release to send; also interrupts active playback |
+| F3 | Mute toggle |
+| F4 | Toggle proactive mode — Rio watches and offers help unprompted |
+| F5 | Screen mode — cycle between on-demand and autonomous capture |
+| F6 | Live mode — continuous monitoring + wake word ("Hey Rio") |
+| F7 | Live translation toggle — real-time bidirectional speech translation |
+| F8 | Current task status — speak or display active task progress |
+
+---
 
 ## Known Limitations
 
-- Gemini Pro routing is not complete yet. The router can decide that Pro should be used, but the actual Pro call path still returns `None`.
-- The checked-in model settings and the cloud runtime are not perfectly aligned. `cloud/gemini_session.py` defaults to `gemini-2.5-flash` and `gemini-2.5-flash-native-audio-latest`, regardless of the older model notes elsewhere in the repo.
-- Memory, some hotkeys, and some screen-navigation features are optional and may appear disabled until their dependencies are installed.
-- Desktop automation on Wayland and elevated/admin windows is inherently less reliable than standard Windows desktop automation.
-- The codebase contains version strings from multiple milestones (`v0.6.x`, `v0.7.x`, `v0.9.0`) because the project evolved layer by layer.
+- **`pip install rio-agent`** — single-command install and `rio run` CLI launch coming soon. `[Roadmap]`
+- **A2A protocol** — no Agent Cards or remote agent discovery yet. `[In Progress]`
+- **pyautogui → Playwright** unification still expanding. `[In Progress]`
+- **React dashboard** planned; current UI is static HTML/JS served by FastAPI. `[In Progress]`
+- Desktop automation on Wayland and elevated/admin windows is inherently less reliable than standard Windows desktop.
+
+---
 
 ## Tech Stack
 
-| Layer | Tech |
-| --- | --- |
-| Cloud relay | FastAPI, uvicorn, websockets, structlog |
-| Gemini integration | `google-genai`, Gemini 2.5 Flash text mode, Gemini Live audio mode |
-| Audio | `sounddevice`, CPU PyTorch, Silero VAD |
-| Vision | `mss`, Pillow, RapidOCR |
-| Desktop automation | `pyautogui`, `pygetwindow`, `pyperclip` |
-| Memory and local state | SQLite, optional ChromaDB, sentence-transformers |
-| ML | NumPy, scikit-learn ensemble pipeline |
-| UI | Static HTML/CSS/JS dashboard served by FastAPI |
+| Layer | Technology |
+|---|---|
+| Cloud relay | FastAPI · uvicorn · websockets · structlog |
+| AI / Gemini | `google-genai` SDK · Live API · Gemini 2.5 Flash Native Audio · Flash/Pro text |
+| Audio | sounddevice · Silero VAD · CPU PyTorch |
+| Vision | mss · Pillow · RapidOCR (ONNX) |
+| Automation | pyautogui · pygetwindow · Playwright |
+| Memory | SQLite · ChromaDB · **Gemini Text Embeddings 2** (`text-embedding-004`) |
+| Deployment | Cloud Run · Docker (Python 3.11-slim) |
 
-## Related Docs
+---
 
-- [`Rio-Plan.md`](Rio-Plan.md) - architecture and hackathon plan
-- [`context.txt`](context.txt) - project-wide context snapshot
-- [`rio/setup/README.md`](rio/setup/README.md) - setup-script-focused quick reference
+## License & Contact
+
+License: see `LICENSE` in repository root.  
+GitHub: [Gowshik-S/Gemini-Live-Agent](https://github.com/Gowshik-S/Gemini-Live-Agent) — open an issue for deployment support or collaboration.
