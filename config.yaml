@@ -34,6 +34,12 @@ rio:
   browser:
     default_browser: auto
     default_profile: rio
+  portal:
+    enabled: false
+    backend_url: https://riocloud.gowshik.in
+    api_key: ''
+    validate_on_startup: true
+    timeout_seconds: 8.0
   cloud_url: ws://localhost:8080/ws/rio/live
   filesystem:
     enabled: true

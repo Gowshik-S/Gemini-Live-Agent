@@ -157,6 +157,11 @@ except ImportError:
     CreativeAgent = None
 
 try:
+    from portal_auth import validate_rio_key
+except ImportError:
+    validate_rio_key = None
+
+try:
     from user_pattern_model import UserPatternModel
 except ImportError:
     UserPatternModel = None
@@ -1981,6 +1986,62 @@ async def main() -> None:
         cloud_url=config.cloud_url,
         model=config.models.primary,
     )
+
+    portal_enabled = os.environ.get("RIO_PORTAL_ENABLED", str(config.portal.enabled)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    portal_validate_on_startup = (
+        os.environ.get("RIO_PORTAL_VALIDATE_ON_STARTUP", str(config.portal.validate_on_startup))
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+    portal_backend_url = os.environ.get("RIO_PORTAL_BACKEND_URL", config.portal.backend_url).strip()
+    portal_api_key = os.environ.get("RIO_PORTAL_API_KEY", config.portal.api_key).strip()
+    try:
+        portal_timeout = float(os.environ.get("RIO_PORTAL_TIMEOUT_SECONDS", str(config.portal.timeout_seconds)) or 8.0)
+    except ValueError:
+        portal_timeout = 8.0
+
+    if portal_enabled and portal_validate_on_startup:
+        if validate_rio_key is None:
+            print("  Portal: validation helper unavailable")
+            log.warning("portal.validation_unavailable")
+        elif not portal_api_key:
+            print("  Portal: enabled but RIO_PORTAL_API_KEY is missing")
+            log.warning("portal.api_key_missing")
+        else:
+            portal_result = validate_rio_key(
+                backend_url=portal_backend_url,
+                rio_api_key=portal_api_key,
+                timeout_seconds=portal_timeout,
+            )
+            if not portal_result.get("ok") or not portal_result.get("valid"):
+                error_message = portal_result.get("error") or "Portal validation failed"
+                print(f"  Portal: ACCESS DENIED ({error_message})")
+                log.error(
+                    "portal.validation_failed",
+                    backend_url=portal_backend_url,
+                    status_code=portal_result.get("status_code"),
+                    error=error_message,
+                )
+                return
+
+            tier = portal_result.get("tier") or "unknown"
+            credits = portal_result.get("credits") or {}
+            print(
+                f"  Portal: key validated ({tier}) "
+                f"RIO={credits.get('rio', '?')} CU={credits.get('computer_use', '?')}"
+            )
+            log.info(
+                "portal.validation_ok",
+                backend_url=portal_backend_url,
+                tier=tier,
+                credits=credits,
+            )
 
     # -- Print banner ------------------------------------------------------
     print(BANNER)

@@ -133,6 +133,15 @@ class BrowserConfig:
     default_profile: str = "Default"  # "Default" or empty for shared Rio profile
 
 
+@dataclass
+class PortalConfig:
+    enabled: bool = False
+    backend_url: str = "https://riocloud.gowshik.in"
+    api_key: str = ""
+    validate_on_startup: bool = True
+    timeout_seconds: float = 8.0
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -154,6 +163,7 @@ class RioConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
+    portal: PortalConfig = field(default_factory=PortalConfig)
 
     # ------------------------------------------------------------------
     # Factory: load from YAML
@@ -210,6 +220,7 @@ class RioConfig:
             logging=_build(LoggingConfig, d.get("logging")),
             skills=_build_skills(d.get("skills")),
             browser=_build(BrowserConfig, d.get("browser")),
+            portal=_build(PortalConfig, d.get("portal")),
         )
 
     # ------------------------------------------------------------------
@@ -249,6 +260,10 @@ class RioConfig:
             raise ValueError(f"models.pro_rpm_budget must be >= 0, got: {self.models.pro_rpm_budget}")
         if not (0.0 < self.vad.threshold <= 1.0):
             raise ValueError(f"vad.threshold must be in (0, 1], got: {self.vad.threshold}")
+        if self.portal.enabled and not self.portal.backend_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"portal.backend_url must start with http:// or https://, got: {self.portal.backend_url}"
+            )
         log.info("config.validated")
 
 
