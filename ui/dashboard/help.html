@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rio - Help and Guide</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/help.css">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__logo" viewBox="0 0 32 32" width="28" height="28" fill="none">
+        <rect x="2" y="2" width="28" height="28" rx="6" stroke="currentColor" stroke-width="2"/>
+        <path d="M10 22V10h5a4 4 0 010 8h-5m5-8l5 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="topbar__title">Rio</span>
+      <span class="topbar__subtitle">Help</span>
+    </div>
+
+    <div class="topbar__status">
+      <a href="index.html" class="status-pill status-pill--muted status-link">
+        <span>Dashboard</span>
+      </a>
+      <a href="chat.html" class="status-pill status-pill--muted status-link">
+        <span>Chat</span>
+      </a>
+      <a href="setup.html" class="status-pill status-pill--muted status-link">
+        <span>Setup</span>
+      </a>
+    </div>
+  </header>
+
+  <main class="help-layout">
+    <section class="panel help-panel-gap">
+      <div class="panel__header">
+        <h2 class="panel__title">Quick Start</h2>
+      </div>
+      <div class="panel__body">
+        <ol class="help-list-ordered">
+          <li>Install Rio using installer scripts or pip/pipx.</li>
+          <li>You will be redirected immediately to <strong>rio configure</strong> for mandatory onboarding.</li>
+          <li>Choose your cloud/dashboard port when prompted (default is 8080).</li>
+          <li>Start runtime with <strong>rio run</strong> (starts cloud + local).</li>
+          <li>Open dashboard at <strong>http://localhost:&lt;port&gt;/dashboard</strong>.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="panel help-panel-gap">
+      <div class="panel__header">
+        <h2 class="panel__title">Boot and Services</h2>
+      </div>
+      <div class="panel__body help-copy">
+        <p class="help-no-top">Linux setup can create user-level systemd services if you approve the start-on-boot prompt.</p>
+        <p>Generated services:</p>
+        <ul class="help-list-unordered">
+          <li>rio-cloud.service</li>
+          <li>rio-local.service</li>
+        </ul>
+        <p>They are stored under <strong>~/.config/systemd/user</strong>.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__header">
+        <h2 class="panel__title">CLI Commands</h2>
+      </div>
+      <div class="panel__body help-copy">
+        <ul class="help-list-unordered">
+          <li><strong>rio config get &lt;path&gt;</strong> - read config value</li>
+          <li><strong>rio config set &lt;path&gt; &lt;value&gt;</strong> - update config value</li>
+          <li><strong>rio config show</strong> - print entire config</li>
+          <li><strong>rio configure</strong> - mandatory setup flow</li>
+          <li><strong>rio doctor</strong> - diagnose and auto-fix issues</li>
+          <li><strong>rio doctor --no-fix</strong> - report only</li>
+          <li><strong>rio doctor --test-api</strong> - include Gemini API probe</li>
+          <li><strong>rio run</strong> - run cloud + local</li>
+          <li><strong>rio run --foreground</strong> - local foreground mode</li>
+          <li><strong>rio run --background</strong> - force detached mode</li>
+          <li><strong>rio run --skip-configure</strong> - bypass configure gate</li>
+          <li><strong>rio logs --component both --lines 80</strong> - read logs</li>
+          <li><strong>rio logs --component local --follow</strong> - live log tail</li>
+          <li><strong>rio status --component both</strong> - process health</li>
+          <li><strong>rio stop --component both</strong> - stop runtime</li>
+          <li><strong>rio stop --component both --force</strong> - force kill process tree</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__header">
+        <h2 class="panel__title">Deployment Checklist</h2>
+      </div>
+      <div class="panel__body help-copy">
+        <ol class="help-list-ordered">
+          <li>Run <strong>rio doctor</strong> and confirm acknowledgement.</li>
+          <li>Run <strong>rio run</strong> then validate with <strong>rio status</strong> and <strong>rio logs</strong>.</li>
+          <li>Build package: <strong>python -m build</strong> (from Rio-Agent root).</li>
+          <li>Validate metadata: <strong>twine check dist/*</strong>.</li>
+          <li>Push to GitHub and trigger <strong>publish-pypi.yml</strong> from release/workflow dispatch.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__header">
+        <h2 class="panel__title">Troubleshooting</h2>
+      </div>
+      <div class="panel__body help-copy">
+        <p class="help-no-top">If dashboard is not loading, confirm your selected port is available and cloud is running.</p>
+        <p>If local client does not connect, verify <strong>cloud_url</strong> in <strong>rio/config.yaml</strong> matches your chosen port.</p>
+        <p>If API calls fail, open <strong>rio/cloud/.env</strong> and check <strong>GEMINI_API_KEY</strong>.</p>
+        <p class="help-no-bottom"><strong>Expected completion message:</strong> Rio is live at: http://localhost:&lt;port&gt;/dashboard</p>
+      </div>
+    </section>
+  </main>
+
+</body>
+</html>

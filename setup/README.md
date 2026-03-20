@@ -4,7 +4,7 @@ One-command setup for the Rio AI Pair Programmer. Works on **Windows**, **Linux*
 
 ## Prerequisites
 
-- **Python 3.10+** installed and on PATH
+- **Python 3.11+** installed and on PATH
   - Windows: [python.org](https://www.python.org/downloads/) — check "Add Python to PATH"
   - Linux: `sudo apt install python3 python3-venv` (Debian/Ubuntu)
   - macOS: `brew install python@3.12` or [python.org](https://www.python.org/downloads/)
@@ -43,11 +43,21 @@ Then in two separate terminals:
 
 ## What Setup Does
 
-1. **Checks Python 3.10+** is available
+1. **Checks Python 3.11+** is available
 2. **Creates `cloud/venv`** — installs FastAPI, uvicorn, google-genai, etc.
 3. **Creates `local/venv`** — installs PyTorch CPU, sounddevice, mss, Pillow, scikit-learn, etc.
 4. **Prompts for `GEMINI_API_KEY`** — saves to `cloud/.env`
-5. **Prints next steps**
+5. **Prompts for cloud/dashboard port** — writes `PORT` to `cloud/.env` and updates `cloud_url` in `rio/config.yaml`
+6. **Asks start-on-boot consent**
+7. **(Linux/macOS) creates optional `systemd --user` service files** for cloud and local
+8. **Runs mandatory onboarding** via `rio configure`
+9. **Prints live URL acknowledgement**: `Rio is live at: http://localhost:<port>/dashboard`
+
+## Mandatory Onboarding
+
+- Installer scripts (`scripts/install.sh`, `scripts/install.ps1`) now launch `rio configure` immediately after installation.
+- Local setup scripts (`setup/setup.sh`, `setup/setup.bat`) also launch `rio configure` before finishing.
+- `rio run` enforces configure flow by default if portal key setup is incomplete.
 
 ## File Overview
 
@@ -62,7 +72,7 @@ Then in two separate terminals:
 
 ## Re-running Setup
 
-Running setup again is safe — it skips venv creation if the folder already exists and skips `.env` if the file already exists. To force a fresh install, delete the `venv/` folders first:
+Running setup again is safe — it skips venv creation if the folder already exists and lets you optionally update `.env` values and port settings. To force a fresh install, delete the `venv/` folders first:
 
 ```cmd
 REM Windows

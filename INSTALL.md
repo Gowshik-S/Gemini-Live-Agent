@@ -185,17 +185,52 @@ mv ~/.rio/vosk-model-small-en-us-0.15 ~/.rio/vosk-model-small-en-us
 After installation, verify your setup:
 
 ```bash
-# Run diagnostics
+# Run diagnostics (auto-fix + acknowledgement)
 python -m rio.cli doctor
 
 # Test API connection
 python -m rio.cli doctor --test-api
 
+# Report-only diagnostics
+python -m rio.cli doctor --no-fix
+
 # View configuration
 python -m rio.cli config show
 ```
 
+## CLI Command Reference
+
+All commands (installed script form):
+
+```bash
+rio config get <path>
+rio config set <path> <value>
+rio config show
+rio configure
+rio doctor
+rio doctor --no-fix
+rio doctor --test-api
+rio run
+rio run --foreground
+rio run --background
+rio run --skip-configure
+rio logs --component both --lines 80
+rio logs --component cloud --follow
+rio logs --component local --follow
+rio status --component both
+rio stop --component both
+rio stop --component both --force
+```
+
+Module form equivalents:
+
+```bash
+python -m rio.cli <command>
+```
+
 ## Running Rio Agent
+
+`rio run` starts both cloud and local runtime. If onboarding is incomplete, it redirects to `rio configure` first.
 
 ### Start Cloud Relay
 
@@ -227,6 +262,34 @@ Open your browser to:
 - Health check: http://localhost:8080/health
 - Dashboard: http://localhost:8080/dashboard
 - Setup page: http://localhost:8080/dashboard/setup.html
+
+At the end of onboarding/setup, you should see:
+
+```text
+Rio is live at: http://localhost:<port>/dashboard
+```
+
+## Mandatory Onboarding Redirect
+
+- Installer scripts (`scripts/install.sh`, `scripts/install.ps1`) launch `rio configure` immediately after install.
+- Setup scripts (`setup/setup.sh`, `setup/setup.bat`) launch `rio configure` before finishing.
+- `rio run` enforces configure flow unless `--skip-configure` is explicitly used.
+
+## GitHub + PyPI Deployment Preflight
+
+From `Rio-Agent` root:
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+twine check dist/*
+```
+
+Publishing automation:
+
+- GitHub workflow: `.github/workflows/publish-pypi.yml`
+- Trigger: release published or manual workflow dispatch
+- Publish method: trusted publisher OIDC (`pypa/gh-action-pypi-publish`)
 
 ## Troubleshooting
 

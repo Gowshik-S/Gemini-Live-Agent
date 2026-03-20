@@ -1,0 +1,33 @@
+.help-layout {
+  display: block;
+  max-width: 1000px;
+  margin: 24px auto;
+  padding: 0 16px;
+}
+
+.help-panel-gap {
+  margin-bottom: 16px;
+}
+
+.help-copy {
+  line-height: 1.7;
+}
+
+.help-list-ordered {
+  margin: 0;
+  padding-left: 20px;
+  line-height: 1.6;
+}
+
+.help-list-unordered {
+  margin-top: 0;
+  padding-left: 20px;
+}
+
+.help-no-top {
+  margin-top: 0;
+}
+
+.help-no-bottom {
+  margin-bottom: 0;
+}

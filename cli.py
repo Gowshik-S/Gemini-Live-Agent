@@ -19,24 +19,155 @@ Entry point: `python -m rio.cli` or installed as `rio` command.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
+import shlex
+import shutil
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Resolve paths
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _RIO_ROOT = _SCRIPT_DIR  # rio/ directory
 _LOCAL_DIR = _RIO_ROOT / "local"
-_CONFIG_PATH = _RIO_ROOT / "config.yaml"
+_CLOUD_DIR = _RIO_ROOT / "cloud"
+_DEFAULT_CONFIG_PATH = _RIO_ROOT / "config.yaml"
+_RIO_HOME = Path(os.environ.get("RIO_HOME", Path.home() / ".rio")).expanduser()
+_CONFIG_PATH = Path(os.environ.get("RIO_CONFIG", _RIO_HOME / "config.yaml")).expanduser()
+_ENV_PATH = _RIO_HOME / ".env"
+_LOG_DIR = _RIO_HOME / "logs"
+_PID_DIR = _RIO_HOME / "pids"
+_RIO_PORTAL_URL = "https://rio.gowshik.in"
+_RIO_REGISTER_URL = f"{_RIO_PORTAL_URL}/register"
 
 # Add local/ to path for imports
 if str(_LOCAL_DIR) not in sys.path:
     sys.path.insert(0, str(_LOCAL_DIR))
 
 
+def _ensure_runtime_files() -> None:
+    """Create user-writable runtime files for packaged installs."""
+    _RIO_HOME.mkdir(parents=True, exist_ok=True)
+
+    if _CONFIG_PATH.exists():
+        return
+
+    if _DEFAULT_CONFIG_PATH.exists():
+        shutil.copy2(_DEFAULT_CONFIG_PATH, _CONFIG_PATH)
+    else:
+        _CONFIG_PATH.write_text("rio:\n", encoding="utf-8")
+
+
+def _read_api_key_from_env_file() -> str:
+    """Read GEMINI_API_KEY from ~/.rio/.env if present."""
+    if not _ENV_PATH.exists():
+        return ""
+    for line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+        if line.startswith("GEMINI_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _ensure_runtime_dirs() -> None:
+    _ensure_runtime_files()
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _PID_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pid_path(component: str) -> Path:
+    return _PID_DIR / f"{component}.pid"
+
+
+def _write_pid(component: str, pid: int) -> None:
+    _pid_path(component).write_text(str(pid), encoding="utf-8")
+
+
+def _read_pid(component: str) -> int | None:
+    path = _pid_path(component)
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _is_pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _clear_pid(component: str) -> None:
+    path = _pid_path(component)
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _stop_pid(pid: int, force: bool = False) -> bool:
+    if not _is_pid_running(pid):
+        return True
+
+    if os.name == "nt":
+        if force:
+            proc = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
+            return proc.returncode == 0
+        proc = subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, text=True)
+        return proc.returncode == 0
+
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    time.sleep(0.5)
+    return not _is_pid_running(pid)
+
+
+def _spawn_component(
+    component: str,
+    cwd: Path,
+    env: dict[str, str],
+    background: bool,
+) -> int:
+    """Start a Rio component and return its process id."""
+    log_file = _LOG_DIR / f"{component}.log"
+    log_handle = open(log_file, "a", encoding="utf-8", buffering=1)
+
+    cmd = [sys.executable, "-m", "main"]
+    kwargs: dict = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "close_fds": True,
+    }
+
+    if background:
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    log_handle.close()
+    _write_pid(component, proc.pid)
+    return int(proc.pid)
+
+
 def _load_config():
     """Load Rio configuration."""
+    _ensure_runtime_files()
     from config import RioConfig
     return RioConfig.load(_CONFIG_PATH)
 
@@ -48,6 +179,8 @@ def _save_config_value(path: str, value: str) -> None:
     Handles nested paths like 'models.primary' or 'audio.sample_rate'.
     """
     import yaml
+
+    _ensure_runtime_files()
 
     if not _CONFIG_PATH.exists():
         print(f"  [Error] Config file not found: {_CONFIG_PATH}")
@@ -118,6 +251,34 @@ def _get_config_value(path: str):
     return obj
 
 
+def _dashboard_url_from_cloud_url(cloud_url: str) -> str:
+    url = (cloud_url or "ws://localhost:8080/ws/rio/live").strip()
+    if url.startswith("wss://"):
+        base = "https://" + url[len("wss://"):]
+    elif url.startswith("ws://"):
+        base = "http://" + url[len("ws://"):]
+    elif url.startswith("https://") or url.startswith("http://"):
+        base = url
+    else:
+        base = "http://" + url
+
+    if "/ws/rio/live" in base:
+        base = base.split("/ws/rio/live", 1)[0]
+    return base.rstrip("/") + "/dashboard"
+
+
+def _needs_configure() -> bool:
+    try:
+        cfg = _load_config()
+    except Exception:
+        return True
+
+    portal_key = (getattr(cfg.portal, "api_key", "") or "").strip()
+    if not portal_key or portal_key.lower() in {"your_rio_key_here", "changeme", "todo"}:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -149,96 +310,187 @@ def cmd_config_show(args):
 
 
 def cmd_doctor(args):
-    """Handle: rio doctor — validate config, check deps, test API."""
+    """Handle: rio doctor — diagnose, auto-fix, then report unresolved issues."""
+
+    def _collect_issues(*, show_details: bool) -> list[dict]:
+        issues_local: list[dict] = []
+
+        # 1. Platform detection
+        try:
+            import platform_utils
+            importlib.reload(platform_utils)
+            if hasattr(platform_utils, "_platform_info"):
+                platform_utils._platform_info = None
+            get_missing_dependencies = platform_utils.get_missing_dependencies
+            print_platform_summary = platform_utils.print_platform_summary
+            if show_details:
+                print_platform_summary()
+            missing = get_missing_dependencies()
+            issues_local.extend(missing)
+        except ImportError:
+            if show_details:
+                print("  [!] platform_utils not available")
+
+        # 2. Config validation
+        if show_details:
+            print("\n  [Config]")
+        try:
+            config_local = _load_config()
+            config_local.validate()
+            if show_details:
+                print(f"  Config: valid ({_CONFIG_PATH})")
+                print(f"  Cloud URL: {config_local.cloud_url}")
+                print(f"  Models: primary={config_local.models.primary}, secondary={config_local.models.secondary}")
+                print(f"  Session mode: {config_local.session_mode}")
+        except Exception as exc:
+            if show_details:
+                print(f"  Config: INVALID — {exc}")
+            issues_local.append({
+                "name": "config",
+                "purpose": "Configuration file",
+                "install_cmd": f"Fix the error in {_CONFIG_PATH}",
+                "severity": "critical",
+            })
+
+        # 3. Access
+        if show_details:
+            print("\n  [Access]")
+        try:
+            config_local = _load_config()
+        except Exception:
+            config_local = None
+
+        portal_key = ""
+        if config_local is not None:
+            portal_key = (getattr(config_local.portal, "api_key", "") or "").strip()
+        if not portal_key:
+            portal_key = os.environ.get("RIO_PORTAL_API_KEY", "").strip()
+
+        if portal_key:
+            masked = f"{portal_key[:6]}...{portal_key[-4:]}" if len(portal_key) >= 10 else "(set)"
+            if show_details:
+                print(f"  Rio key: configured ({masked})")
+        else:
+            if show_details:
+                print("  Rio key: NOT SET")
+                print(f"  Register and get your key: {_RIO_REGISTER_URL}")
+            issues_local.append({
+                "name": "rio_portal_key",
+                "purpose": "Rio portal access",
+                "install_cmd": f"Register at {_RIO_REGISTER_URL} and set portal.api_key using 'rio configure'",
+                "severity": "critical",
+            })
+
+        # 4. Optional API test
+        direct_api_key = os.environ.get("GEMINI_API_KEY", "") or _read_api_key_from_env_file()
+        if args.test_api:
+            if show_details:
+                print("\n  [Direct Gemini API Test]")
+            if not direct_api_key:
+                if show_details:
+                    print("  Skipped: GEMINI_API_KEY not set (not required for normal Rio-key flow)")
+            else:
+                if show_details:
+                    print("  Testing direct Gemini API connection...")
+                try:
+                    from google import genai
+                    client = genai.Client(api_key=direct_api_key)
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents="Say 'OK' in one word.",
+                        config={"max_output_tokens": 5},
+                    )
+                    if show_details:
+                        print(f"  API test: OK (Flash responded: {response.text.strip()[:20]})")
+                except Exception as exc:
+                    if show_details:
+                        print(f"  API test: FAILED — {exc}")
+                    issues_local.append({
+                        "name": "gemini_api_optional",
+                        "purpose": "Optional direct Gemini API access",
+                        "install_cmd": "Set GEMINI_API_KEY only if you need direct local Gemini mode",
+                        "severity": "warning",
+                    })
+
+        # 5. Model availability (informational)
+        if show_details:
+            print("\n  [Models]")
+        try:
+            config_local = _load_config()
+            from model_fallback import ModelFallbackChain
+            chain = ModelFallbackChain(
+                primary=config_local.models.primary,
+                fallbacks=[config_local.models.secondary, "gemini-2.5-flash"],
+            )
+            models = chain.get_available_models()
+            if show_details:
+                print(f"  Fallback chain: {' → '.join(models)}")
+        except ImportError:
+            if show_details:
+                print("  Fallback chain: not configured")
+
+        return issues_local
+
+    def _is_fixable(issue: dict) -> bool:
+        install_cmd = str(issue.get("install_cmd", "")).strip().lower()
+        if not install_cmd:
+            return False
+        return install_cmd.startswith("pip ") or install_cmd.startswith("python -m ")
+
+    def _run_install_segment(segment: str) -> subprocess.CompletedProcess:
+        tokens = shlex.split(segment, posix=(os.name != "nt"))
+        if not tokens:
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        first = tokens[0].lower()
+        if first in {"pip", "pip3"}:
+            cmd = [sys.executable, "-m", "pip", *tokens[1:]]
+        elif first in {"python", "python3", "py"}:
+            cmd = [sys.executable, *tokens[1:]]
+        else:
+            # Fallback only for non-install commands.
+            return subprocess.run(segment, shell=True, text=True, capture_output=True)
+
+        return subprocess.run(cmd, shell=False, text=True, capture_output=True)
+
+    def _try_fix(issue: dict) -> bool:
+        cmd = str(issue.get("install_cmd", "")).strip()
+        if not cmd:
+            return False
+        print(f"    -> {issue.get('name', 'unknown')}: {cmd}")
+
+        # Support chained installers like: pip install ... && python -m ...
+        segments = [seg.strip() for seg in cmd.split("&&") if seg.strip()]
+        if not segments:
+            print("       [FAILED] empty install command")
+            return False
+
+        for segment in segments:
+            proc = _run_install_segment(segment)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip().splitlines()
+                detail = err[-1] if err else "unknown error"
+                print(f"       [FAILED] {detail}")
+                return False
+
+        print("       [OK] fixed")
+        return True
+
     print("\n  Rio Doctor — System Diagnostics")
     print("  " + "=" * 40)
 
-    issues = []
+    issues = _collect_issues(show_details=True)
 
-    # 1. Platform detection
-    try:
-        from platform_utils import get_platform, get_missing_dependencies, print_platform_summary
-        print_platform_summary()
-        missing = get_missing_dependencies()
-        issues.extend(missing)
-    except ImportError:
-        print("  [!] platform_utils not available")
+    auto_fix_enabled = not getattr(args, "no_fix", False)
+    if auto_fix_enabled and issues:
+        fixable = [i for i in issues if _is_fixable(i)]
+        if fixable:
+            print("\n  [Auto-Fix] Attempting to resolve detected issues...")
+            for issue in fixable:
+                _try_fix(issue)
+            print("\n  [Auto-Fix] Re-running diagnostics...")
+            issues = _collect_issues(show_details=False)
 
-    # 2. Config validation
-    print("\n  [Config]")
-    try:
-        config = _load_config()
-        config.validate()
-        print(f"  Config: valid ({_CONFIG_PATH})")
-        print(f"  Cloud URL: {config.cloud_url}")
-        print(f"  Models: primary={config.models.primary}, secondary={config.models.secondary}")
-        print(f"  Session mode: {config.session_mode}")
-    except Exception as exc:
-        print(f"  Config: INVALID — {exc}")
-        issues.append({
-            "name": "config",
-            "purpose": "Configuration file",
-            "install_cmd": f"Fix the error in {_CONFIG_PATH}",
-            "severity": "critical",
-        })
-
-    # 3. API key check
-    print("\n  [API]")
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    env_file = _RIO_ROOT / "cloud" / ".env"
-    if not api_key and env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("GEMINI_API_KEY="):
-                api_key = line.split("=", 1)[1].strip()
-                break
-
-    if api_key:
-        print(f"  API Key: configured ({api_key[:8]}...{api_key[-4:]})")
-
-        # Quick API test
-        if args.test_api:
-            print("  Testing API connection...")
-            try:
-                from google import genai
-                client = genai.Client(api_key=api_key)
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents="Say 'OK' in one word.",
-                    config={"max_output_tokens": 5},
-                )
-                print(f"  API test: OK (Flash responded: {response.text.strip()[:20]})")
-            except Exception as exc:
-                print(f"  API test: FAILED — {exc}")
-                issues.append({
-                    "name": "api_key",
-                    "purpose": "Gemini API access",
-                    "install_cmd": "Check your API key at https://aistudio.google.com/apikey",
-                    "severity": "critical",
-                })
-    else:
-        print("  API Key: NOT SET")
-        issues.append({
-            "name": "GEMINI_API_KEY",
-            "purpose": "Gemini API authentication",
-            "install_cmd": "Set in rio/cloud/.env or environment",
-            "severity": "critical",
-        })
-
-    # 4. Model availability
-    print("\n  [Models]")
-    try:
-        config = _load_config()
-        from model_fallback import ModelFallbackChain
-        chain = ModelFallbackChain(
-            primary=config.models.primary,
-            fallbacks=[config.models.secondary, "gemini-2.5-flash"],
-        )
-        models = chain.get_available_models()
-        print(f"  Fallback chain: {' → '.join(models)}")
-    except ImportError:
-        print(f"  Fallback chain: not configured")
-
-    # 5. Summary
     print("\n  " + "=" * 40)
     criticals = [i for i in issues if i.get("severity") == "critical"]
     errors = [i for i in issues if i.get("severity") == "error"]
@@ -262,7 +514,7 @@ def cmd_doctor(args):
             print(f"        - {i['name']}: {i['purpose']}")
 
     if not issues:
-        print("  All checks passed! Rio is ready to run.")
+        print("  ACKNOWLEDGEMENT: All detected errors were resolved. Rio is ready to run.")
     print()
 
 
@@ -275,38 +527,31 @@ def cmd_configure(args):
     import yaml
 
     config_data = {}
+    _ensure_runtime_files()
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
             config_data = raw.get("rio", raw)
 
-    # Step 1: API Key
-    print("  Step 1/5: Gemini API Key")
-    print("  Get your key at: https://aistudio.google.com/apikey")
-    current_key = ""
-    env_file = _RIO_ROOT / "cloud" / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("GEMINI_API_KEY="):
-                current_key = line.split("=", 1)[1].strip()
-                break
+    portal_cfg = config_data.setdefault("portal", {})
 
-    if current_key:
-        print(f"  Current: {current_key[:8]}...{current_key[-4:]}")
-        new_key = input("  New API key (Enter to keep current): ").strip()
-        if new_key:
-            current_key = new_key
-    else:
-        current_key = input("  API key: ").strip()
-
-    if current_key:
-        env_file.parent.mkdir(parents=True, exist_ok=True)
-        env_file.write_text(f"GEMINI_API_KEY={current_key}\n", encoding="utf-8")
-        print("  Saved to rio/cloud/.env")
+    # Step 1: Rio key (primary)
+    print("  Step 1/6: Rio Access Key")
+    print(f"  Get your key at: {_RIO_REGISTER_URL}")
+    current_portal_key = (portal_cfg.get("api_key", "") or "").strip()
+    masked_key = f"{current_portal_key[:6]}...{current_portal_key[-4:]}" if len(current_portal_key) >= 10 else "(not set)"
+    print(f"  Current RIO key: {masked_key}")
+    new_portal_key = input("  RIO key (Enter to keep current): ").strip()
+    if new_portal_key:
+        portal_cfg["api_key"] = new_portal_key
+        portal_cfg["enabled"] = True
+        print("  Rio key saved to config.")
+    elif not current_portal_key:
+        print(f"  No key set yet. Register here: {_RIO_REGISTER_URL}")
     print()
 
     # Step 2: Model Selection
-    print("  Step 2/5: Model Configuration")
+    print("  Step 2/6: Model Configuration")
     print("  Available models:")
     print("    1. gemini-2.5-flash (fast, free tier)")
     print("    2. gemini-2.5-pro-preview-03-25 (powerful, requires billing)")
@@ -325,7 +570,7 @@ def cmd_configure(args):
     print()
 
     # Step 3: Session Mode
-    print("  Step 3/5: Session Mode")
+    print("  Step 3/6: Session Mode")
     print("    live — Voice + audio (requires microphone)")
     print("    text — Text only (keyboard input)")
     current_mode = config_data.get("session_mode", "live")
@@ -336,7 +581,7 @@ def cmd_configure(args):
     print()
 
     # Step 4: Cloud URL
-    print("  Step 4/5: Cloud Server URL")
+    print("  Step 4/6: Cloud Server URL")
     current_url = config_data.get("cloud_url", "ws://localhost:8080/ws/rio/live")
     print(f"  Current: {current_url}")
     url = input("  URL (Enter for current): ").strip()
@@ -344,8 +589,29 @@ def cmd_configure(args):
         config_data["cloud_url"] = url
     print()
 
-    # Step 5: Vision Settings
-    print("  Step 5/5: Vision / Screen Mode")
+    # Step 5: Portal settings (optional)
+    print("  Step 5/6: Portal Settings")
+    current_portal_enabled = bool(portal_cfg.get("enabled", False))
+    current_portal_backend = portal_cfg.get("backend_url", "https://riocloud.gowshik.in")
+
+    print(f"  Current enabled: {current_portal_enabled}")
+    enable_answer = input("  Enable portal enforcement? [y/N] (Enter for current): ").strip().lower()
+    if enable_answer in {"y", "yes", "true", "1"}:
+        portal_cfg["enabled"] = True
+    elif enable_answer in {"n", "no", "false", "0"}:
+        portal_cfg["enabled"] = False
+
+    print(f"  Current backend: {current_portal_backend}")
+    portal_backend = input("  Portal backend URL (Enter for current): ").strip()
+    if portal_backend:
+        portal_cfg["backend_url"] = portal_backend
+
+    portal_cfg.setdefault("validate_on_startup", True)
+    portal_cfg.setdefault("timeout_seconds", 8.0)
+    print()
+
+    # Step 6: Vision Settings
+    print("  Step 6/6: Vision / Screen Mode")
     print("    on_demand — Capture screen only when asked")
     print("    autonomous — Always watching screen")
     current_vision = config_data.get("vision", {}).get("default_mode", "on_demand")
@@ -361,16 +627,162 @@ def cmd_configure(args):
 
     print("  " + "=" * 40)
     print(f"  Configuration saved to {_CONFIG_PATH}")
+    live_url = _dashboard_url_from_cloud_url(config_data.get("cloud_url", "ws://localhost:8080/ws/rio/live"))
+    print(f"  Rio is live at: {live_url}")
     print("  Run 'rio doctor' to verify your setup.")
     print()
 
 
 def cmd_run(args):
-    """Handle: rio run — start the Rio agent."""
+    """Handle: rio run — start cloud + local runtime."""
     print("  Starting Rio Agent...")
-    # Just exec the main.py
-    main_py = _LOCAL_DIR / "main.py"
-    os.execv(sys.executable, [sys.executable, str(main_py)])
+    _ensure_runtime_dirs()
+    env = os.environ.copy()
+    env.setdefault("RIO_CONFIG", str(_CONFIG_PATH))
+    if "GEMINI_API_KEY" not in env:
+        api_key = _read_api_key_from_env_file()
+        if api_key:
+            env["GEMINI_API_KEY"] = api_key
+
+    if not args.skip_configure and _needs_configure():
+        print("  Configuration required before run. Redirecting to rio configure...")
+        cmd_configure(args)
+        env["RIO_CONFIG"] = str(_CONFIG_PATH)
+
+    run_in_background = bool(args.background or (os.name == "nt" and not args.foreground))
+
+    if run_in_background:
+        cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, background=True)
+        time.sleep(1.0)
+        local_pid = _spawn_component("local", _LOCAL_DIR, env, background=True)
+        print("  Rio is running in background mode.")
+        print(f"  Cloud PID: {cloud_pid}  |  Log: {_LOG_DIR / 'cloud.log'}")
+        print(f"  Local PID: {local_pid}  |  Log: {_LOG_DIR / 'local.log'}")
+        print("  Check logs with: rio logs --component both --follow")
+        return
+
+    cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, background=True)
+    print(f"  Cloud started in background (PID {cloud_pid}).")
+    print(f"  Cloud log: {_LOG_DIR / 'cloud.log'}")
+    print("  Starting local in foreground...")
+    os.chdir(_LOCAL_DIR)
+    os.environ.update(env)
+    os.execv(sys.executable, [sys.executable, "-m", "main"])
+
+
+def _read_log_lines(path: Path, lines: int = 80) -> list[str]:
+    if not path.exists():
+        return [f"[missing] {path}\n"]
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        data = handle.readlines()
+    return data[-lines:]
+
+
+def _follow_log(path: Path) -> None:
+    if not path.exists():
+        print(f"[missing] {path}")
+        return
+
+    print(f"  Following {path} (Ctrl+C to stop)")
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                print(line.rstrip())
+            else:
+                time.sleep(0.4)
+
+
+def cmd_logs(args):
+    """Handle: rio logs — show/tail cloud and local logs."""
+    _ensure_runtime_dirs()
+    selected = args.component
+    paths: list[tuple[str, Path]] = []
+    if selected in {"cloud", "both"}:
+        paths.append(("cloud", _LOG_DIR / "cloud.log"))
+    if selected in {"local", "both"}:
+        paths.append(("local", _LOG_DIR / "local.log"))
+
+    if args.follow and selected == "both":
+        print("  Follow mode for both components is not supported in one stream.")
+        print("  Use one component at a time: rio logs --component cloud --follow")
+        print("  or: rio logs --component local --follow")
+        return
+
+    if args.follow:
+        _follow_log(paths[0][1])
+        return
+
+    for name, path in paths:
+        print(f"\n===== {name.upper()} LOG ({path}) =====")
+        for line in _read_log_lines(path, lines=args.lines):
+            print(line.rstrip())
+
+
+def cmd_status(args):
+    """Handle: rio status — show cloud/local process state from pid files."""
+    _ensure_runtime_dirs()
+    components = ["cloud", "local"] if args.component == "both" else [args.component]
+    print("\n  Rio Runtime Status")
+    print("  " + "=" * 40)
+    all_running = True
+
+    for component in components:
+        pid = _read_pid(component)
+        log_path = _LOG_DIR / f"{component}.log"
+        if pid is None:
+            all_running = False
+            print(f"  {component.upper()}: STOPPED (no pid file)")
+            print(f"    Log: {log_path}")
+            continue
+
+        running = _is_pid_running(pid)
+        all_running = all_running and running
+        state = "RUNNING" if running else "STOPPED"
+        print(f"  {component.upper()}: {state} (PID {pid})")
+        print(f"    Log: {log_path}")
+
+        if not running:
+            _clear_pid(component)
+
+    print("  " + "=" * 40)
+    if all_running:
+        print("  ACKNOWLEDGEMENT: Requested Rio component(s) are running.")
+    else:
+        print("  Some requested components are not running.")
+    print()
+
+
+def cmd_stop(args):
+    """Handle: rio stop — stop cloud/local process(es) from pid files."""
+    _ensure_runtime_dirs()
+    components = ["cloud", "local"] if args.component == "both" else [args.component]
+
+    print("\n  Stopping Rio Runtime")
+    print("  " + "=" * 40)
+    failures: list[str] = []
+
+    for component in components:
+        pid = _read_pid(component)
+        if pid is None:
+            print(f"  {component.upper()}: already stopped (no pid file)")
+            continue
+
+        ok = _stop_pid(pid, force=args.force)
+        if ok:
+            _clear_pid(component)
+            print(f"  {component.upper()}: stopped (PID {pid})")
+        else:
+            failures.append(component)
+            print(f"  {component.upper()}: failed to stop (PID {pid})")
+
+    print("  " + "=" * 40)
+    if not failures:
+        print("  ACKNOWLEDGEMENT: Requested Rio component(s) stopped.")
+    else:
+        print(f"  Failed to stop: {', '.join(failures)}")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -403,13 +815,48 @@ def build_parser() -> argparse.ArgumentParser:
     # rio doctor
     doctor_parser = subparsers.add_parser("doctor", help="Run system diagnostics")
     doctor_parser.add_argument("--test-api", action="store_true",
-                               help="Test API connectivity (makes a real API call)")
+                               help="Test optional direct Gemini API connectivity if GEMINI_API_KEY is set")
+    doctor_parser.add_argument("--no-fix", action="store_true",
+                               help="Do not auto-attempt fixes; only report issues")
 
     # rio configure
     subparsers.add_parser("configure", help="Interactive setup wizard")
 
     # rio run
-    subparsers.add_parser("run", help="Start the Rio agent")
+    run_parser = subparsers.add_parser("run", help="Start Rio cloud + local runtime")
+    run_parser.add_argument("--background", action="store_true", help="Run detached in background")
+    run_parser.add_argument("--foreground", action="store_true", help="Force foreground mode")
+    run_parser.add_argument("--skip-configure", action="store_true", help="Skip configure gate (not recommended)")
+
+    # rio logs
+    logs_parser = subparsers.add_parser("logs", help="Show or follow runtime logs")
+    logs_parser.add_argument(
+        "--component",
+        choices=["cloud", "local", "both"],
+        default="both",
+        help="Which component log to read",
+    )
+    logs_parser.add_argument("--follow", action="store_true", help="Tail logs continuously")
+    logs_parser.add_argument("--lines", type=int, default=80, help="Number of recent lines to show")
+
+    # rio status
+    status_parser = subparsers.add_parser("status", help="Show runtime status for cloud/local")
+    status_parser.add_argument(
+        "--component",
+        choices=["cloud", "local", "both"],
+        default="both",
+        help="Which component status to check",
+    )
+
+    # rio stop
+    stop_parser = subparsers.add_parser("stop", help="Stop runtime components")
+    stop_parser.add_argument(
+        "--component",
+        choices=["cloud", "local", "both"],
+        default="both",
+        help="Which component to stop",
+    )
+    stop_parser.add_argument("--force", action="store_true", help="Force kill process tree")
 
     return parser
 
@@ -437,6 +884,12 @@ def main():
         cmd_configure(args)
     elif args.command == "run":
         cmd_run(args)
+    elif args.command == "logs":
+        cmd_logs(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "stop":
+        cmd_stop(args)
     else:
         parser.print_help()
 

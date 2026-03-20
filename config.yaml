@@ -179,3 +179,4 @@ rio:
       module: rio.cloud.voice_plugins.custom_voice
   workspace_cli:
     binary: workspace-cli
+

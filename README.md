@@ -340,8 +340,20 @@ This checks: config loading, API connectivity, rate limiter, model routing, tool
 
 ### One-Line Install (Alternative)
 
+```powershell
+powershell -c "irm https://rio.gowshik.in/install.ps1 | iex"
+```
+
 ```bash
-curl -sL https://raw.githubusercontent.com/Gowshik-S/Gemini-Live-Agent/main/install.sh | bash
+curl -fsSL https://rio.gowshik.in/install.sh | bash
+```
+
+Or install directly from PyPI:
+
+```bash
+pipx install rio-agent
+# or
+python -m pip install --user rio-agent
 ```
 
 ---
@@ -429,7 +441,7 @@ The dashboard is pure static HTML/CSS/JS served directly by FastAPI — no separ
 
 ## Known Limitations
 
-- **`pip install rio-agent`** — single-command install and `rio run` CLI launch coming soon. `[Roadmap]`
+- **Installer shell PATH propagation** — after `pipx`/`pip --user` install, some shells require reopening terminal before `rio` command is available.
 - **A2A protocol** — no Agent Cards or remote agent discovery yet. `[In Progress]`
 - **pyautogui → Playwright** unification still expanding. `[In Progress]`
 - **React dashboard** planned; current UI is static HTML/JS served by FastAPI. `[In Progress]`

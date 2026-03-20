@@ -272,7 +272,7 @@ def get_missing_dependencies() -> list[dict]:
             "name": "pywinauto",
             "purpose": "Windows application automation",
             "install_cmd": "pip install pywinauto",
-            "severity": "warning",
+            "severity": "error",
         })
 
     if not plat.has_pynput:
@@ -280,16 +280,7 @@ def get_missing_dependencies() -> list[dict]:
             "name": "pynput",
             "purpose": "Keyboard hotkeys (push-to-talk, shortcuts)",
             "install_cmd": "pip install pynput>=1.7.0",
-            "severity": "warning",
-        })
-
-    # Check GEMINI_API_KEY
-    if not os.environ.get("GEMINI_API_KEY"):
-        missing.append({
-            "name": "GEMINI_API_KEY",
-            "purpose": "Gemini API authentication",
-            "install_cmd": "Set GEMINI_API_KEY in rio/cloud/.env or environment",
-            "severity": "critical",
+            "severity": "error",
         })
 
     return missing

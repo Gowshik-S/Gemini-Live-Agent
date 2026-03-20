@@ -21,6 +21,7 @@ Layer 3 (L3): voice + vision + tools client.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import signal
@@ -157,9 +158,10 @@ except ImportError:
     CreativeAgent = None
 
 try:
-    from portal_auth import validate_rio_key
+    from portal_auth import report_task_usage, validate_rio_key
 except ImportError:
     validate_rio_key = None
+    report_task_usage = None
 
 try:
     from user_pattern_model import UserPatternModel
@@ -211,6 +213,62 @@ structlog.configure(
 )
 
 log = structlog.get_logger("rio.main")
+
+
+def _module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _get_mandatory_dependency_gaps() -> list[dict[str, str]]:
+    """Return dependency gaps that are now required for full Rio runtime."""
+    gaps: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    required = [
+        ("pynput", "Keyboard hotkeys", "pip install pynput>=1.7.0"),
+        ("torch", "Voice activity detection", "pip install torch --index-url https://download.pytorch.org/whl/cpu"),
+        ("chromadb", "Long-term memory engine", "pip install chromadb"),
+        ("sentence_transformers", "Memory embeddings", "pip install sentence-transformers"),
+    ]
+
+    for module_name, purpose, install_cmd in required:
+        if not _module_available(module_name):
+            seen.add(module_name)
+            gaps.append({
+                "name": module_name,
+                "purpose": purpose,
+                "install_cmd": install_cmd,
+            })
+
+    if _PLATFORM_UTILS:
+        for dep in get_missing_dependencies():
+            dep_name = str(dep.get("name", "")).strip()
+            if dep_name and dep_name not in seen:
+                seen.add(dep_name)
+                gaps.append({
+                    "name": dep_name,
+                    "purpose": str(dep.get("purpose", "required runtime dependency")),
+                    "install_cmd": str(dep.get("install_cmd", "pip install <package>")),
+                })
+
+    return gaps
+
+
+async def _notify_mode_change(client: WSClient | None, spoken_status: str) -> None:
+    """Ask the agent to confirm hotkey-triggered mode changes out loud."""
+    if client is None or not client.is_connected:
+        return
+    try:
+        await client.send_json({
+            "type": "context",
+            "subtype": "mode_change",
+            "content": (
+                "[SYSTEM: User pressed a hotkey. Reply with exactly one short sentence confirming this mode/status update: "
+                f"{spoken_status}]"
+            ),
+        })
+    except ConnectionError:
+        pass
 
 
 def _load_cloud_env() -> Path | None:
@@ -376,12 +434,116 @@ def _is_task_request(text: str) -> bool:
     return False
 
 
+def _estimate_task_usage(task) -> tuple[int, int]:
+    """Estimate portal credit usage from completed task steps with per-tool weights."""
+    if task is None:
+        return 0, 0
+
+    tool_weights = {
+        "browser_goto": (5, 1),
+        "browser_click": (4, 1),
+        "browser_type": (4, 1),
+        "browser_search": (5, 1),
+        "smart_click": (6, 2),
+        "screen_click": (5, 2),
+        "screen_type": (4, 1),
+        "screen_hotkey": (3, 1),
+        "screen_scroll": (3, 1),
+        "screen_drag": (5, 2),
+        "open_application": (5, 1),
+        "run_command": (7, 0),
+        "patch_file": (8, 0),
+        "write_file": (7, 0),
+        "read_file": (3, 0),
+        "generate_image": (10, 0),
+        "generate_video": (18, 0),
+        "generate_text": (6, 0),
+        "capture_screen": (2, 0),
+    }
+    step_type_fallback = {
+        "browser": (5, 1),
+        "system": (5, 2),
+        "creative": (8, 0),
+        "tool": (4, 0),
+        "verify": (2, 0),
+        "": (3, 0),
+    }
+
+    done_steps = []
+    for step in getattr(task, "steps", []):
+        status_obj = getattr(step, "status", None)
+        status_value = getattr(status_obj, "value", status_obj)
+        if status_value == "done":
+            done_steps.append(step)
+    if not done_steps:
+        return 0, 0
+
+    rio_units = 0
+    cu_units = 0
+    for step in done_steps:
+        tool_name = str(getattr(step, "tool_name", "") or "").strip().lower()
+        step_type = getattr(getattr(step, "step_type", None), "value", "")
+        attempts = max(1, int(getattr(step, "attempts", 1) or 1))
+        rio_weight, cu_weight = tool_weights.get(tool_name, step_type_fallback.get(step_type, (3, 0)))
+        rio_units += rio_weight * attempts
+        cu_units += cu_weight * attempts
+
+    return max(1, rio_units), max(0, cu_units)
+
+
+async def portal_session_guard_loop(client: WSClient, portal_runtime: dict) -> None:
+    """Periodically revalidate portal session for long-running local runtime."""
+    interval = float(portal_runtime.get("revalidate_interval_seconds", 0) or 0)
+    if interval <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(interval)
+
+        if not portal_runtime.get("enabled"):
+            continue
+        if validate_rio_key is None:
+            continue
+
+        result = validate_rio_key(
+            backend_url=str(portal_runtime.get("backend_url", "")),
+            rio_api_key=str(portal_runtime.get("api_key", "")),
+            timeout_seconds=float(portal_runtime.get("timeout_seconds", 8.0) or 8.0),
+        )
+        if result.get("ok") and result.get("valid"):
+            portal_runtime["blocked"] = False
+            portal_runtime["last_validation"] = result
+            continue
+
+        portal_runtime["blocked"] = True
+        error_message = result.get("error") or "Portal session validation failed"
+        log.warning(
+            "portal.session_guard_failed",
+            status_code=result.get("status_code"),
+            error=error_message,
+        )
+        print(f"\n  Portal: ACCESS DENIED ({error_message})")
+        try:
+            await client.send_json({
+                "type": "context",
+                "subtype": "portal_session",
+                "content": (
+                    "[SYSTEM: Portal session check failed during runtime. "
+                    f"Error: {error_message}. Inform the user that autonomous tasks are paused "
+                    "until portal access is restored.]"
+                ),
+            })
+        except ConnectionError:
+            pass
+
+
 async def _run_autonomous_task(
     goal: str,
     orchestrator,
     client: WSClient,
     autonomous_mode: asyncio.Event,
     task_active: asyncio.Event,
+    portal_runtime: dict | None = None,
 ) -> None:
     """Run a task through the local orchestrator autonomously.
 
@@ -396,6 +558,32 @@ async def _run_autonomous_task(
     task_active.set()
 
     try:
+        portal_usage_note = ""
+        if portal_runtime and portal_runtime.get("enabled"):
+            if portal_runtime.get("blocked"):
+                await client.send_json({
+                    "type": "text",
+                    "content": "Portal access is currently blocked. Fix your RIO portal key/session, then retry.",
+                })
+                return
+            if validate_rio_key is not None:
+                validation = validate_rio_key(
+                    backend_url=str(portal_runtime.get("backend_url", "")),
+                    rio_api_key=str(portal_runtime.get("api_key", "")),
+                    timeout_seconds=float(portal_runtime.get("timeout_seconds", 8.0) or 8.0),
+                )
+                if not validation.get("ok") or not validation.get("valid"):
+                    portal_runtime["blocked"] = True
+                    err = validation.get("error") or "Portal validation failed"
+                    print(f"\n  Portal: ACCESS DENIED ({err})")
+                    await client.send_json({
+                        "type": "text",
+                        "content": f"Portal access denied: {err}. Autonomous task execution is paused.",
+                    })
+                    return
+                portal_runtime["blocked"] = False
+                portal_runtime["last_validation"] = validation
+
         # Handle resume of paused/active task
         if goal == "resume":
             print("\n  [Orchestrator] Resuming previous task...")
@@ -442,6 +630,38 @@ async def _run_autonomous_task(
         print(f"  [Orchestrator] Executing {len(task.steps)} steps...")
         task = await orchestrator.execute_task(task)
 
+        if (
+            portal_runtime
+            and portal_runtime.get("enabled")
+            and report_task_usage is not None
+            and getattr(task, "status", None) is not None
+            and task.status.value in {"done", "partial"}
+        ):
+            credits_used, cu_used = _estimate_task_usage(task)
+            usage_result = report_task_usage(
+                backend_url=str(portal_runtime.get("backend_url", "")),
+                rio_api_key=str(portal_runtime.get("api_key", "")),
+                credits_used=credits_used,
+                cu_used=cu_used,
+                task_description=(task.goal or goal)[:512],
+                timeout_seconds=float(portal_runtime.get("timeout_seconds", 8.0) or 8.0),
+            )
+            if usage_result.get("ok"):
+                balance = usage_result.get("new_balance") or {}
+                portal_usage_note = (
+                    f"Portal balance update: RIO={balance.get('rio', '?')} "
+                    f"CU={balance.get('computer_use', '?')}"
+                )
+                print(f"  [Portal] Usage synced. {portal_usage_note}")
+            else:
+                portal_usage_note = f"Portal usage sync failed: {usage_result.get('error') or 'unknown error'}"
+                print(f"  [Portal] {portal_usage_note}")
+                log.warning(
+                    "portal.usage_sync_failed",
+                    error=usage_result.get("error"),
+                    status_code=usage_result.get("status_code"),
+                )
+
         # Report completion
         report = orchestrator.get_progress_report()
         status = task.status.value
@@ -451,6 +671,8 @@ async def _run_autonomous_task(
             f"Summarize what was accomplished to the user. "
             f"If anything failed, explain what went wrong.]"
         )
+        if portal_usage_note:
+            completion_msg += f"\n[SYSTEM: {portal_usage_note}]"
         try:
             await client.send_json({
                 "type": "context",
@@ -694,6 +916,10 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     mode = "bidirectional" if bidirectional else "single-direction"
                     status = "ON" if enabled else "OFF"
                     print(f"  [live translation: {status} | {source_language} -> {target_language} | {mode}]")
+                    await _notify_mode_change(
+                        client,
+                        f"Live translation is now {status}, {source_language} to {target_language}, {mode}.",
+                    )
                     print("  You: ", end="", flush=True)
 
             elif msg_type == "dashboard":
@@ -1270,6 +1496,7 @@ async def mute_pause_toggle_loop(
     trigger: "PushToTalk",
     mic_pause_until: list[float],
     mic_muted_state: list[bool],
+    client: WSClient | None = None,
 ) -> None:
     """Toggle microphone mute state with a single hotkey (F3)."""
 
@@ -1282,12 +1509,14 @@ async def mute_pause_toggle_loop(
 
             log.info("f3.toggle", muted=True)
             print("\n  [F3: mic muted]")
+            await _notify_mode_change(client, "Microphone mode is now muted.")
         else:
             mic_muted_state[0] = False
             mic_pause_until[0] = 0.0
 
             log.info("f3.toggle", muted=False)
             print("\n  [F3: mic unmuted]")
+            await _notify_mode_change(client, "Microphone mode is now unmuted.")
 
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
@@ -1326,6 +1555,8 @@ async def task_status_hotkey_loop(
             except ConnectionError:
                 pass
 
+            await _notify_mode_change(client, "Task status mode update delivered.")
+
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
 
@@ -1337,6 +1568,7 @@ async def task_status_hotkey_loop(
 async def screen_mode_toggle_loop(
     trigger: "PushToTalk",
     autonomous_mode: asyncio.Event,
+    client: WSClient | None = None,
 ) -> None:
     """Wait for the screen-mode hotkey (F5) and toggle autonomous mode.
 
@@ -1357,6 +1589,7 @@ async def screen_mode_toggle_loop(
             log.info("screen_mode.toggled", mode="autonomous")
 
         print(f"\n  [screen mode: {mode_label}]")
+        await _notify_mode_change(client, f"Screen mode is now {mode_label}.")
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
 
@@ -1414,6 +1647,7 @@ async def live_mode_toggle_loop(
                     })
                 except ConnectionError:
                     pass
+            await _notify_mode_change(client, "Live mode is now ON.")
         else:
             autonomous_mode.clear()
             if wake_word is not None and wake_word.available:
@@ -1435,6 +1669,7 @@ async def live_mode_toggle_loop(
                     })
                 except ConnectionError:
                     pass
+            await _notify_mode_change(client, "Live mode is now OFF.")
 
         print("  You: ", end="", flush=True)
         await trigger.wait_for_release()
@@ -1457,6 +1692,7 @@ async def live_translation_toggle_loop(
                 "action": "translator_toggle",
             })
             print("\n  [live translation toggle requested]")
+            await _notify_mode_change(client, "Live translation toggle requested.")
         except ConnectionError:
             print("\n  [live translation toggle failed — not connected]")
 
@@ -1473,7 +1709,8 @@ async def input_loop(client: WSClient, struggle_detector=None,
                      pattern_model=None, ml_manager=None,
                      orchestrator=None,
                      autonomous_mode: asyncio.Event | None = None,
-                     task_active: asyncio.Event | None = None) -> None:
+                     task_active: asyncio.Event | None = None,
+                     portal_runtime: dict | None = None) -> None:
     """Read user text from stdin and send to the cloud.
 
     Task requests are detected and routed through the local orchestrator
@@ -1519,6 +1756,7 @@ async def input_loop(client: WSClient, struggle_detector=None,
                         "resume", orchestrator, client,
                         autonomous_mode or asyncio.Event(),
                         task_active or asyncio.Event(),
+                        portal_runtime=portal_runtime,
                     ),
                     name="autonomous_task",
                 )
@@ -1583,6 +1821,7 @@ async def input_loop(client: WSClient, struggle_detector=None,
                 _run_autonomous_task(
                     goal, orchestrator, client,
                     autonomous_mode, task_active,
+                    portal_runtime=portal_runtime,
                 ),
                 name="autonomous_task",
             )
@@ -1612,6 +1851,9 @@ async def struggle_detection_loop(
     ocr_engine=None,
     memory_store=None,
     orchestrator=None,
+    autonomous_mode: asyncio.Event | None = None,
+    task_active: asyncio.Event | None = None,
+    portal_runtime: dict | None = None,
 ) -> None:
     """Periodically evaluate struggle signals and trigger proactive help.
 
@@ -1648,7 +1890,17 @@ async def struggle_detection_loop(
                     "identify the error or problem visible, and suggest or implement a fix. "
                     "If you can see a specific error message, address it directly."
                 )
-                asyncio.create_task(orchestrator.run(diagnostic_goal))
+                asyncio.create_task(
+                    _run_autonomous_task(
+                        diagnostic_goal,
+                        orchestrator,
+                        client,
+                        autonomous_mode or asyncio.Event(),
+                        task_active or asyncio.Event(),
+                        portal_runtime=portal_runtime,
+                    ),
+                    name="struggle_auto_takeover_task",
+                )
             except Exception:
                 log.exception("struggle_loop.auto_takeover_failed")
 
@@ -2005,6 +2257,22 @@ async def main() -> None:
         portal_timeout = float(os.environ.get("RIO_PORTAL_TIMEOUT_SECONDS", str(config.portal.timeout_seconds)) or 8.0)
     except ValueError:
         portal_timeout = 8.0
+    try:
+        portal_revalidate_interval = float(
+            os.environ.get("RIO_PORTAL_REVALIDATE_INTERVAL_SECONDS", "300") or 300,
+        )
+    except ValueError:
+        portal_revalidate_interval = 300.0
+
+    portal_runtime: dict[str, object] = {
+        "enabled": portal_enabled,
+        "backend_url": portal_backend_url,
+        "api_key": portal_api_key,
+        "timeout_seconds": portal_timeout,
+        "revalidate_interval_seconds": portal_revalidate_interval,
+        "blocked": False,
+        "last_validation": None,
+    }
 
     if portal_enabled and portal_validate_on_startup:
         if validate_rio_key is None:
@@ -2021,6 +2289,7 @@ async def main() -> None:
             )
             if not portal_result.get("ok") or not portal_result.get("valid"):
                 error_message = portal_result.get("error") or "Portal validation failed"
+                portal_runtime["blocked"] = True
                 print(f"  Portal: ACCESS DENIED ({error_message})")
                 log.error(
                     "portal.validation_failed",
@@ -2032,6 +2301,7 @@ async def main() -> None:
 
             tier = portal_result.get("tier") or "unknown"
             credits = portal_result.get("credits") or {}
+            portal_runtime["last_validation"] = portal_result
             print(
                 f"  Portal: key validated ({tier}) "
                 f"RIO={credits.get('rio', '?')} CU={credits.get('computer_use', '?')}"
@@ -2061,11 +2331,20 @@ async def main() -> None:
         print_platform_summary()
         missing = get_missing_dependencies()
         if missing:
-            print(f"\n  [!] {len(missing)} missing optional dep(s):")
+            print(f"\n  [!] {len(missing)} missing dependency(ies):")
             for dep in missing:
                 print(f"      - {dep['name']}: {dep['purpose']}")
                 print(f"        Install: {dep['install_cmd']}")
             print()
+
+    mandatory_gaps = _get_mandatory_dependency_gaps()
+    if mandatory_gaps:
+        print("  [FATAL] Rio requires all dependencies; optional mode is disabled.")
+        for dep in mandatory_gaps:
+            print(f"      - {dep['name']}: {dep['purpose']}")
+            print(f"        Install: {dep['install_cmd']}")
+        print("  Aborting startup until all required dependencies are installed.")
+        raise SystemExit(1)
 
     # -- Initialize audio capture ------------------------------------------
     capture: AudioCapture | None = None
@@ -2640,10 +2919,17 @@ async def main() -> None:
                    pattern_model=pattern_model, ml_manager=ml_manager,
                    orchestrator=orchestrator,
                    autonomous_mode=autonomous_mode,
-                   task_active=task_active),
+                   task_active=task_active,
+                   portal_runtime=portal_runtime),
         name="input",
     ))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))
+
+    if portal_enabled and portal_api_key and validate_rio_key is not None:
+        tasks.add(asyncio.create_task(
+            portal_session_guard_loop(client, portal_runtime),
+            name="portal_session_guard",
+        ))
 
     if capture is not None:
         tasks.add(asyncio.create_task(
@@ -2686,6 +2972,7 @@ async def main() -> None:
                 screenshot_trigger,
                 mic_pause_until,
                 mic_muted_state,
+                client=client,
             ),
             name="mute_pause_toggle",
         ))
@@ -2699,8 +2986,17 @@ async def main() -> None:
     # L4: Struggle detection loop
     if struggle_detector is not None and screen is not None:
         tasks.add(asyncio.create_task(
-            struggle_detection_loop(client, screen, struggle_detector, ocr_engine,
-                                    memory_store, orchestrator=orchestrator),
+            struggle_detection_loop(
+                client,
+                screen,
+                struggle_detector,
+                ocr_engine,
+                memory_store,
+                orchestrator=orchestrator,
+                autonomous_mode=autonomous_mode,
+                task_active=task_active,
+                portal_runtime=portal_runtime,
+            ),
             name="struggle",
         ))
 
@@ -2718,7 +3014,7 @@ async def main() -> None:
         screen_mode_trigger.start(asyncio.get_running_loop())
         print(f"  [press {config.hotkeys.screen_mode.upper()} to toggle screen mode]")
         tasks.add(asyncio.create_task(
-            screen_mode_toggle_loop(screen_mode_trigger, autonomous_mode),
+            screen_mode_toggle_loop(screen_mode_trigger, autonomous_mode, client=client),
             name="screen_mode",
         ))
 
