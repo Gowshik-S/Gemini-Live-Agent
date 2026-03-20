@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rio-agent"
+version = "0.9.0"
+description = "Rio Agent: voice-first autonomous assistant with local and cloud runtimes"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Gowshik S" }
+]
+keywords = ["rio", "agent", "gemini", "automation", "voice"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent"
+]
+license = "MIT"
+dependencies = [
+  "pyyaml>=6.0",
+  "structlog>=24.0.0",
+  "python-dotenv>=1.0.0",
+  "google-genai>=1.0.0"
+]
+
+[project.optional-dependencies]
+cloud = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.34.0",
+  "websockets>=14.0"
+]
+local = [
+  "websockets>=14.0",
+  "sounddevice>=0.5.0",
+  "numpy>=1.24.0",
+  "scipy>=1.11.0",
+  "torch>=2.0.0",
+  "PyAudio>=0.2.14",
+  "pynput>=1.7.0",
+  "pyautogui>=0.9.54",
+  "pygetwindow>=0.0.9",
+  "pyperclip>=1.8.2",
+  "mss>=9.0.0",
+  "Pillow>=10.0.0",
+  "rapidocr-onnxruntime>=1.2.0",
+  "vosk>=0.3.45",
+  "scikit-learn>=1.3.0",
+  "playwright>=1.40.0",
+  "pywinauto>=0.6.8",
+  "google-api-python-client>=2.0.0"
+]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "build>=1.2.0",
+  "twine>=5.0.0"
+]
+
+[project.scripts]
+rio = "cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rio", "rio.*"]
+exclude = ["rio.venv", "rio.venv.*"]
+
+[tool.setuptools.package-data]
+rio = [
+  "config.yaml",
+  "cloud/service.yaml",
+  "modes/*.yaml",
+  "skills/*.yaml",
+  "ui/dashboard/*.html",
+  "ui/dashboard/css/*.css",
+  "ui/dashboard/js/*.js"
+]
