@@ -80,7 +80,7 @@ local = [
   "config.yaml",
   "modes/*.yaml",
   "skills/*.yaml",
-  "ui/dashboard/*.html",`
+  "ui/dashboard/*.html",
   "ui/dashboard/css/*.css",
   "ui/dashboard/js/*.js"
 ]
