@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rio-agent"
-version = "0.9.11"
+version = "0.9.12"
 description = "Rio Agent: voice-first autonomous assistant with local and cloud runtimes"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 authors = [
   { name = "Gowshik S" }
 ]
@@ -16,7 +16,6 @@ classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
   "Operating System :: OS Independent"
 ]
 license = "MIT"

@@ -6,7 +6,7 @@ REM  Usage:
 REM    Double-click setup.bat   OR   run from cmd:  setup.bat
 REM
 REM  What it does:
-REM    1. Checks Python 3.11+ is installed
+REM    1. Ensures Python 3.11 is installed (auto-installs via winget when missing)
 REM    2. Creates cloud\venv and installs cloud dependencies
 REM    3. Creates local\venv and installs local dependencies (incl. PyTorch CPU)
 REM    4. Prompts for GEMINI_API_KEY and writes cloud\.env
@@ -44,48 +44,51 @@ echo.
 REM ---------------------------------------------------------------------------
 REM  Step 0 — Check Python
 REM ---------------------------------------------------------------------------
-echo [1/7] Checking Python installation...
+echo [1/7] Checking Python 3.11 installation...
 
-where python >nul 2>&1
-if %ERRORLEVEL% neq 0 (
+set "PYTHON_EXE="
+for /f "usebackq delims=" %%P in (`py -3.11 -c "import sys; print(sys.executable)" 2^>nul`) do set "PYTHON_EXE=%%P"
+
+if "%PYTHON_EXE%"=="" (
+    where winget >nul 2>&1
+    if %ERRORLEVEL% equ 0 (
+        echo   Python 3.11 not found. Installing via winget...
+        winget install -e --id Python.Python.3.11 --accept-package-agreements --accept-source-agreements
+        for /f "usebackq delims=" %%P in (`py -3.11 -c "import sys; print(sys.executable)" 2^>nul`) do set "PYTHON_EXE=%%P"
+    )
+)
+
+if "%PYTHON_EXE%"=="" (
     echo.
-    echo ERROR: Python not found in PATH.
-    echo   Install Python 3.11+ from https://www.python.org/downloads/
-    echo   Make sure to check "Add Python to PATH" during installation.
+    echo ERROR: Python 3.11 not available.
+    echo   Install Python 3.11 from https://www.python.org/downloads/release/python-3119/
     echo.
     pause
     exit /b 1
 )
 
-REM Get Python version
-for /f "tokens=2 delims= " %%V in ('python --version 2^>^&1') do set "PY_VERSION=%%V"
-echo   Found Python %PY_VERSION%
+for /f "tokens=2 delims= " %%V in ('"%PYTHON_EXE%" --version 2^>^&1') do set "PY_VERSION=%%V"
+echo   Using Python %PY_VERSION% at %PYTHON_EXE%
 
-REM Basic version check (major.minor)
 for /f "tokens=1,2 delims=." %%A in ("%PY_VERSION%") do (
     set "PY_MAJOR=%%A"
     set "PY_MINOR=%%B"
 )
 
-if !PY_MAJOR! lss 3 (
-    echo ERROR: Python 3.10+ required. Found Python %PY_VERSION%.
-    pause
-    exit /b 1
-)
-if !PY_MAJOR! equ 3 if !PY_MINOR! lss 11 (
-    echo ERROR: Python 3.11+ required. Found Python %PY_VERSION%.
+if not "!PY_MAJOR!.!PY_MINOR!"=="3.11" (
+    echo ERROR: Python 3.11.x required. Found Python %PY_VERSION%.
     pause
     exit /b 1
 )
 
-echo   Python version OK.
+echo   Python 3.11 OK.
 echo.
 
 REM ---------------------------------------------------------------------------
 REM  Step 1 — Upgrade pip globally
 REM ---------------------------------------------------------------------------
 echo [2/7] Upgrading pip...
-python -m pip install --upgrade pip --quiet
+"%PYTHON_EXE%" -m pip install --upgrade pip --quiet
 echo   pip upgraded.
 echo.
 
@@ -104,7 +107,7 @@ if exist "%CLOUD_DIR%\venv" (
     echo   Cloud venv already exists, skipping creation.
 ) else (
     echo   Creating cloud\venv...
-    python -m venv "%CLOUD_DIR%\venv"
+    "%PYTHON_EXE%" -m venv "%CLOUD_DIR%\venv"
     if %ERRORLEVEL% neq 0 (
         echo ERROR: Failed to create cloud virtual environment.
         pause
@@ -140,7 +143,7 @@ if exist "%LOCAL_DIR%\venv" (
     echo   Local venv already exists, skipping creation.
 ) else (
     echo   Creating local\venv...
-    python -m venv "%LOCAL_DIR%\venv"
+    "%PYTHON_EXE%" -m venv "%LOCAL_DIR%\venv"
     if %ERRORLEVEL% neq 0 (
         echo ERROR: Failed to create local virtual environment.
         pause

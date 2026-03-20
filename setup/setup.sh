@@ -6,7 +6,7 @@
 #    chmod +x setup.sh && ./setup.sh
 #
 #  What it does:
-#    1. Checks Python 3.11+ is installed
+#    1. Ensures Python 3.11 is installed (best-effort auto-install)
 #    2. Creates cloud/venv and installs cloud dependencies
 #    3. Creates local/venv and installs local dependencies (incl. PyTorch CPU)
 #    4. Prompts for GEMINI_API_KEY and writes cloud/.env
@@ -112,18 +112,35 @@ EOF
 # ---------------------------------------------------------------------------
 #  Step 0 — Find Python 3.11+
 # ---------------------------------------------------------------------------
-echo "[1/7] Checking Python installation..."
+echo "[1/7] Checking Python 3.11 installation..."
 
-# Try python3 first, then python
-if command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
-elif command -v python &>/dev/null; then
-    PYTHON_CMD="python"
-else
+PYTHON_CMD=""
+if command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_CMD="python3.11"
+fi
+
+if [[ -z "$PYTHON_CMD" ]]; then
+    echo "  Python 3.11 not found. Attempting automatic install..."
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update || true
+        sudo apt-get install -y python3.11 python3.11-venv || true
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y python3.11 python3.11-devel || true
+    elif command -v yum >/dev/null 2>&1; then
+        sudo yum install -y python3.11 || true
+    elif command -v brew >/dev/null 2>&1; then
+        brew install python@3.11 || true
+    fi
+fi
+
+if command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_CMD="python3.11"
+fi
+
+if [[ -z "$PYTHON_CMD" ]]; then
     echo ""
-    echo "ERROR: Python not found."
-    echo "  Install Python 3.11+ from https://www.python.org/downloads/"
-    echo "  or via your package manager (e.g. sudo apt install python3 python3-venv)"
+    echo "ERROR: Python 3.11 not found."
+    echo "  Install Python 3.11 and rerun setup."
     exit 1
 fi
 
@@ -131,14 +148,14 @@ PY_VERSION=$($PYTHON_CMD --version 2>&1 | awk '{print $2}')
 PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
 PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
 
-echo "  Found $PYTHON_CMD $PY_VERSION"
+echo "  Using $PYTHON_CMD $PY_VERSION"
 
-if [[ "$PY_MAJOR" -lt 3 ]] || { [[ "$PY_MAJOR" -eq 3 ]] && [[ "$PY_MINOR" -lt 11 ]]; }; then
-    echo "ERROR: Python 3.11+ required. Found $PY_VERSION."
+if [[ "$PY_MAJOR" -ne 3 ]] || [[ "$PY_MINOR" -ne 11 ]]; then
+    echo "ERROR: Python 3.11.x required. Found $PY_VERSION."
     exit 1
 fi
 
-echo "  Python version OK."
+echo "  Python 3.11 OK."
 echo ""
 
 # ---------------------------------------------------------------------------

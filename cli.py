@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import os
 import shlex
@@ -45,6 +46,8 @@ _PID_DIR = _RIO_HOME / "pids"
 _VENV_DIR = _RIO_HOME / "venv"
 _RIO_PORTAL_URL = "https://rio.gowshik.in"
 _RIO_REGISTER_URL = f"{_RIO_PORTAL_URL}/register"
+_REQUIRED_PYTHON_MAJOR = 3
+_REQUIRED_PYTHON_MINOR = 11
 
 # Add local/ to path for imports
 if str(_LOCAL_DIR) not in sys.path:
@@ -62,6 +65,125 @@ def _ensure_runtime_files() -> None:
         shutil.copy2(_DEFAULT_CONFIG_PATH, _CONFIG_PATH)
     else:
         _CONFIG_PATH.write_text("rio:\n", encoding="utf-8")
+
+
+def _ensure_supported_python() -> None:
+    if (sys.version_info.major, sys.version_info.minor) == (_REQUIRED_PYTHON_MAJOR, _REQUIRED_PYTHON_MINOR):
+        return
+
+    current = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    required = f"{_REQUIRED_PYTHON_MAJOR}.{_REQUIRED_PYTHON_MINOR}.x"
+    print(f"  [Error] Rio requires Python {required}. Detected: Python {current}.")
+
+    target = _find_python_311_launcher()
+    if target is None:
+        print("  Python 3.11 not found. Attempting automatic installation...")
+        _attempt_install_python_311()
+        target = _find_python_311_launcher()
+
+    if target is None:
+        print("  [Error] Automatic Python 3.11 install did not complete.")
+        print("  Fix: install Python 3.11 manually and re-run rio.")
+        raise SystemExit(1)
+
+    if not _install_rio_into_target_python(target):
+        print("  [Error] Failed to install rio-agent into Python 3.11.")
+        print("  Fix: run 'py -3.11 -m pip install --upgrade rio-agent' and retry.")
+        raise SystemExit(1)
+
+    cmd = [*target, str(_SCRIPT_DIR / "cli.py"), *sys.argv[1:]]
+    print(f"  Relaunching Rio with Python 3.11: {' '.join(cmd)}")
+    proc = subprocess.run(cmd)
+    raise SystemExit(proc.returncode)
+
+
+def _install_rio_into_target_python(target_python: list[str]) -> bool:
+    spec = _rio_install_spec()
+    cmd = [*target_python, "-m", "pip", "install", "--upgrade", spec]
+    print(f"  Ensuring rio-agent is installed in Python 3.11: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, check=False)
+    return proc.returncode == 0
+
+
+def _rio_install_spec() -> str:
+    try:
+        version = importlib_metadata.version("rio-agent")
+        return f"rio-agent=={version}"
+    except Exception:
+        pass
+
+    if (_RIO_ROOT / "pyproject.toml").exists():
+        return str(_RIO_ROOT)
+
+    return "rio-agent"
+
+
+def _is_python_311_command(command: list[str]) -> bool:
+    try:
+        proc = subprocess.run(
+            [*command, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "3.11"
+
+
+def _find_python_311_launcher() -> list[str] | None:
+    candidates: list[list[str]] = []
+
+    if os.name == "nt" and shutil.which("py"):
+        candidates.append(["py", "-3.11"])
+
+    for exe in ("python3.11", "python3", "python"):
+        resolved = shutil.which(exe)
+        if resolved:
+            candidates.append([resolved])
+
+    for candidate in candidates:
+        if _is_python_311_command(candidate):
+            return candidate
+    return None
+
+
+def _attempt_install_python_311() -> None:
+    commands: list[list[str]] = []
+
+    if os.name == "nt":
+        if shutil.which("winget"):
+            commands.append([
+                "winget",
+                "install",
+                "-e",
+                "--id",
+                "Python.Python.3.11",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ])
+        if shutil.which("choco"):
+            commands.append(["choco", "install", "python311", "-y"])
+    elif sys.platform == "darwin":
+        if shutil.which("brew"):
+            commands.append(["brew", "install", "python@3.11"])
+    else:
+        if shutil.which("apt-get"):
+            commands.append(["sudo", "apt-get", "update"])
+            commands.append(["sudo", "apt-get", "install", "-y", "python3.11", "python3.11-venv"])
+        if shutil.which("dnf"):
+            commands.append(["sudo", "dnf", "install", "-y", "python3.11", "python3.11-devel"])
+        if shutil.which("yum"):
+            commands.append(["sudo", "yum", "install", "-y", "python3.11"])
+
+    for cmd in commands:
+        try:
+            print(f"  Running: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, check=False)
+            if proc.returncode == 0 and _find_python_311_launcher() is not None:
+                return
+        except OSError:
+            continue
 
 
 def _read_api_key_from_env_file() -> str:
@@ -937,6 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    _ensure_supported_python()
     parser = build_parser()
     args = parser.parse_args()
 
