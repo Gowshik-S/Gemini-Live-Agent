@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rio-agent"
-version = "0.9.12"
+version = "0.9.13"
 description = "Rio Agent: voice-first autonomous assistant with local and cloud runtimes"
 readme = "README.md"
 requires-python = "==3.11.*"
