@@ -65,19 +65,22 @@ rio = "cli:main"
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rio", "rio.*"]
-exclude = ["rio.venv", "rio.venv.*"]
+include = ["cloud", "cloud.*", "local", "local.*", "ml", "ml.*"]
+exclude = ["venv", "venv.*", "local.venv", "local.venv.*", "local.venv*", "tests", "tests.*"]
 
 [tool.setuptools.package-data]
-rio = [
+cloud = [
+  "service.yaml"
+]
+local = [
   "config.yaml",
-  "cloud/service.yaml",
   "modes/*.yaml",
   "skills/*.yaml",
-  "ui/dashboard/*.html",
+  "ui/dashboard/*.html",`
   "ui/dashboard/css/*.css",
   "ui/dashboard/js/*.js"
 ]
