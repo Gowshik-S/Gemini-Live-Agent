@@ -19,6 +19,7 @@ Entry point: `python -m rio.cli` or installed as `rio` command.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -41,6 +42,7 @@ _CONFIG_PATH = Path(os.environ.get("RIO_CONFIG", _RIO_HOME / "config.yaml")).exp
 _ENV_PATH = _RIO_HOME / ".env"
 _LOG_DIR = _RIO_HOME / "logs"
 _PID_DIR = _RIO_HOME / "pids"
+_VENV_DIR = _RIO_HOME / "venv"
 _RIO_PORTAL_URL = "https://rio.gowshik.in"
 _RIO_REGISTER_URL = f"{_RIO_PORTAL_URL}/register"
 
@@ -76,6 +78,72 @@ def _ensure_runtime_dirs() -> None:
     _ensure_runtime_files()
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _PID_DIR.mkdir(parents=True, exist_ok=True)
+    _VENV_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _venv_python_path(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _venv_stamp_path(venv_dir: Path) -> Path:
+    return venv_dir / ".rio_requirements_stamp"
+
+
+def _requirements_stamp(requirements_path: Path) -> str:
+    content = requirements_path.read_text(encoding="utf-8", errors="replace")
+    payload = f"{sys.version_info.major}.{sys.version_info.minor}|{content}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ensure_component_venv(component: str, component_dir: Path) -> Path:
+    """Create/update a per-component venv under ~/.rio/venv and return its Python path."""
+    requirements_path = component_dir / "requirements.txt"
+    if not requirements_path.exists():
+        return Path(sys.executable)
+
+    venv_dir = _VENV_DIR / component
+    venv_python = _venv_python_path(venv_dir)
+    expected_stamp = _requirements_stamp(requirements_path)
+    stamp_path = _venv_stamp_path(venv_dir)
+    force_rebuild = os.environ.get("RIO_REBUILD_VENV", "").strip() in {"1", "true", "True", "yes", "YES"}
+
+    if not venv_python.exists():
+        print(f"  Creating {component} runtime venv at {venv_dir}...")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+
+    current_stamp = ""
+    if stamp_path.exists():
+        current_stamp = stamp_path.read_text(encoding="utf-8", errors="replace").strip()
+
+    if force_rebuild or current_stamp != expected_stamp:
+        print(f"  Installing {component} dependencies...")
+        subprocess.run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], check=True)
+        subprocess.run([str(venv_python), "-m", "pip", "install", "-r", str(requirements_path)], check=True)
+        stamp_path.write_text(expected_stamp, encoding="utf-8")
+
+    return venv_python
+
+
+def _bootstrap_runtime_venvs() -> dict[str, Path]:
+    auto_venv = os.environ.get("RIO_AUTO_VENV", "1").strip().lower() not in {"0", "false", "no"}
+    if not auto_venv:
+        return {
+            "cloud": Path(sys.executable),
+            "local": Path(sys.executable),
+        }
+
+    try:
+        return {
+            "cloud": _ensure_component_venv("cloud", _CLOUD_DIR),
+            "local": _ensure_component_venv("local", _LOCAL_DIR),
+        }
+    except subprocess.CalledProcessError as exc:
+        print("  [Error] Failed to initialize runtime virtual environments.")
+        print(f"  Command failed with exit code {exc.returncode}.")
+        print("  Fix: run setup/setup.sh (Linux/macOS) or setup/setup.bat (Windows), or set RIO_AUTO_VENV=0 to bypass.")
+        raise SystemExit(1)
 
 
 def _pid_path(component: str) -> Path:
@@ -137,13 +205,14 @@ def _spawn_component(
     component: str,
     cwd: Path,
     env: dict[str, str],
+    python_executable: Path,
     background: bool,
 ) -> int:
     """Start a Rio component and return its process id."""
     log_file = _LOG_DIR / f"{component}.log"
     log_handle = open(log_file, "a", encoding="utf-8", buffering=1)
 
-    cmd = [sys.executable, "-m", "main"]
+    cmd = [str(python_executable), "-m", "main"]
     kwargs: dict = {
         "cwd": str(cwd),
         "env": env,
@@ -647,6 +716,8 @@ def cmd_run(args):
         if api_key:
             env["GEMINI_API_KEY"] = api_key
 
+    runtimes = _bootstrap_runtime_venvs()
+
     if not args.skip_configure and _needs_configure():
         print("  Configuration required before run. Redirecting to rio configure...")
         cmd_configure(args)
@@ -655,22 +726,23 @@ def cmd_run(args):
     run_in_background = bool(args.background or (os.name == "nt" and not args.foreground))
 
     if run_in_background:
-        cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, background=True)
+        cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
         time.sleep(1.0)
-        local_pid = _spawn_component("local", _LOCAL_DIR, env, background=True)
+        local_pid = _spawn_component("local", _LOCAL_DIR, env, runtimes["local"], background=True)
         print("  Rio is running in background mode.")
         print(f"  Cloud PID: {cloud_pid}  |  Log: {_LOG_DIR / 'cloud.log'}")
         print(f"  Local PID: {local_pid}  |  Log: {_LOG_DIR / 'local.log'}")
         print("  Check logs with: rio logs --component both --follow")
         return
 
-    cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, background=True)
+    cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
     print(f"  Cloud started in background (PID {cloud_pid}).")
     print(f"  Cloud log: {_LOG_DIR / 'cloud.log'}")
     print("  Starting local in foreground...")
     os.chdir(_LOCAL_DIR)
     os.environ.update(env)
-    os.execv(sys.executable, [sys.executable, "-m", "main"])
+    local_python = str(runtimes["local"])
+    os.execv(local_python, [local_python, "-m", "main"])
 
 
 def _read_log_lines(path: Path, lines: int = 80) -> list[str]:

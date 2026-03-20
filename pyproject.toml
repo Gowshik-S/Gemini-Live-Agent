@@ -23,6 +23,7 @@ license = "MIT"
 dependencies = [
   "pyyaml>=6.0",
   "structlog>=24.0.0",
+  "colorama>=0.4.6; platform_system == 'Windows'",
   "python-dotenv>=1.0.0",
   "google-genai>=1.0.0"
 ]
@@ -64,23 +65,33 @@ dev = [
 rio = "cli:main"
 
 [tool.setuptools]
-include-package-data = true
+include-package-data = false
 py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cloud", "cloud.*", "local", "local.*", "ml", "ml.*"]
-exclude = ["venv", "venv.*", "local.venv", "local.venv.*", "local.venv*", "tests", "tests.*"]
+exclude = [
+  "venv",
+  "venv.*",
+  "local.venv",
+  "local.venv.*",
+  "local.venv*",
+  "local.*.site-packages*",
+  "tests",
+  "tests.*"
+]
 
 [tool.setuptools.package-data]
 cloud = [
-  "service.yaml"
+  "service.yaml",
+  "requirements.txt"
 ]
 local = [
-  "config.yaml",
-  "modes/*.yaml",
-  "skills/*.yaml",
-  "ui/dashboard/*.html",`
-  "ui/dashboard/css/*.css",
-  "ui/dashboard/js/*.js"
+  "requirements.txt",
+  "config.yaml"
 ]
+
+[tool.setuptools.exclude-package-data]
+cloud = ["venv/*", "venv/**/*"]
+local = ["venv/*", "venv/**/*"]

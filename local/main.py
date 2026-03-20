@@ -197,6 +197,10 @@ except ImportError:
 # Structlog configuration
 # ---------------------------------------------------------------------------
 
+_use_color_logs = True
+if os.name == "nt" and importlib.util.find_spec("colorama") is None:
+    _use_color_logs = False
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -204,7 +208,7 @@ structlog.configure(
         structlog.processors.StackInfoRenderer(),
         structlog.dev.set_exc_info,
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
-        structlog.dev.ConsoleRenderer(colors=True),
+        structlog.dev.ConsoleRenderer(colors=_use_color_logs),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(0),  # show DEBUG+
     context_class=dict,

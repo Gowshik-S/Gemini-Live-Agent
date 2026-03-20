@@ -1,0 +1,23 @@
+include README.md
+include pyproject.toml
+include config.yaml
+
+recursive-include cloud *.py *.yaml requirements.txt
+recursive-include local *.py requirements.txt
+recursive-include ml *.py
+
+recursive-include ui/dashboard *.html
+recursive-include ui/dashboard/css *.css
+recursive-include ui/dashboard/js *.js
+recursive-include modes *.yaml
+recursive-include skills *.yaml
+
+prune venv
+prune .venv
+prune local/venv
+prune cloud/venv
+prune build
+prune dist
+prune tests
+prune __pycache__
+prune rio_agent-0.9.11
