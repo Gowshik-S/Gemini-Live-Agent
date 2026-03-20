@@ -531,7 +531,10 @@ def cmd_configure(args):
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
-            config_data = raw.get("rio", raw)
+            if not isinstance(raw, dict):
+                raw = {}
+            section = raw.get("rio", raw)
+            config_data = section if isinstance(section, dict) else {}
 
     portal_cfg = config_data.setdefault("portal", {})
 
