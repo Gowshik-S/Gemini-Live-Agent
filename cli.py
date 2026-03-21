@@ -196,6 +196,72 @@ def _read_api_key_from_env_file() -> str:
     return ""
 
 
+def _looks_like_gemini_api_key(value: str) -> bool:
+    key = (value or "").strip()
+    return key.startswith("AIza") and len(key) >= 20
+
+
+def _read_portal_key_from_config() -> str:
+    """Read portal.api_key from runtime config yaml without strict schema dependency."""
+    try:
+        import yaml
+    except Exception:
+        return ""
+
+    if not _CONFIG_PATH.exists():
+        return ""
+
+    try:
+        raw = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict):
+            return ""
+        section = raw.get("rio", raw)
+        if not isinstance(section, dict):
+            return ""
+        portal = section.get("portal", {})
+        if not isinstance(portal, dict):
+            return ""
+        return str(portal.get("api_key", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_runtime_gemini_api_key() -> tuple[str, str]:
+    """Resolve Gemini API key for local cloud runtime.
+
+    Returns:
+        tuple[key, source], where source is one of env|env_file|config_portal.
+    """
+    env_key = (os.environ.get("GEMINI_API_KEY", "") or "").strip()
+    if env_key:
+        return env_key, "env"
+
+    env_file_key = _read_api_key_from_env_file()
+    if env_file_key:
+        return env_file_key, "env_file"
+
+    portal_key = _read_portal_key_from_config()
+    if _looks_like_gemini_api_key(portal_key):
+        return portal_key, "config_portal"
+
+    return "", ""
+
+
+def _read_cloud_url_from_config() -> str:
+    try:
+        cfg = _load_config()
+        return str(getattr(cfg, "cloud_url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_localhost_cloud_url(url: str) -> bool:
+    value = (url or "").strip().lower()
+    if not value:
+        return True
+    return "localhost" in value or "127.0.0.1" in value
+
+
 def _ensure_runtime_dirs() -> None:
     _ensure_runtime_files()
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -871,33 +937,72 @@ def cmd_run(args):
     _ensure_runtime_dirs()
     env = os.environ.copy()
     env.setdefault("RIO_CONFIG", str(_CONFIG_PATH))
-    if "GEMINI_API_KEY" not in env:
-        api_key = _read_api_key_from_env_file()
-        if api_key:
-            env["GEMINI_API_KEY"] = api_key
-
-    runtimes = _bootstrap_runtime_venvs()
 
     if not args.skip_configure and _needs_configure():
         print("  Configuration required before run. Redirecting to rio configure...")
         cmd_configure(args)
         env["RIO_CONFIG"] = str(_CONFIG_PATH)
 
+    cloud_url = _read_cloud_url_from_config()
+    use_remote_cloud = False
+
+    # Ensure cloud runtime has a valid Gemini API key before process launch.
+    runtime_key, key_source = _resolve_runtime_gemini_api_key()
+    if runtime_key:
+        env["GEMINI_API_KEY"] = runtime_key
+        if key_source == "config_portal":
+            print("  Using Gemini API key from config portal.api_key.")
+    else:
+        portal_key = _read_portal_key_from_config()
+        if portal_key:
+            if _is_localhost_cloud_url(cloud_url):
+                print("  [Error] Rio key is set, but cloud_url points to localhost.")
+                print("  Rio-key-only mode requires a remote cloud_url (non-localhost).")
+                print("  Fix: set rio.cloud_url to your hosted Rio Cloud websocket URL.")
+                raise SystemExit(1)
+            use_remote_cloud = True
+            print("  GEMINI_API_KEY not found; using Rio-key remote cloud mode.")
+        else:
+            print("  [Error] Gemini API key not found for local cloud runtime.")
+            print("  Fix: set GEMINI_API_KEY in ~/.rio/.env, or configure Rio key + remote cloud_url.")
+            print("  Example: GEMINI_API_KEY=AIza... (in ~/.rio/.env)")
+            raise SystemExit(1)
+
+    if use_remote_cloud:
+        runtimes = {
+            "local": _ensure_component_venv("local", _LOCAL_DIR),
+        }
+    else:
+        runtimes = _bootstrap_runtime_venvs()
+
     run_in_background = bool(args.background or (os.name == "nt" and not args.foreground))
 
     if run_in_background:
-        cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
-        time.sleep(1.0)
+        cloud_pid = None
+        if not use_remote_cloud:
+            cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
+            time.sleep(1.0)
         local_pid = _spawn_component("local", _LOCAL_DIR, env, runtimes["local"], background=True)
-        print("  Rio is running in background mode.")
-        print(f"  Cloud PID: {cloud_pid}  |  Log: {_LOG_DIR / 'cloud.log'}")
+        if use_remote_cloud:
+            print("  Rio is running in background mode (remote cloud).")
+            print(f"  Cloud URL: {cloud_url}")
+        else:
+            print("  Rio is running in background mode.")
+            print(f"  Cloud PID: {cloud_pid}  |  Log: {_LOG_DIR / 'cloud.log'}")
         print(f"  Local PID: {local_pid}  |  Log: {_LOG_DIR / 'local.log'}")
-        print("  Check logs with: rio logs --component both --follow")
+        if use_remote_cloud:
+            print("  Check logs with: rio logs --component local --follow")
+        else:
+            print("  Check logs with: rio logs --component both --follow")
         return
 
-    cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
-    print(f"  Cloud started in background (PID {cloud_pid}).")
-    print(f"  Cloud log: {_LOG_DIR / 'cloud.log'}")
+    if not use_remote_cloud:
+        cloud_pid = _spawn_component("cloud", _CLOUD_DIR, env, runtimes["cloud"], background=True)
+        print(f"  Cloud started in background (PID {cloud_pid}).")
+        print(f"  Cloud log: {_LOG_DIR / 'cloud.log'}")
+    else:
+        print("  Using remote cloud; local cloud process not started.")
+        print(f"  Cloud URL: {cloud_url}")
     print("  Starting local in foreground...")
     os.chdir(_LOCAL_DIR)
     os.environ.update(env)

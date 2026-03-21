@@ -68,6 +68,12 @@ class SessionManager:
         """
         if mode is None:
             mode = self._session_mode
+
+        if not (self._api_key or "").strip():
+            raise RuntimeError(
+                "GEMINI_API_KEY is missing; cannot create Gemini session for local cloud runtime"
+            )
+
         async with self._lock:
             # Tear down any stale session
             if client_id in self._sessions:
