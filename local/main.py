@@ -232,7 +232,7 @@ def _get_mandatory_dependency_gaps() -> list[dict[str, str]]:
         ("pynput", "Keyboard hotkeys", "pip install pynput>=1.7.0"),
         ("torch", "Voice activity detection", "pip install torch --index-url https://download.pytorch.org/whl/cpu"),
         ("chromadb", "Long-term memory engine", "pip install chromadb"),
-        ("sentence_transformers", "Memory embeddings", "pip install sentence-transformers"),
+        ("google.genai", "Gemini memory embeddings", "pip install google-genai"),
     ]
 
     for module_name, purpose, install_cmd in required:
@@ -2620,7 +2620,7 @@ async def main() -> None:
             print(f"  Memory: {memory_store.count()} entries in {config.memory.db_path}")
         except RuntimeError as e:
             log.warning("memory.deps_missing", detail=str(e))
-            print("  Memory: disabled (chromadb/sentence-transformers not installed)")
+            print("  Memory: disabled (chromadb/google-genai not installed)")
             memory_store = None
         except Exception:
             log.exception("memory.init_failed")

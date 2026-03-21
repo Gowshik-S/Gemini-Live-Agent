@@ -130,7 +130,7 @@ pip install pynput>=1.7.0
 ### Vector Memory (Semantic recall)
 
 ```bash
-pip install chromadb>=0.4.0 sentence-transformers>=2.2.0
+pip install chromadb>=0.4.0 google-genai>=1.0.0
 ```
 
 ### Offline Wake Word

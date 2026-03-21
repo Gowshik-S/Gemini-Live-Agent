@@ -219,6 +219,42 @@ def _requirements_stamp(requirements_path: Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_venv_python_usable(python_path: Path) -> bool:
+    """Return True when venv Python exists, launches, and matches required runtime version."""
+    if not python_path.exists():
+        return False
+
+    try:
+        proc = subprocess.run(
+            [str(python_path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+
+    required = f"{_REQUIRED_PYTHON_MAJOR}.{_REQUIRED_PYTHON_MINOR}"
+    return proc.returncode == 0 and proc.stdout.strip() == required
+
+
+def _recreate_component_venv(component: str, venv_dir: Path) -> Path:
+    """Recreate a component venv, preferring Python 3.11 launchers when available."""
+    if venv_dir.exists():
+        print(f"  Rebuilding stale {component} runtime venv at {venv_dir}...")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    creator_cmd: list[str]
+    launcher_311 = _find_python_311_launcher()
+    if launcher_311 is not None:
+        creator_cmd = [*launcher_311, "-m", "venv", str(venv_dir)]
+    else:
+        creator_cmd = [sys.executable, "-m", "venv", str(venv_dir)]
+
+    subprocess.run(creator_cmd, check=True)
+    return _venv_python_path(venv_dir)
+
+
 def _ensure_component_venv(component: str, component_dir: Path) -> Path:
     """Create/update a per-component venv under ~/.rio/venv and return its Python path."""
     requirements_path = component_dir / "requirements.txt"
@@ -233,7 +269,9 @@ def _ensure_component_venv(component: str, component_dir: Path) -> Path:
 
     if not venv_python.exists():
         print(f"  Creating {component} runtime venv at {venv_dir}...")
-        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        venv_python = _recreate_component_venv(component, venv_dir)
+    elif not _is_venv_python_usable(venv_python):
+        venv_python = _recreate_component_venv(component, venv_dir)
 
     current_stamp = ""
     if stamp_path.exists():
@@ -982,6 +1020,153 @@ def cmd_stop(args):
     print()
 
 
+def _confirm_reset(target: str, args) -> None:
+    """Require explicit confirmation for destructive reset actions."""
+    if getattr(args, "yes", False):
+        return
+
+    prompt = {
+        "memory": "RESET MEMORY",
+        "config": "RESET CONFIG",
+        "both": "RESET BOTH",
+        "rio": "ERASE RIO",
+    }.get(target, "RESET")
+
+    if not sys.stdin.isatty():
+        print("  [Error] Refusing destructive reset in non-interactive mode without --yes.")
+        print("  Fix: re-run with --yes to confirm.")
+        raise SystemExit(1)
+
+    typed = input(f"  Type '{prompt}' to continue: ").strip()
+    if typed != prompt:
+        print("  Reset cancelled.")
+        raise SystemExit(1)
+
+
+def _remove_path(path: Path) -> bool:
+    """Remove file or directory if present. Returns True when a deletion occurred."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+            return True
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return False
+
+
+def _memory_reset_targets() -> list[Path]:
+    """Collect memory-related paths to clear for local runtime and project defaults."""
+    targets: list[Path] = []
+
+    # Default known memory locations.
+    targets.append((_LOCAL_DIR / "data" / "memory").resolve())
+    targets.append((_RIO_ROOT / "data" / "memory").resolve())
+    targets.append((_RIO_HOME / "memory").resolve())
+
+    # Common db artifacts mentioned in install/troubleshooting docs.
+    for parent in {_LOCAL_DIR, _RIO_ROOT, Path.cwd()}:
+        targets.append((parent / "rio_chats.db").resolve())
+        targets.append((parent / "rio_patterns.db").resolve())
+        targets.append((parent / "rio_memory").resolve())
+
+    # Include configured memory db_path when available.
+    try:
+        cfg = _load_config()
+        configured = str(getattr(getattr(cfg, "memory", object()), "db_path", "") or "").strip()
+        if configured:
+            p = Path(configured).expanduser()
+            if not p.is_absolute():
+                targets.append((_LOCAL_DIR / p).resolve())
+                targets.append((_RIO_ROOT / p).resolve())
+            else:
+                targets.append(p.resolve())
+    except Exception:
+        pass
+
+    # De-duplicate while preserving order.
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for p in targets:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+    return deduped
+
+
+def _stop_for_reset() -> None:
+    """Best-effort stop of runtime processes before destructive cleanup."""
+    for component in ("cloud", "local"):
+        pid = _read_pid(component)
+        if pid is None:
+            continue
+        _stop_pid(pid, force=True)
+        _clear_pid(component)
+
+
+def cmd_reset(args):
+    """Handle: rio reset <memory|config|both|rio>"""
+    target = args.target
+    _ensure_runtime_dirs()
+    _confirm_reset(target, args)
+
+    print("\n  Rio Reset")
+    print("  " + "=" * 40)
+    _stop_for_reset()
+
+    removed: list[str] = []
+
+    if target in {"memory", "both", "rio"}:
+        for path in _memory_reset_targets():
+            if _remove_path(path):
+                removed.append(str(path))
+
+    if target in {"config", "both"}:
+        for path in (_CONFIG_PATH, _ENV_PATH):
+            if _remove_path(path):
+                removed.append(str(path))
+
+    if target == "rio":
+        # Remove runtime home first (contains config/logs/venvs/pids).
+        if _remove_path(_RIO_HOME):
+            removed.append(str(_RIO_HOME))
+
+        # If config is outside RIO_HOME, remove it explicitly.
+        if _CONFIG_PATH.resolve() != (_RIO_HOME / "config.yaml").resolve() and _remove_path(_CONFIG_PATH):
+            removed.append(str(_CONFIG_PATH))
+
+        if not args.skip_uninstall:
+            print("  Attempting package uninstall: rio-agent")
+            uninstall = subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "rio-agent"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if uninstall.returncode == 0:
+                print("  Package uninstall: OK")
+            else:
+                detail = (uninstall.stderr or uninstall.stdout or "").strip().splitlines()
+                msg = detail[-1] if detail else "uninstall skipped/failed"
+                print(f"  Package uninstall: {msg}")
+
+    if removed:
+        print(f"  Removed {len(removed)} path(s):")
+        for entry in removed:
+            print(f"    - {entry}")
+    else:
+        print("  No matching reset data found; nothing to remove.")
+
+    print("  " + "=" * 40)
+    print(f"  ACKNOWLEDGEMENT: rio reset {target} completed.")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -1055,6 +1240,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stop_parser.add_argument("--force", action="store_true", help="Force kill process tree")
 
+    # rio reset
+    reset_parser = subparsers.add_parser("reset", help="Reset Rio memory/config or erase installation")
+    reset_parser.add_argument(
+        "target",
+        choices=["memory", "config", "both", "rio"],
+        help="Reset target: memory, config, both, or rio (full erase)",
+    )
+    reset_parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation")
+    reset_parser.add_argument(
+        "--skip-uninstall",
+        action="store_true",
+        help="When target=rio, keep the installed rio-agent package",
+    )
+
     return parser
 
 
@@ -1088,6 +1287,8 @@ def main():
         cmd_status(args)
     elif args.command == "stop":
         cmd_stop(args)
+    elif args.command == "reset":
+        cmd_reset(args)
     else:
         parser.print_help()
 
