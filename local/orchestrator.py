@@ -302,6 +302,37 @@ class Orchestrator:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_browser_goal(goal: str) -> bool:
+        goal_lower = goal.strip().lower()
+        browser_keywords = (
+            "browser", "chrome", "edge", "brave", "firefox",
+            "gmail", "google", "website", "web", "url", "navigate",
+            "open ", "visit ", "search ",
+        )
+        return any(k in goal_lower for k in browser_keywords)
+
+    def _fallback_steps_for_goal(self, goal: str) -> list[Step]:
+        """Create safe fallback steps when planner output is unavailable/unparseable."""
+        if self._is_browser_goal(goal):
+            # Let BrowserAgent handle free-form browser intent directly.
+            return [Step(
+                action=goal,
+                step_type=StepType.BROWSER,
+                tool_name="",
+                tool_args={},
+                expected_outcome="Browser task executed",
+            )]
+
+        # Generic safe fallback for non-browser goals.
+        return [Step(
+            action=goal,
+            step_type=StepType.TOOL,
+            tool_name="run_command",
+            tool_args={"command": f'echo "Manual follow-up needed: {goal}"'},
+            expected_outcome="Manual follow-up surfaced",
+        )]
+
     # ------------------------------------------------------------------
     # Planning
     # ------------------------------------------------------------------
@@ -314,14 +345,8 @@ class Orchestrator:
         self._log.info("orchestrator.planning", task_id=task.id, goal=goal[:100])
 
         if self._client is None:
-            # No API — create a single generic step
-            task.steps = [Step(
-                action=goal,
-                step_type=StepType.TOOL,
-                tool_name="run_command",
-                tool_args={"command": "echo 'No Gemini client — manual execution needed'"},
-                expected_outcome="User handles manually",
-            )]
+            # No API — build safe fallback steps.
+            task.steps = self._fallback_steps_for_goal(goal)
             task.plan_summary = "Direct execution (no planner available)"
             self._task_store.save(task)
             return task
@@ -379,12 +404,8 @@ class Orchestrator:
 
         except json.JSONDecodeError:
             self._log.warning("orchestrator.plan_parse_error", text=text[:200])
-            # Fallback: single step
-            task.steps = [Step(
-                action=goal,
-                step_type=StepType.TOOL,
-                expected_outcome="Goal achieved",
-            )]
+            # Fallback: safe route based on goal type.
+            task.steps = self._fallback_steps_for_goal(goal)
             task.plan_summary = "Single-step fallback (plan parse failed)"
 
         except Exception as exc:
@@ -398,11 +419,7 @@ class Orchestrator:
                                 model=classified.model,
                                 diagnostic=diag)
                 print(f"\n{diag}\n")
-            task.steps = [Step(
-                action=goal,
-                step_type=StepType.TOOL,
-                expected_outcome="Goal achieved",
-            )]
+            task.steps = self._fallback_steps_for_goal(goal)
             task.plan_summary = "Single-step fallback (planner error)"
 
         self._task_store.save(task)
@@ -501,27 +518,24 @@ class Orchestrator:
     async def _execute_browser_step(self, step: Step, task: Task) -> dict:
         """Execute via BrowserAgent (Playwright)."""
         if self._browser_agent is None or not self._browser_agent.available:
-            # Fallback: try opening URL via system command if it's a navigation step
-            url = step.tool_args.get("url", "")
-            if url and self._tool_executor is not None:
-                import platform
-                if platform.system() == "Windows":
-                    cmd = f'start "" "{url}"'
-                else:
-                    cmd = f'xdg-open "{url}" 2>/dev/null || open "{url}" 2>/dev/null'
-                result = await self._tool_executor.execute("run_command", {"command": cmd})
-                if result.get("success"):
-                    step.mark_done(f"Opened {url} in default browser")
-                    await asyncio.sleep(2.0)  # Wait for browser to load
-                    return result
-            # Fallback to screen navigator for visual interaction
-            return await self._execute_system_step(step, task)
+            error = (
+                "BrowserAgent is unavailable. Install Playwright dependencies and retry browser tasks."
+            )
+            step.mark_failed(error)
+            return {"success": False, "error": error}
 
         if not self._browser_agent.is_running:
             started = await self._browser_agent.start()
             if not started:
-                # Fallback to system step
-                return await self._execute_system_step(step, task)
+                detail = getattr(self._browser_agent, "last_start_error", "") or "unknown startup error"
+                error = (
+                    "BrowserAgent failed to start. "
+                    "Ensure an existing browser is running with --remote-debugging-port=9222 "
+                    "or configure RIO_BROWSER_CDP_URLS to the correct endpoint. "
+                    f"Details: {detail}"
+                )
+                step.mark_failed(error)
+                return {"success": False, "error": error}
 
         # If step has a direct URL, navigate first
         url = step.tool_args.get("url", "")

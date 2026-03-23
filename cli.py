@@ -208,6 +208,76 @@ def _read_portal_key_from_config() -> str:
     except Exception:
         return ""
 
+
+def _read_portal_backend_url_from_config() -> str:
+    """Read portal.backend_url from runtime config yaml."""
+    try:
+        import yaml
+    except Exception:
+        return ""
+
+    if not _CONFIG_PATH.exists():
+        return ""
+
+    try:
+        raw = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict):
+            return ""
+        section = raw.get("rio", raw)
+        if not isinstance(section, dict):
+            return ""
+        portal = section.get("portal", {})
+        if not isinstance(portal, dict):
+            return ""
+        return str(portal.get("backend_url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _derive_cloud_ws_url_from_backend(backend_url: str) -> str:
+    """Derive websocket cloud_url from a portal backend URL."""
+    value = (backend_url or "").strip()
+    if not value:
+        return ""
+    value = value.rstrip("/")
+
+    if value.startswith("https://"):
+        base = "wss://" + value[len("https://"):]
+    elif value.startswith("http://"):
+        base = "ws://" + value[len("http://"):]
+    elif value.startswith("wss://") or value.startswith("ws://"):
+        base = value
+    else:
+        base = "wss://" + value
+
+    if "/ws/rio/live" in base:
+        return base
+    return f"{base}/ws/rio/live"
+
+
+def _write_cloud_url_to_config(new_cloud_url: str) -> bool:
+    """Persist rio.cloud_url to runtime config file."""
+    try:
+        import yaml
+    except Exception:
+        return False
+
+    try:
+        raw: dict = {}
+        if _CONFIG_PATH.exists():
+            loaded = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                raw = loaded
+        section = raw.get("rio", raw)
+        if not isinstance(section, dict):
+            section = {}
+        section["cloud_url"] = new_cloud_url
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            yaml.dump({"rio": section}, f, default_flow_style=False, allow_unicode=True)
+        return True
+    except Exception:
+        return False
+
     if not _CONFIG_PATH.exists():
         return ""
 
@@ -908,8 +978,20 @@ def cmd_configure(args):
     portal_cfg.setdefault("timeout_seconds", 8.0)
     print()
 
-    # Step 6: Vision Settings
-    print("  Step 6/6: Vision / Screen Mode")
+    # Step 6: Browser Profile
+    print("  Step 6/7: Browser Automation Profile")
+    browser_cfg = config_data.setdefault("browser", {})
+    current_profile = str(browser_cfg.get("default_profile", "rio") or "rio")
+    print("  This profile is used for browser automation sessions.")
+    print(f"  Current profile: {current_profile}")
+    profile_name = input("  Browser profile name (Enter for current): ").strip()
+    if profile_name:
+        browser_cfg["default_profile"] = profile_name
+        print(f"  Browser profile set to: {profile_name}")
+    print()
+
+    # Step 7: Vision Settings
+    print("  Step 7/7: Vision / Screen Mode")
     print("    on_demand — Capture screen only when asked")
     print("    autonomous — Always watching screen")
     current_vision = config_data.get("vision", {}).get("default_mode", "on_demand")
@@ -956,10 +1038,19 @@ def cmd_run(args):
         portal_key = _read_portal_key_from_config()
         if portal_key:
             if _is_localhost_cloud_url(cloud_url):
-                print("  [Error] Rio key is set, but cloud_url points to localhost.")
-                print("  Rio-key-only mode requires a remote cloud_url (non-localhost).")
-                print("  Fix: set rio.cloud_url to your hosted Rio Cloud websocket URL.")
-                raise SystemExit(1)
+                backend_url = _read_portal_backend_url_from_config()
+                inferred_cloud_url = _derive_cloud_ws_url_from_backend(backend_url)
+                if inferred_cloud_url and not _is_localhost_cloud_url(inferred_cloud_url):
+                    cloud_url = inferred_cloud_url
+                    if _write_cloud_url_to_config(inferred_cloud_url):
+                        env["RIO_CONFIG"] = str(_CONFIG_PATH)
+                    print("  cloud_url pointed to localhost; auto-switched to remote cloud URL from portal backend.")
+                    print(f"  Remote cloud URL: {cloud_url}")
+                else:
+                    print("  [Error] Rio key is set, but cloud_url points to localhost.")
+                    print("  Rio-key-only mode requires a remote cloud_url (non-localhost).")
+                    print("  Fix: set rio.cloud_url to your hosted Rio Cloud websocket URL.")
+                    raise SystemExit(1)
             use_remote_cloud = True
             print("  GEMINI_API_KEY not found; using Rio-key remote cloud mode.")
         else:

@@ -55,6 +55,7 @@ class SessionManager:
         self,
         client_id: str,
         mode: str | None = None,
+        credential_profile: dict | None = None,
     ) -> GeminiSession:
         """Create and connect a new GeminiSession for *client_id*.
 
@@ -69,7 +70,7 @@ class SessionManager:
         if mode is None:
             mode = self._session_mode
 
-        if not (self._api_key or "").strip():
+        if not (self._api_key or "").strip() and not credential_profile:
             raise RuntimeError(
                 "GEMINI_API_KEY is missing; cannot create Gemini session for local cloud runtime"
             )
@@ -86,6 +87,7 @@ class SessionManager:
                 mode=mode,
                 text_model=self._text_model,
                 live_model=self._live_model,
+                credential_profile=credential_profile,
             )
             await session.connect()
 

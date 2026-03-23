@@ -11,10 +11,14 @@ Uses browser automation tools preferentially, escalates to Computer Use only whe
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
+import subprocess
+import time
 
 import structlog
 
@@ -135,7 +139,9 @@ class BrowserAgent:
         self._context = None
         self._page: Optional[Page] = None
         self._running = False
-        self._uses_shared_context = False
+        self.browser_mode: Optional[str] = None
+        self.last_start_error: str = ""
+        self._bootstrap_last_attempt: dict[tuple[str, int], float] = {}
         self._log = log.bind(component="browser_agent")
 
     @property
@@ -150,59 +156,336 @@ class BrowserAgent:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _detect_chrome_user_data_dir() -> Path:
+        if sys.platform == "win32":
+            local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+            if not local_appdata:
+                raise RuntimeError("LOCALAPPDATA is not set")
+            return Path(local_appdata) / "Google" / "Chrome" / "User Data"
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+        return Path.home() / ".config" / "google-chrome"
+
+    @staticmethod
+    def _candidate_cdp_urls() -> list[str]:
+        """Return CDP endpoints to probe in priority order.
+
+        Supports explicit overrides for demo reliability:
+        - RIO_BROWSER_CDP_URLS="http://localhost:9222,http://localhost:9223"
+        - RIO_BROWSER_CDP_URL="http://localhost:9222"
+        """
+        urls: list[str] = []
+
+        env_urls = os.environ.get("RIO_BROWSER_CDP_URLS", "").strip()
+        if env_urls:
+            for item in env_urls.split(","):
+                url = item.strip()
+                if url:
+                    urls.append(url)
+
+        single_url = os.environ.get("RIO_BROWSER_CDP_URL", "").strip()
+        if single_url:
+            urls.append(single_url)
+
+        # Demo-friendly defaults for common Chromium-family debug ports.
+        if not urls:
+            urls = [
+                "http://localhost:9222",
+                "http://127.0.0.1:9222",
+                "http://localhost:9223",
+                "http://127.0.0.1:9223",
+                "http://localhost:9224",
+                "http://127.0.0.1:9224",
+            ]
+
+        # Preserve order but remove duplicates.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for url in urls:
+            normalized = url.replace("127.0.0.1", "localhost")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(url)
+        return deduped
+
+    @staticmethod
+    def _cdp_only_mode_enabled() -> bool:
+        """Return True when BrowserAgent must only attach to existing CDP browsers.
+
+        Default is True for demo/operator safety: do not silently launch a new
+        Playwright Chromium profile when existing browser CDP attach fails.
+        Set RIO_BROWSER_ALLOW_PERSISTENT_FALLBACK=1 to re-enable fallback.
+        """
+        allow_fallback = os.environ.get("RIO_BROWSER_ALLOW_PERSISTENT_FALLBACK", "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        return not allow_fallback
+
+    @staticmethod
+    async def _detect_browser_label(page: Page) -> str:
+        """Best-effort browser label from user agent for logging."""
+        try:
+            ua = await page.evaluate("() => navigator.userAgent || ''")
+            ua = str(ua)
+            if "Edg/" in ua:
+                return "edge"
+            if "Brave/" in ua:
+                return "brave"
+            if "Chrome/" in ua:
+                return "chrome"
+            if "Chromium/" in ua:
+                return "chromium"
+        except Exception:
+            pass
+        return "chromium-family"
+
+    @staticmethod
+    def _extract_debug_port(cdp_url: str) -> int:
+        try:
+            return int(cdp_url.rsplit(":", 1)[-1])
+        except Exception:
+            return 9222
+
+    @staticmethod
+    def _bootstrap_cooldown_seconds() -> float:
+        return float(os.environ.get("RIO_BROWSER_CDP_BOOTSTRAP_COOLDOWN_S", "30") or 30)
+
+    @staticmethod
+    def _get_bootstrap_user_data_dir(browser_name: str) -> Path:
+        if sys.platform == "win32":
+            local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+            if local_appdata:
+                base = Path(local_appdata) / "Rio" / "CDPBootstrap"
+            else:
+                base = Path.home() / "AppData" / "Local" / "Rio" / "CDPBootstrap"
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support" / "Rio" / "CDPBootstrap"
+        else:
+            base = Path.home() / ".local" / "share" / "rio" / "cdp-bootstrap"
+        safe_name = (browser_name or "auto").strip().lower() or "auto"
+        return base / safe_name
+
+    def _launch_browser_with_cdp(self, port: int, browser_name: str = "auto") -> bool:
+        candidates = [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ]
+
+        exe = ""
+        for path in candidates:
+            if path and os.path.exists(path):
+                exe = path
+                break
+        if not exe:
+            exe = "chrome"
+
+        key = (str(exe).lower(), port)
+        now = time.monotonic()
+        cooldown_s = self._bootstrap_cooldown_seconds()
+        last = self._bootstrap_last_attempt.get(key, 0.0)
+        if last and (now - last) < cooldown_s:
+            self._log.info(
+                "browser_agent.cdp_bootstrap_skipped_recent",
+                exe=exe,
+                port=port,
+                retry_after_s=round(cooldown_s - (now - last), 1),
+            )
+            return True
+
+        self._bootstrap_last_attempt[key] = now
+
+        user_data_dir = self._get_bootstrap_user_data_dir(browser_name)
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={str(user_data_dir)}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            "about:blank",
+        ]
+
+        profile_name = os.environ.get("CHROME_PROFILE", "").strip()
+        if profile_name:
+            args.append(f"--profile-directory={profile_name}")
+
+        try:
+            kwargs: dict[str, object] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "stdin": subprocess.DEVNULL,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(args, **kwargs)
+            self._log.info(
+                "browser_agent.cdp_bootstrap_started",
+                exe=exe,
+                port=port,
+                user_data_dir=str(user_data_dir),
+            )
+            return True
+        except Exception as exc:
+            self._log.warning(
+                "browser_agent.cdp_bootstrap_failed",
+                exe=exe,
+                port=port,
+                error=str(exc),
+            )
+            return False
+    async def get_browser_page(self) -> tuple[object, Page]:
+        async def _pick_page(context) -> Page:
+            if context.pages:
+                # Prefer a normal web tab over chrome:// or extension pages.
+                for p in context.pages:
+                    u = (p.url or "").lower()
+                    if u.startswith("http://") or u.startswith("https://"):
+                        return p
+                return context.pages[0]
+            return await context.new_page()
+
+        if self._pw is None:
+            self._pw = await async_playwright().start()
+
+        cdp_errors: dict[str, str] = {}
+        for cdp_url in self._candidate_cdp_urls():
+            try:
+                browser = await self._pw.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await _pick_page(context)
+                with contextlib.suppress(Exception):
+                    await page.bring_to_front()
+                self.browser_mode = "cdp"
+                browser_label = await self._detect_browser_label(page)
+                self._log.info(
+                    "browser_agent.browser_mode_selected",
+                    mode=self.browser_mode,
+                    cdp_url=cdp_url,
+                    browser=browser_label,
+                )
+                return browser, page
+            except Exception as exc:
+                cdp_errors[cdp_url] = str(exc)
+
+        bootstrap_enabled = os.environ.get("RIO_BROWSER_AUTO_BOOTSTRAP_CDP", "1").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if bootstrap_enabled:
+            for cdp_url in self._candidate_cdp_urls():
+                port = self._extract_debug_port(cdp_url)
+                if not self._launch_browser_with_cdp(port, browser_name="auto"):
+                    continue
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.5)
+                    try:
+                        browser = await self._pw.chromium.connect_over_cdp(cdp_url)
+                        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                        page = await _pick_page(context)
+                        with contextlib.suppress(Exception):
+                            await page.bring_to_front()
+                        self.browser_mode = "cdp"
+                        browser_label = await self._detect_browser_label(page)
+                        self._log.info(
+                            "browser_agent.browser_mode_selected",
+                            mode=self.browser_mode,
+                            cdp_url=cdp_url,
+                            browser=browser_label,
+                            bootstrapped=True,
+                        )
+                        return browser, page
+                    except Exception:
+                        continue
+
+        self._log.warning(
+            "browser_agent.cdp_unavailable",
+            tried_urls=list(cdp_errors.keys()),
+            note=(
+                "No CDP endpoint accepted a connection. For demo, launch your target browser "
+                "with --remote-debugging-port=9222 (or set RIO_BROWSER_CDP_URLS to the correct port)."
+            ),
+        )
+
+        cdp_error_summary = " | ".join(f"{url}: {err}" for url, err in cdp_errors.items())
+
+        if self._cdp_only_mode_enabled():
+            raise RuntimeError(
+                "CDP attach failed for all detected endpoints and CDP-only mode is enabled. "
+                "Launch your existing browser with --remote-debugging-port=9222 (or set RIO_BROWSER_CDP_URLS), "
+                "then retry. "
+                f"CDP errors: {cdp_error_summary}"
+            )
+
+        try:
+            profile_name = os.environ.get("CHROME_PROFILE", "").strip() or "Default"
+            user_data_dir = self._detect_chrome_user_data_dir()
+
+            try:
+                context = await self._pw.chromium.launch_persistent_context(
+                    str(user_data_dir),
+                    headless=False,
+                    args=[f"--profile-directory={profile_name}"],
+                )
+                page = await _pick_page(context)
+                with contextlib.suppress(Exception):
+                    await page.bring_to_front()
+                self.browser_mode = "persistent"
+                self._log.info(
+                    "browser_agent.browser_mode_selected",
+                    mode=self.browser_mode,
+                    user_data_dir=str(user_data_dir),
+                    profile=profile_name,
+                    note="Demo sanity check failed to get CDP mode; running persistent fallback.",
+                )
+                return context, page
+            except Exception as persistent_exc:
+                raise RuntimeError(
+                    "Browser initialization failed. CDP attach failed and persistent profile launch failed. "
+                    "Either launch Chrome with --remote-debugging-port=9222, or close Chrome so the profile lock is released. "
+                    f"CDP errors: {cdp_error_summary}; persistent error: {persistent_exc}"
+                ) from persistent_exc
+        except Exception:
+            raise
+
     async def start(self) -> bool:
         """Launch browser and initialize Gemini client."""
         if not self.available:
             self._log.warning("browser_agent.unavailable",
                               genai=_GENAI_AVAILABLE, playwright=_PLAYWRIGHT_AVAILABLE)
+            self.last_start_error = "BrowserAgent dependencies are unavailable"
             return False
 
         try:
+            self.last_start_error = ""
             self._client = genai.Client(api_key=self._api_key)
-            
-            # Use shared logic from browser_tools to attach or launch with profile
-            try:
-                from browser_tools import get_browser_context
-                from config import RioConfig
-                cfg = RioConfig.load()
-                
-                pref_browser = cfg.browser.default_browser
-                if pref_browser == "auto":
-                    pref_browser = "chrome"
-                pref_profile = cfg.browser.default_profile
-                
-                self._context = await get_browser_context(browser=pref_browser, profile=pref_profile)
-                self._uses_shared_context = True
-                
-                # Get the first page or create one
-                pages = self._context.pages
-                if pages:
-                    self._page = pages[0]
-                else:
-                    self._page = await self._context.new_page()
-                
-                # Ensure viewport is set correctly for Computer Use model
-                await self._page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
-                
-                self._running = True
-                self._log.info("browser_agent.started",
-                               mode="shared_context",
-                               model=MODEL_COMPUTER_USE,
-                               viewport=f"{VIEWPORT_W}x{VIEWPORT_H}")
-                return True
-            except ImportError:
-                # Fallback to legacy fresh-launch if browser_tools missing (unlikely)
-                self._pw = await async_playwright().start()
-                self._browser = await self._pw.chromium.launch(headless=self._headless)
-                self._context = await self._browser.new_context(
-                    viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-                )
-                self._page = await self._context.new_page()
-                self._uses_shared_context = False
-                self._running = True
-                return True
-        except Exception:
+
+            browser_or_context, page = await self.get_browser_page()
+            self._page = page
+            self._context = page.context
+            self._browser = browser_or_context if self.browser_mode == "cdp" else None
+
+            await self._page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
+
+            self._running = True
+            self._log.info(
+                "browser_agent.started",
+                mode=self.browser_mode,
+                model=MODEL_COMPUTER_USE,
+                viewport=f"{VIEWPORT_W}x{VIEWPORT_H}",
+            )
+            return True
+        except Exception as exc:
             self._log.exception("browser_agent.start_failed")
+            self.last_start_error = str(exc)
             await self.stop()
             return False
 
@@ -210,14 +493,15 @@ class BrowserAgent:
         """Shut down browser and clean up resources."""
         self._running = False
 
-        # Legacy fallback path can own a dedicated browser/process.
-        if not self._uses_shared_context and self._browser is not None:
+        # For CDP mode, do not close browser/context because this agent does not own them.
+        # For persistent mode, the launched context is owned by this agent and should be closed.
+        if self.browser_mode == "persistent" and self._context is not None:
             try:
-                await self._browser.close()
+                await self._context.close()
             except Exception:
-                self._log.debug("browser_agent.browser_close_failed")
+                self._log.debug("browser_agent.context_close_failed")
 
-        if not self._uses_shared_context and self._pw is not None:
+        if self._pw is not None:
             try:
                 await self._pw.stop()
             except Exception:
@@ -228,7 +512,7 @@ class BrowserAgent:
         self._page = None
         self._context = None
         self._client = None
-        self._uses_shared_context = False
+        self.browser_mode = None
         self._log.info("browser_agent.stopped")
 
     # ------------------------------------------------------------------
@@ -240,6 +524,8 @@ class BrowserAgent:
         if self._page is None:
             return None
         try:
+            with contextlib.suppress(Exception):
+                await self._page.bring_to_front()
             return await self._page.screenshot(type="png", full_page=False)
         except Exception:
             self._log.exception("browser_agent.screenshot_failed")
@@ -412,6 +698,9 @@ class BrowserAgent:
         """
         if self._page is None:
             raise RuntimeError("No active page")
+
+        with contextlib.suppress(Exception):
+            await self._page.bring_to_front()
 
         action = action_json["action"]
 

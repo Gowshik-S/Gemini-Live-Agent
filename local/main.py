@@ -24,6 +24,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -438,6 +439,71 @@ def _is_task_request(text: str) -> bool:
     return False
 
 
+_PROFILE_OVERRIDE_PATTERNS = (
+    re.compile(r"(?:^|\b)use\s+(?:this\s+)?profile\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"(?:^|\b)switch\s+to\s+profile\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"(?:^|\b)set\s+(?:the\s+)?profile\s+to\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"(?:^|\b)use\s+profile\s+name\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"(?:^|\b)profile\s+name\s+(?:is\s+)?['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"(?:^|\b)(?:user|account)\s+name\s+(?:is\s+)?['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+    re.compile(r"^(?:use|switch\s+to|change\s+to|select|pick)\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?$", re.IGNORECASE),
+    re.compile(r"^(?:use|switch\s+to|change\s+to|select|pick)\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?\s+(?:profile|account|user)$", re.IGNORECASE),
+    re.compile(r"^['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?\s+(?:profile|account|user)$", re.IGNORECASE),
+    re.compile(r"(?:^|\b)profile\s+['\"]?([a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63})['\"]?", re.IGNORECASE),
+)
+
+_PROFILE_OVERRIDE_CLEAR_PATTERNS = (
+    re.compile(r"(?:^|\b)(?:clear|reset)\s+(?:the\s+)?profile\s+override(?:\b|$)", re.IGNORECASE),
+    re.compile(r"(?:^|\b)use\s+(?:the\s+)?config\s+profile(?:\b|$)", re.IGNORECASE),
+    re.compile(r"(?:^|\b)use\s+default\s+profile(?:\b|$)", re.IGNORECASE),
+)
+
+
+def _parse_profile_override_command(text: str) -> tuple[str, str]:
+    """Parse user profile override command from chat/transcript text.
+
+    Returns:
+      ("set", "Profile Name") when command sets runtime profile override
+      ("clear", "") when command clears override and reverts to config
+      ("none", "") when text is not a profile override command
+    """
+    value = (text or "").strip()
+    if not value:
+        return ("none", "")
+
+    for pattern in _PROFILE_OVERRIDE_CLEAR_PATTERNS:
+        if pattern.search(value):
+            return ("clear", "")
+
+    for pattern in _PROFILE_OVERRIDE_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            profile = _normalize_profile_name(match.group(1) or "")
+            if profile:
+                return ("set", profile)
+
+    return ("none", "")
+
+
+def _normalize_profile_name(raw: str) -> str:
+    """Normalize spoken/typed profile names to a clean profile token."""
+    value = (raw or "").strip().strip("'\"").rstrip(".,!?:;")
+    value = re.sub(r"\s+", " ", value)
+
+    # Drop common trailing filler words from speech transcripts.
+    for suffix in (" profile", " please", " now"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)].strip()
+
+    if not value:
+        return ""
+
+    # Keep profile names safe and predictable for browser profile dirs.
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,63}", value):
+        return ""
+    return value
+
+
 def _estimate_task_usage(task) -> tuple[int, int]:
     """Estimate portal credit usage from completed task steps with per-tool weights."""
     if task is None:
@@ -778,7 +844,8 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                        autonomous_mode: asyncio.Event | None = None,
                        task_active: asyncio.Event | None = None,
                        wake_word=None,
-                       translation_state: dict[str, object] | None = None) -> None:
+                       translation_state: dict[str, object] | None = None,
+                       browser_runtime_state: dict[str, object] | None = None) -> None:
     """Continuously read messages from the cloud and print/play them."""
     audio_frames_received = 0
     task_in_progress = False  # Track autonomous task execution
@@ -823,6 +890,16 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                         if wake_word.check_exit_phrase(text):
                             print("\n  [Rio deactivated — say 'Rio' to wake]")
                             print("  You: ", end="", flush=True)
+
+                    action, profile_name = _parse_profile_override_command(text)
+                    if browser_runtime_state is not None and action == "set":
+                        browser_runtime_state["profile_override"] = profile_name
+                        print(f"\n  [browser profile override active: {profile_name}]")
+                        print("  You: ", end="", flush=True)
+                    elif browser_runtime_state is not None and action == "clear":
+                        browser_runtime_state["profile_override"] = ""
+                        print("\n  [browser profile override cleared — using config profile]")
+                        print("  You: ", end="", flush=True)
                     # Otherwise: Echo of our own message — ignore
 
             elif msg_type == "translation":
@@ -986,6 +1063,13 @@ async def receive_loop(client: WSClient, playback=None, tool_executor=None,
                     continue
 
                 if tool_executor is not None:
+                    profile_override = ""
+                    if browser_runtime_state is not None:
+                        profile_override = str(browser_runtime_state.get("profile_override", "") or "").strip()
+                    if tool_name.startswith("browser_") and profile_override:
+                        tool_args = dict(tool_args)
+                        tool_args["profile"] = profile_override
+
                     # Confirmation gate: auto-approve read_file,
                     # prompt for write_file / patch_file / run_command
                     if tool_name in ("write_file", "patch_file", "run_command"):
@@ -1714,7 +1798,8 @@ async def input_loop(client: WSClient, struggle_detector=None,
                      orchestrator=None,
                      autonomous_mode: asyncio.Event | None = None,
                      task_active: asyncio.Event | None = None,
-                     portal_runtime: dict | None = None) -> None:
+                     portal_runtime: dict | None = None,
+                     browser_runtime_state: dict[str, object] | None = None) -> None:
     """Read user text from stdin and send to the cloud.
 
     Task requests are detected and routed through the local orchestrator
@@ -1765,6 +1850,18 @@ async def input_loop(client: WSClient, struggle_detector=None,
                     name="autonomous_task",
                 )
                 continue
+
+        action, profile_name = _parse_profile_override_command(text)
+        if browser_runtime_state is not None and action == "set":
+            browser_runtime_state["profile_override"] = profile_name
+            print(f"\n  [browser profile override active: {profile_name}]")
+            print("  You: ", end="", flush=True)
+            continue
+        if browser_runtime_state is not None and action == "clear":
+            browser_runtime_state["profile_override"] = ""
+            print("\n  [browser profile override cleared — using config profile]")
+            print("  You: ", end="", flush=True)
+            continue
 
         # Wake word: text input always activates listening
         if wake_word is not None and wake_word.available:
@@ -2717,6 +2814,11 @@ async def main() -> None:
     # -- Build client ------------------------------------------------------
     client = WSClient(
         config.cloud_url,
+        auth_payload={
+            "type": "auth",
+            "token": os.environ.get("RIO_WS_TOKEN", "").strip(),
+            "rio_api_key": portal_api_key,
+        } if portal_api_key else None,
         on_connect=lambda: log.info("event.connected"),
         on_disconnect=lambda: log.warning("event.disconnected"),
     )
@@ -2903,6 +3005,9 @@ async def main() -> None:
         "target_language": "en",
         "bidirectional": False,
     }
+    browser_runtime_state: dict[str, object] = {
+        "profile_override": "",
+    }
 
     session_ready = asyncio.Event()
     tasks.add(asyncio.create_task(
@@ -2914,7 +3019,8 @@ async def main() -> None:
                      autonomous_mode=autonomous_mode,
                      task_active=task_active,
                      wake_word=wake_word,
-                     translation_state=translation_state),
+                                         translation_state=translation_state,
+                                         browser_runtime_state=browser_runtime_state),
         name="recv",
     ))
     tasks.add(asyncio.create_task(
@@ -2924,7 +3030,8 @@ async def main() -> None:
                    orchestrator=orchestrator,
                    autonomous_mode=autonomous_mode,
                    task_active=task_active,
-                   portal_runtime=portal_runtime),
+                                     portal_runtime=portal_runtime,
+                                     browser_runtime_state=browser_runtime_state),
         name="input",
     ))
     tasks.add(asyncio.create_task(heartbeat_loop(client), name="heartbeat"))

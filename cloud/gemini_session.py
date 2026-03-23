@@ -11,7 +11,10 @@ Dual-mode architecture:
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import random
+import tempfile
 from typing import AsyncGenerator, Union
 
 import structlog
@@ -814,10 +817,13 @@ class GeminiSession:
     ReceiveItem = Union[str, dict]
 
     def __init__(self, api_key: str, client_id: str, mode: str = "live",
-                 text_model: str | None = None, live_model: str | None = None) -> None:
+                 text_model: str | None = None, live_model: str | None = None,
+                 credential_profile: dict | None = None) -> None:
         self._api_key = api_key
+        self._credential_profile = credential_profile or {}
         self._client_id = client_id
         self._client: genai.Client | None = None
+        self._client_provider = "gemini"
         self._connected = False
         self._log = logger.bind(client_id=client_id)
         # Model selection — use provided values or fall back to defaults
@@ -840,6 +846,50 @@ class GeminiSession:
         # Lock to prevent concurrent reconnect calls from sender+receiver racing
         self._reconnect_lock: asyncio.Lock = asyncio.Lock()
 
+    def _build_vertex_client(self):
+        profile = self._credential_profile or {}
+        project_id = str(profile.get("vertex_project_id", "") or "").strip()
+        location = str(profile.get("vertex_region", "") or "").strip() or "global"
+        sa_json = str(profile.get("vertex_service_account_json", "") or "").strip()
+        if not project_id or not sa_json:
+            return None
+
+        try:
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_info(json.loads(sa_json))
+            try:
+                return genai.Client(
+                    vertexai=True,
+                    project=project_id,
+                    location=location,
+                    credentials=credentials,
+                )
+            except TypeError:
+                pass
+        except Exception:
+            pass
+
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+                fh.write(sa_json)
+                adc_path = fh.name
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+            return genai.Client(vertexai=True, project=project_id, location=location)
+        except Exception:
+            return None
+
+    def _build_gemini_client(self):
+        profile = self._credential_profile or {}
+        gemini_key = str(profile.get("gemini_api_key", "") or "").strip()
+        key = gemini_key or (self._api_key or "").strip()
+        if not key:
+            return None
+        try:
+            return genai.Client(api_key=key)
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -853,7 +903,14 @@ class GeminiSession:
         """
         self._log.info("gemini.connect.start", requested_mode=self._requested_mode)
         try:
-            self._client = genai.Client(api_key=self._api_key)
+            self._client = self._build_vertex_client()
+            self._client_provider = "vertex" if self._client is not None else "gemini"
+            if self._client is None:
+                self._client = self._build_gemini_client()
+
+            if self._client is None:
+                raise RuntimeError("No usable Gemini/Vertex credentials for this session")
+
             self._history = []
             self._pending_image = None
 
@@ -869,7 +926,7 @@ class GeminiSession:
                     await self._connect_live()
                     self._connected = True
                     self._log.info(
-                        "gemini.connect.ok", mode="live", model=self._live_model,
+                        "gemini.connect.ok", mode="live", model=self._live_model, provider=self._client_provider,
                     )
                     return
                 except Exception as exc:
@@ -885,7 +942,7 @@ class GeminiSession:
 
             # Text mode (L0 fallback)
             self._connected = True
-            self._log.info("gemini.connect.ok", mode="text", model=self._text_model)
+            self._log.info("gemini.connect.ok", mode="text", model=self._text_model, provider=self._client_provider)
         except Exception:
             self._connected = False
             self._log.exception("gemini.connect.failed")

@@ -71,12 +71,14 @@ class WSClient:
     def __init__(
         self,
         url: str,
+        auth_payload: Optional[dict[str, Any]] = None,
         *,
         on_connect: Optional[OnConnect] = None,
         on_disconnect: Optional[OnDisconnect] = None,
         on_message: Optional[OnMessage] = None,
     ) -> None:
         self._url = url
+        self._auth_payload = auth_payload
         self._ws: Optional[ClientConnection] = None
         self._state = ConnectionState.DISCONNECTED
         self._should_reconnect = True
@@ -130,6 +132,15 @@ class WSClient:
                 self._state = ConnectionState.CONNECTED
                 backoff = self._INITIAL_BACKOFF  # reset on success
                 log.info("ws.connected", url=self._url)
+
+                # Send optional auth payload before regular traffic.
+                if self._auth_payload:
+                    try:
+                        await self._ws.send(json.dumps(self._auth_payload))
+                        log.info("ws.auth_sent")
+                    except Exception as exc:
+                        log.warning("ws.auth_send_failed", error=str(exc))
+
                 self._start_heartbeat()
                 await self._fire_callback(self._on_connect)
                 return  # connection established — caller takes over

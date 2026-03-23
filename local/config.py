@@ -206,6 +206,10 @@ class RioConfig:
     def _from_dict(cls, d: dict) -> "RioConfig":
         """Build a RioConfig from a raw dictionary, tolerating missing keys."""
         _defaults = cls()
+        ui_nav_raw = d.get("ui_navigator")
+        if isinstance(ui_nav_raw, dict) and "enabled" in ui_nav_raw:
+            ui_nav_raw = dict(ui_nav_raw)
+            ui_nav_raw["enabled"] = _coerce_bool(ui_nav_raw.get("enabled"), _defaults.ui_navigator.enabled)
         return cls(
             cloud_url=d.get("cloud_url", _defaults.cloud_url),
             session_mode=d.get("session_mode", _defaults.session_mode),
@@ -213,7 +217,7 @@ class RioConfig:
             hotkeys=_build(HotkeyConfig, d.get("hotkeys")),
             vad=_build(VadConfig, d.get("vad")),
             vision=_build(VisionConfig, d.get("vision")),
-            ui_navigator=_build(UINavigatorConfig, d.get("ui_navigator")),
+            ui_navigator=_build(UINavigatorConfig, ui_nav_raw),
             struggle=_build(StruggleConfig, d.get("struggle")),
             memory=_build(MemoryConfig, d.get("memory")),
             models=_build(ModelConfig, d.get("models")),
@@ -279,6 +283,21 @@ def _build(klass: type, raw: dict | None):
     valid_keys = {f.name for f in klass.__dataclass_fields__.values()}
     filtered = {k: v for k, v in raw.items() if k in valid_keys}
     return klass(**filtered)
+
+
+def _coerce_bool(value, default: bool) -> bool:
+    """Convert common YAML/string boolean forms to bool with safe fallback."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "on", "yes", "y", "1"}:
+            return True
+        if normalized in {"false", "off", "no", "n", "0"}:
+            return False
+    return default
 
 
 def _build_skills(raw: dict | None) -> SkillsConfig:

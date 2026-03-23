@@ -154,10 +154,10 @@ rio:
     enabled: true
     threshold: 0.85
   ui_navigator:
-    analyze_every_n_frames: 3
-    click_tool: screen_click
-    confidence_threshold: 0.85
     enabled: false
+    analyze_every_n_frames: 3
+    click_tool: screen_click9
+    confidence_threshold: 0.85
     fps: 10.0
     model: gemini-2.5-flash
   vad:

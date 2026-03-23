@@ -14,10 +14,12 @@ import asyncio
 import json
 import os
 import uuid
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator, Set
+from typing import AsyncGenerator
 
 import structlog
 import uvicorn
@@ -63,6 +65,8 @@ TEXT_MODEL = os.environ.get("TEXT_MODEL", None)  # Override via env, else use de
 LIVE_MODEL = os.environ.get("LIVE_MODEL", None)  # Override via env, else use default
 # Shared secret for WebSocket authentication (set via env for production)
 WS_AUTH_TOKEN = os.environ.get("RIO_WS_TOKEN", "")
+PORTAL_BACKEND_URL = os.environ.get("RIO_PORTAL_BACKEND_URL", "").strip().rstrip("/")
+PORTAL_CLOUD_SECRET = os.environ.get("RIO_PORTAL_CLOUD_SECRET", "").strip()
 
 # ---------------------------------------------------------------------------
 # Shared singletons (created during lifespan)
@@ -71,8 +75,8 @@ session_manager: SessionManager | None = None
 rate_limiter: RateLimiter = RateLimiter(budget_rpm=30)
 model_router: ModelRouter | None = None  # Initialized in lifespan with api_key
 
-# Connected dashboard WebSocket clients
-dashboard_clients: Set[WebSocket] = set()
+# Connected dashboard WebSocket clients with optional scope metadata
+dashboard_clients: dict[WebSocket, dict] = {}
 dashboard_lock = asyncio.Lock()
 
 
@@ -406,13 +410,88 @@ async def _broadcast_dashboard(payload: dict) -> None:
     message = json.dumps(payload)
     stale: list[WebSocket] = []
     async with dashboard_lock:
-        for ws in dashboard_clients:
+        for ws, scope in dashboard_clients.items():
             try:
+                tenant_scope = str((scope or {}).get("tenant_id", "") or "").strip()
+                user_scope = str((scope or {}).get("user_id", "") or "").strip()
+                payload_tenant = str(payload.get("tenant_id", "") or "").strip()
+                payload_user = str(payload.get("user_id", "") or "").strip()
+                is_global_dashboard_event = (
+                    payload.get("type") == "dashboard"
+                    and payload.get("subtype") in {"health", "rate_limit"}
+                )
+
+                if tenant_scope and not is_global_dashboard_event:
+                    if not payload_tenant:
+                        continue
+                    if payload_tenant != tenant_scope:
+                        continue
+                    if user_scope and payload_user and payload_user != user_scope:
+                        continue
                 await ws.send_text(message)
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            dashboard_clients.discard(ws)
+            dashboard_clients.pop(ws, None)
+
+
+def _portal_post_json(path: str, payload: dict, extra_headers: dict[str, str] | None = None) -> dict:
+    if not PORTAL_BACKEND_URL:
+        return {}
+
+    endpoint = f"{PORTAL_BACKEND_URL}{path}"
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(endpoint, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+    except Exception:
+        return {}
+
+
+def _resolve_user_credential_profile(rio_api_key: str) -> dict | None:
+    key = (rio_api_key or "").strip()
+    if not key or not PORTAL_BACKEND_URL:
+        return None
+
+    validation = _portal_post_json("/api/session/validate", {"rio_api_key": key})
+    if not validation.get("valid"):
+        return None
+
+    headers = {"X-Rio-Cloud-Secret": PORTAL_CLOUD_SECRET} if PORTAL_CLOUD_SECRET else {}
+    creds = _portal_post_json("/api/session/cloud-credentials", {"rio_api_key": key}, headers)
+    if not creds.get("valid"):
+        return {
+            "user_id": validation.get("user_id"),
+            "tenant_id": validation.get("tenant_id") or validation.get("user_id"),
+            "tier": validation.get("tier"),
+        }
+
+    return {
+        "user_id": creds.get("user_id") or validation.get("user_id"),
+        "tenant_id": creds.get("tenant_id") or validation.get("tenant_id") or validation.get("user_id"),
+        "tier": creds.get("tier") or validation.get("tier"),
+        "providers": creds.get("providers") or [],
+        "gemini_api_key": creds.get("gemini_api_key"),
+        "vertex_project_id": creds.get("vertex_project_id"),
+        "vertex_region": creds.get("vertex_region"),
+        "vertex_service_account_json": creds.get("vertex_service_account_json"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -421,9 +500,21 @@ async def _broadcast_dashboard(payload: dict) -> None:
 @app.websocket("/ws/dashboard")
 async def ws_dashboard(websocket: WebSocket) -> None:
     await websocket.accept()
+    scope: dict = {}
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed.get("type") == "dashboard_auth":
+            scope = {
+                "user_id": str(parsed.get("user_id", "") or "").strip(),
+                "tenant_id": str(parsed.get("tenant_id", "") or "").strip(),
+            }
+    except Exception:
+        scope = {}
+
     async with dashboard_lock:
-        dashboard_clients.add(websocket)
-    logger.info("dashboard.connected", total=len(dashboard_clients))
+        dashboard_clients[websocket] = scope
+    logger.info("dashboard.connected", total=len(dashboard_clients), scope=scope)
 
     try:
         # Keep alive -- read pings and respond with pong for RTT measurement
@@ -435,7 +526,7 @@ async def ws_dashboard(websocket: WebSocket) -> None:
         pass
     finally:
         async with dashboard_lock:
-            dashboard_clients.discard(websocket)
+            dashboard_clients.pop(websocket, None)
         logger.info("dashboard.disconnected", total=len(dashboard_clients))
 
 
@@ -448,19 +539,50 @@ async def ws_rio_live(websocket: WebSocket) -> None:
     client_id = str(uuid.uuid4())
     log = logger.bind(client_id=client_id)
 
+    auth_frame: dict = {}
+    rio_api_key = ""
+    credential_profile: dict | None = None
+
     # ---- Authentication via shared secret (Fix #19) ----
-    if WS_AUTH_TOKEN:
+    if WS_AUTH_TOKEN or PORTAL_BACKEND_URL:
         try:
             auth_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-            auth_frame = json.loads(auth_msg)
-            if auth_frame.get("type") != "auth" or auth_frame.get("token") != WS_AUTH_TOKEN:
+            parsed = json.loads(auth_msg)
+            if isinstance(parsed, dict) and parsed.get("type") == "auth":
+                auth_frame = parsed
+            if WS_AUTH_TOKEN and auth_frame.get("token") != WS_AUTH_TOKEN:
                 log.warning("client.auth_failed")
                 await websocket.close(code=4001, reason="Authentication failed")
                 return
         except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
-            log.warning("client.auth_timeout_or_error")
-            await websocket.close(code=4001, reason="Authentication required")
+            if WS_AUTH_TOKEN:
+                log.warning("client.auth_timeout_or_error")
+                await websocket.close(code=4001, reason="Authentication required")
+                return
+
+    rio_api_key = str(auth_frame.get("rio_api_key", "") or "").strip()
+    if rio_api_key:
+        credential_profile = _resolve_user_credential_profile(rio_api_key)
+        if credential_profile is None:
+            log.warning("client.rio_key_invalid")
+            await websocket.close(code=4001, reason="Invalid Rio key")
             return
+
+        log = log.bind(
+            user_id=credential_profile.get("user_id"),
+            tenant_id=credential_profile.get("tenant_id"),
+        )
+
+    user_scope = str((credential_profile or {}).get("user_id", "") or "").strip()
+    tenant_scope = str((credential_profile or {}).get("tenant_id", "") or "").strip()
+
+    def _scoped_payload(payload: dict) -> dict:
+        scoped = dict(payload)
+        if user_scope and not scoped.get("user_id"):
+            scoped["user_id"] = user_scope
+        if tenant_scope and not scoped.get("tenant_id"):
+            scoped["tenant_id"] = tenant_scope
+        return scoped
 
     log.info("client.connected")
 
@@ -470,13 +592,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         "subtype": "client_event",
         "event": "connected",
         "client_id": client_id,
+        "user_id": (credential_profile or {}).get("user_id"),
+        "tenant_id": (credential_profile or {}).get("tenant_id"),
     })
 
     assert session_manager is not None, "SessionManager not initialised"
 
     # ---- Create Gemini session ----
     try:
-        gemini = await session_manager.create_session(client_id)
+        gemini = await session_manager.create_session(client_id, credential_profile=credential_profile)
         # Record session creation in rate limiter (costs 1 RPM)
         rate_limiter.try_acquire(Priority.USER_ASK)
         # Notify client that Gemini session is ready
@@ -535,12 +659,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
             analysis = await model_router.call_pro(user_text)
             if analysis:
                 await model_router.inject_pro_result(analysis)
-                await _broadcast_dashboard({
+                await _broadcast_dashboard(_scoped_payload({
                     "type": "dashboard",
                     "subtype": "model_switch",
                     "model": "Flash",
                     "reason": "pro_complete",
-                })
+                }))
                 # In text mode, kick a relay to send Gemini's synthesized response
                 if session.mode == "text":
                     asyncio.create_task(
@@ -584,13 +708,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             "speaker": "rio",
                             "text": item,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "user_id": user_scope,
+                            "tenant_id": tenant_scope,
                         })
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "transcript",
                             "speaker": "rio",
                             "text": item,
                             "client_id": client_id,
-                        })
+                        }))
 
                     elif isinstance(item, dict) and item.get("type") == "tool_call":
                         # Function call — forward to local client for execution
@@ -603,13 +729,13 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         await websocket.send_text(json.dumps(item))
 
                         # Broadcast tool call to dashboard
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "dashboard",
                             "subtype": "tool_call",
                             "client_id": client_id,
                             "name": item.get("name"),
                             "args": item.get("args", {}),
-                        })
+                        }))
 
                 if not pending_calls:
                     # No tool calls — Gemini gave final text response. Done.
@@ -636,13 +762,13 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         )
 
                         # Broadcast result to dashboard
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "dashboard",
                             "subtype": "tool_result",
                             "client_id": client_id,
                             "name": call["name"],
                             "success": result_data.get("success"),
-                        })
+                        }))
 
                     except asyncio.TimeoutError:
                         log.error(
@@ -719,13 +845,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     "speaker": "rio",
                     "text": txt,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "user_id": user_scope,
+                    "tenant_id": tenant_scope,
                 })
-                await _broadcast_dashboard({
+                await _broadcast_dashboard(_scoped_payload({
                     "type": "transcript",
                     "speaker": "rio",
                     "text": txt,
                     "client_id": client_id,
-                })
+                }))
             pending_text.clear()
 
         async def _end_task_mode() -> None:
@@ -794,13 +922,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             "speaker": "rio",
                             "text": text,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "user_id": user_scope,
+                            "tenant_id": tenant_scope,
                         })
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "transcript",
                             "speaker": "rio",
                             "text": text,
                             "client_id": client_id,
-                        })
+                        }))
                     else:
                         # Pre-task or conversational text — buffer it.
                         # If a tool_call follows, this preamble is discarded.
@@ -819,13 +949,13 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     pending_text.clear()
 
                     await websocket.send_text(json.dumps(item))
-                    await _broadcast_dashboard({
+                    await _broadcast_dashboard(_scoped_payload({
                         "type": "dashboard",
                         "subtype": "tool_call",
                         "client_id": client_id,
                         "name": item.get("name"),
                         "args": item.get("args", {}),
-                    })
+                    }))
 
                     # Signal task mode to local client when 2+ consecutive tool calls
                     if consecutive_tool_calls >= 2:
@@ -851,13 +981,13 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                             item["name"], result_data,
                             call_id=item.get("id"),
                         )
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "dashboard",
                             "subtype": "tool_result",
                             "client_id": client_id,
                             "name": item["name"],
                             "success": result_data.get("success"),
-                        })
+                        }))
                         # Arm the watchdog: Gemini should reply within timeout
                         awaiting_gemini_reply = True
                     except asyncio.TimeoutError:
@@ -962,12 +1092,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 except Exception:
                     pass
 
-                await _broadcast_dashboard({
+                await _broadcast_dashboard(_scoped_payload({
                     "type": "dashboard",
                     "subtype": "client_event",
                     "event": "reconnected",
                     "client_id": client_id,
-                })
+                }))
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -1017,12 +1147,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         await gemini.send_image(payload, mime_type="image/jpeg")
 
                         # Broadcast to dashboard
-                        await _broadcast_dashboard({
+                        await _broadcast_dashboard(_scoped_payload({
                             "type": "dashboard",
                             "subtype": "vision",
                             "client_id": client_id,
                             "detail": f"Screenshot received ({len(payload)} bytes)",
-                        })
+                        }))
                     except Exception:
                         log.exception("client.image.send_error")
 
@@ -1067,12 +1197,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                 if (model_router.should_use_pro(content)
                         and deg < DegradationLevel.CAUTION):
                     log.info("client.pro_escalation", content_length=len(content))
-                    await _broadcast_dashboard({
+                    await _broadcast_dashboard(_scoped_payload({
                         "type": "dashboard",
                         "subtype": "model_switch",
                         "model": "Pro",
                         "reason": "user_request",
-                    })
+                    }))
                     # Fire-and-forget Pro call (non-blocking)
                     asyncio.create_task(
                         _pro_escalation(gemini, content, client_id),
@@ -1086,13 +1216,15 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                     "speaker": "user",
                     "text": content,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "user_id": user_scope,
+                    "tenant_id": tenant_scope,
                 })
-                await _broadcast_dashboard({
+                await _broadcast_dashboard(_scoped_payload({
                     "type": "transcript",
                     "speaker": "user",
                     "text": content,
                     "client_id": client_id,
-                })
+                }))
 
                 await gemini.send_text(content)
 
@@ -1160,12 +1292,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
                         )
 
                     # Broadcast to dashboard
-                    await _broadcast_dashboard({
+                    await _broadcast_dashboard(_scoped_payload({
                         "type": "dashboard",
                         "subtype": "struggle",
                         "confidence": confidence,
                         "signals": signals,
-                    })
+                    }))
 
                 elif subtype in (
                     "task_abort", "mode_change",
@@ -1232,12 +1364,12 @@ async def ws_rio_live(websocket: WebSocket) -> None:
         log.info("client.cleanup_done")
 
         # Broadcast client disconnection to dashboard
-        await _broadcast_dashboard({
+        await _broadcast_dashboard(_scoped_payload({
             "type": "dashboard",
             "subtype": "client_event",
             "event": "disconnected",
             "client_id": client_id,
-        })
+        }))
 
 
 # ---------------------------------------------------------------------------

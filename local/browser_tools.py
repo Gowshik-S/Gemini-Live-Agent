@@ -32,7 +32,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,10 +93,199 @@ _REQUIRE_CHROMIUM = os.environ.get("RIO_BROWSER_REQUIRE_CHROMIUM", "0").strip().
 _SHOW_AUTOMATION_BANNER = os.environ.get("RIO_BROWSER_SHOW_AUTOMATION_BANNER", "1").strip().lower() in {
     "1", "true", "yes", "on",
 }
+_ALLOW_PERSISTENT_FALLBACK = os.environ.get("RIO_BROWSER_ALLOW_PERSISTENT_FALLBACK", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_AUTO_BOOTSTRAP_CDP = os.environ.get("RIO_BROWSER_AUTO_BOOTSTRAP_CDP", "1").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_BOOTSTRAP_COOLDOWN_SECONDS = float(
+    os.environ.get("RIO_BROWSER_CDP_BOOTSTRAP_COOLDOWN_S", "30") or 30
+)
+_bootstrap_last_attempt: dict[tuple[str, int], float] = {}
 
 # Navigation latency knobs (tuned for faster interactive agent loops).
 _NAV_GOTO_TIMEOUT_MS = int(os.environ.get("RIO_BROWSER_NAV_GOTO_TIMEOUT_MS", "15000") or 15000)
 _NAV_POST_WAIT_MS = int(os.environ.get("RIO_BROWSER_NAV_POST_WAIT_MS", "1200") or 1200)
+
+
+def _candidate_cdp_urls(default_url: str = "http://127.0.0.1:9222") -> list[str]:
+    urls: list[str] = []
+
+    env_urls = os.environ.get("RIO_BROWSER_CDP_URLS", "").strip()
+    if env_urls:
+        for item in env_urls.split(","):
+            url = item.strip()
+            if url:
+                urls.append(url)
+
+    single_url = os.environ.get("RIO_BROWSER_CDP_URL", "").strip()
+    if single_url:
+        urls.append(single_url)
+
+    if not urls:
+        urls = [
+            default_url,
+            "http://localhost:9222",
+            "http://127.0.0.1:9222",
+            "http://localhost:9223",
+            "http://127.0.0.1:9223",
+            "http://localhost:9224",
+            "http://127.0.0.1:9224",
+        ]
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for url in urls:
+        normalized = url.replace("127.0.0.1", "localhost")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(url)
+    return deduped
+
+
+def _extract_debug_port(cdp_url: str) -> int:
+    try:
+        tail = cdp_url.rsplit(":", 1)[-1]
+        return int(tail)
+    except Exception:
+        return 9222
+
+
+def _get_bootstrap_user_data_dir(browser: str) -> Path:
+    """Return a dedicated user-data-dir for CDP bootstrap launches.
+
+    A separate profile ensures debug flags are honored even if the user's normal
+    browser instance is already running with a locked profile.
+    """
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            base = Path(local_appdata) / "Rio" / "CDPBootstrap"
+        else:
+            base = Path.home() / "AppData" / "Local" / "Rio" / "CDPBootstrap"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Rio" / "CDPBootstrap"
+    else:
+        base = Path.home() / ".local" / "share" / "rio" / "cdp-bootstrap"
+
+    safe_browser = (browser or "auto").strip().lower() or "auto"
+    return base / safe_browser
+
+
+def _launch_browser_with_cdp(browser: str, port: int) -> bool:
+    exe = _resolve_browser_exe(browser)
+    if not exe:
+        # If explicit Chromium is unavailable, fall back to any Chromium-family browser.
+        if browser.lower() == "chromium":
+            exe = _resolve_browser_exe("auto")
+
+    if not exe:
+        # Try common command names if path resolution still failed.
+        fallback_cmd = {
+            "chrome": "chrome",
+            "chromium": "chromium",
+            "edge": "msedge",
+            "brave": "brave",
+            "auto": "chrome",
+        }.get(browser.lower(), "chrome")
+        exe = fallback_cmd
+
+    key = (str(exe).lower(), port)
+    now = time.monotonic()
+    last = _bootstrap_last_attempt.get(key, 0.0)
+    if last and (now - last) < _BOOTSTRAP_COOLDOWN_SECONDS:
+        log.info(
+            "browser.cdp_bootstrap_skipped_recent",
+            browser=browser,
+            exe=exe,
+            port=port,
+            retry_after_s=round(_BOOTSTRAP_COOLDOWN_SECONDS - (now - last), 1),
+        )
+        return True
+
+    _bootstrap_last_attempt[key] = now
+
+    user_data_dir = _get_bootstrap_user_data_dir(browser)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        exe,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={str(user_data_dir)}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        "about:blank",
+    ]
+
+    profile_name = os.environ.get("CHROME_PROFILE", "").strip()
+    if profile_name:
+        args.append(f"--profile-directory={profile_name}")
+
+    try:
+        kwargs: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+
+        subprocess.Popen(args, **kwargs)
+        log.info(
+            "browser.cdp_bootstrap_started",
+            browser=browser,
+            exe=exe,
+            port=port,
+            user_data_dir=str(user_data_dir),
+        )
+        return True
+    except Exception as exc:
+        log.warning("browser.cdp_bootstrap_failed", browser=browser, exe=exe, port=port, error=str(exc))
+        return False
+
+
+async def _attempt_cdp_bootstrap_and_connect(
+    cdp_url: str,
+    browser: str,
+    timeout_seconds: float = 8.0,
+) -> Any | None:
+    if not _AUTO_BOOTSTRAP_CDP:
+        return None
+
+    port = _extract_debug_port(cdp_url)
+    if not _launch_browser_with_cdp(browser=browser, port=port):
+        return None
+
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        page = await _ensure_connection(cdp_url)
+        if page is not None:
+            log.info("browser.cdp_bootstrap_connected", browser=browser, cdp_url=cdp_url)
+            return page
+    return None
+
+
+async def _pick_best_page(context) -> Any:
+    pages = list(getattr(context, "pages", []) or [])
+    if not pages:
+        page = await context.new_page()
+        return page
+
+    # Prefer a regular web tab.
+    for page in pages:
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        if url.startswith("http://") or url.startswith("https://"):
+            return page
+    return pages[0]
 
 
 def _find_browser_exe(browser: str) -> str | None:
@@ -232,27 +423,43 @@ async def _ensure_connection(cdp_url: str = "http://127.0.0.1:9222") -> Any | No
     # Context might still be alive — grab a page from it
     if _context is not None:
         try:
-            pages = _context.pages
-            if pages:
-                _page = pages[0]
-                await _page.title()
-                return _page
-            _page = await _context.new_page()
+            _page = await _pick_best_page(_context)
+            await _page.title()
+            try:
+                await _page.bring_to_front()
+            except Exception:
+                pass
             return _page
         except Exception:
             _context = None
 
     # Try CDP connect (for browsers pre-launched with --remote-debugging-port)
-    try:
-        pw = await _get_playwright()
-        browser = await pw.chromium.connect_over_cdp(cdp_url)
-        contexts = browser.contexts
-        _context = contexts[0] if contexts else await browser.new_context()
-        _page = _context.pages[0] if _context.pages else await _context.new_page()
-        log.info("browser.connected_cdp", url=cdp_url)
-        return _page
-    except Exception:
-        return None
+    errors: dict[str, str] = {}
+    for url in _candidate_cdp_urls(cdp_url):
+        try:
+            pw = await _get_playwright()
+            browser = await pw.chromium.connect_over_cdp(url)
+            contexts = browser.contexts
+            _context = contexts[0] if contexts else await browser.new_context()
+            _page = await _pick_best_page(_context)
+            try:
+                await _page.bring_to_front()
+            except Exception:
+                pass
+            log.info("browser.connected_cdp", url=url)
+            return _page
+        except Exception as exc:
+            errors[url] = str(exc)
+
+    log.warning(
+        "browser.cdp_unavailable",
+        tried_urls=list(errors.keys()),
+        note=(
+            "No CDP endpoint accepted a connection. Launch your existing browser with "
+            "--remote-debugging-port=9222 or set RIO_BROWSER_CDP_URLS."
+        ),
+    )
+    return None
 
 
 async def get_browser_context(
@@ -263,7 +470,7 @@ async def get_browser_context(
     """High-level helper to get a shared BrowserContext.
     
     1. Tries to connect to an existing browser via CDP.
-    2. Falls back to launching a persistent context.
+    2. Optionally falls back to launching a persistent context when enabled.
     """
     global _context, _page
     
@@ -272,9 +479,20 @@ async def get_browser_context(
     if page is not None:
         return _context
 
-    # Launch new persistent context
-    await _launch_with_playwright(browser=browser, profile=profile)
-    return _context
+    page = await _attempt_cdp_bootstrap_and_connect(cdp_url=cdp_url, browser=browser)
+    if page is not None:
+        return _context
+
+    if _ALLOW_PERSISTENT_FALLBACK:
+        # Launch new persistent context when explicitly enabled.
+        await _launch_with_playwright(browser=browser, profile=profile)
+        return _context
+
+    raise RuntimeError(
+        "CDP connection failed and persistent fallback is disabled. "
+        "Launch your existing browser with --remote-debugging-port=9222 "
+        "or set RIO_BROWSER_CDP_URLS to your debug endpoint."
+    )
 
 
 async def _launch_with_playwright(
@@ -397,11 +615,9 @@ async def browser_connect(
 ) -> dict[str, Any]:
     """Connect to (or auto-launch) a browser.
 
-    First tries to connect via CDP (for users who manually launched Chrome
-    with --remote-debugging-port=9222). If that fails, falls back to
-    Playwright's launch_persistent_context which works even when Chrome is
-    already running — it opens a separate browser window using a dedicated
-    Rio profile directory, avoiding the Chrome single-instance conflict.
+    First tries to connect via CDP (for users who manually launched a browser
+    with --remote-debugging-port=9222). If CDP fails, fallback launch is only
+    used when RIO_BROWSER_ALLOW_PERSISTENT_FALLBACK=1 is set.
 
     Args:
         cdp_url:  CDP endpoint to try first. Default http://127.0.0.1:9222
@@ -431,7 +647,30 @@ async def browser_connect(
         except Exception:
             pass
 
-    # Fall back to Playwright-managed launch (bypasses Chrome single-instance)
+    page = await _attempt_cdp_bootstrap_and_connect(cdp_url=cdp_url, browser=browser)
+    if page is not None:
+        return {
+            "success": True,
+            "result": {
+                "title": await page.title(),
+                "url": page.url,
+                "mode": "cdp",
+                "browser": browser,
+                "profile": profile or "default",
+                "bootstrapped": True,
+            },
+        }
+
+    if not _ALLOW_PERSISTENT_FALLBACK:
+        return {
+            "success": False,
+            "error": (
+                f"CDP connect failed for configured endpoints and persistent fallback is disabled. "
+                f"Launch your existing browser with --remote-debugging-port=9222 or set RIO_BROWSER_CDP_URLS."
+            ),
+        }
+
+    # Fall back to Playwright-managed launch only when explicitly enabled.
     try:
         page = await _launch_with_playwright(browser=browser, profile=profile)
         return {
@@ -449,7 +688,7 @@ async def browser_connect(
         return {
             "success": False,
             "error": (
-                f"CDP connect failed ({cdp_url}) and Playwright launch also failed: {exc}\n"
+                f"CDP connect failed and fallback launch failed: {exc}\n"
                 f"browser={browser!r}, profile={profile!r}"
             ),
         }

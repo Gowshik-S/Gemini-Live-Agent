@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -913,10 +914,28 @@ class ScreenNavigator:
 
         def _open():
             target = name_or_path.strip()
-            resolved = _APP_ALIASES.get(target.lower(), target)
+            target_lower = target.lower()
+
+            # Normalize natural launch phrases from model/user prompts.
+            for prefix in ("open ", "launch ", "start ", "run "):
+                if target_lower.startswith(prefix):
+                    target = target[len(prefix):].strip()
+                    target_lower = target.lower()
+                    break
+            if target_lower.startswith("the "):
+                target = target[4:].strip()
+                target_lower = target.lower()
+            if target_lower.endswith(" app"):
+                target = target[:-4].strip()
+                target_lower = target.lower()
+            elif target_lower.endswith(" application"):
+                target = target[:-12].strip()
+                target_lower = target.lower()
+
+            resolved = _APP_ALIASES.get(target_lower, target)
 
             # Check for existing browser windows to reuse if possible
-            lower_target = target.lower()
+            lower_target = target_lower
             if any(b in lower_target for b in ("chrome", "google chrome", "browser", "edge", "msedge", "brave")):
                 if _ensure_pygetwindow():
                     try:
@@ -939,18 +958,22 @@ class ScreenNavigator:
                     except Exception:
                         pass
 
-            # URLs or ms-* protocol links: use os.startfile on Windows
-            if resolved.startswith(("http://", "https://", "ms-")):
+            is_http_url = resolved.startswith(("http://", "https://"))
+            # Generic URI detection: scheme:... (but not Windows drive path like C:\)
+            is_uri = bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", resolved)) and not os.path.isabs(resolved)
+
+            # URLs or custom protocol links: use OS handlers
+            if is_http_url or is_uri:
                 if platform.system() == "Windows":
                     # Check if we should override the default browser for URLs
                     try:
                         from config import RioConfig
                         cfg = RioConfig.load()
                         preferred = cfg.browser.default_browser
-                        if preferred == "chrome" and resolved.startswith("http"):
+                        if preferred == "chrome" and is_http_url:
                             subprocess.Popen(f'start chrome "{resolved}"', shell=True)
                             return resolved, "url", None
-                        elif preferred == "edge" and resolved.startswith("http"):
+                        elif preferred == "edge" and is_http_url:
                             subprocess.Popen(f'start msedge "{resolved}"', shell=True)
                             return resolved, "url", None
                     except Exception:
@@ -959,7 +982,7 @@ class ScreenNavigator:
                     os.startfile(resolved)
                 else:
                     subprocess.Popen(["xdg-open", resolved])
-                return resolved, "url", None
+                return resolved, ("url" if is_http_url else "protocol"), None
 
             # If it looks like a file path with extension (not .exe), use startfile
             if (
@@ -1031,6 +1054,32 @@ class ScreenNavigator:
             # For URL/file launches via os.startfile, we can't easily verify
             if proc is None:
                 verification["method"] = "startfile"
+                # Best-effort window verification for known protocol launches.
+                if _ensure_pygetwindow():
+                    try:
+                        time.sleep(0.8)
+                        all_windows = _pygetwindow.getAllWindows()
+                        titles = [w.title for w in all_windows if w.title and w.visible]
+                        normalized = str(resolved).lower()
+                        if "whatsapp" in normalized:
+                            matched = [t for t in titles if "whatsapp" in t.lower()]
+                            if matched:
+                                verification["verified"] = True
+                                verification["window_title"] = matched[0]
+                                verification["note"] = "WhatsApp window detected."
+                                return verification
+                        if "explorer" in normalized:
+                            matched = [
+                                t for t in titles
+                                if any(k in t.lower() for k in ("file explorer", "this pc", "quick access", "downloads", "documents"))
+                            ]
+                            if matched:
+                                verification["verified"] = True
+                                verification["window_title"] = matched[0]
+                                verification["note"] = "File Explorer window detected."
+                                return verification
+                    except Exception:
+                        pass
                 verification["note"] = "Launched via OS handler — cannot verify process directly."
                 return verification
 
@@ -1062,6 +1111,13 @@ class ScreenNavigator:
                         w for w in all_windows
                         if w.title and w.visible and app_base in w.title.lower()
                     ]
+                    if not matching and app_base == "explorer":
+                        matching = [
+                            w for w in all_windows
+                            if w.title and w.visible and any(
+                                k in w.title.lower() for k in ("file explorer", "this pc", "quick access", "downloads", "documents")
+                            )
+                        ]
                     if matching:
                         verification["verified"] = True
                         verification["window_title"] = matching[0].title
